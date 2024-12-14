@@ -84,6 +84,6 @@ run().catch(console.dir);
 
 
 app.listen(port, () => {
-    console.log("listening from port: ",port)
+    console.log("The Server Is running...")
     
 });
