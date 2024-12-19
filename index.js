@@ -31,8 +31,9 @@ async function run() {
       const dataFromList = adminList.find();
       const result = await dataFromList.toArray();
       res.send(result)
-  })
-
+    })
+    
+    
 
     app.post('/user', async(req, res) => {
       const user = req.body;
@@ -59,6 +60,28 @@ async function run() {
     app.get('/pack', async(req, res) => {
       const Packages = PackageListDB.find();
       const result = await Packages.toArray();
+      res.send(result);
+    })
+
+    app.get('/pack/:id', async(req, res) => {
+      const id = req.params.id;
+      const query = {_id : new ObjectId(id)};
+      const result = await PackageListDB.findOne(query);
+      res.send(result);
+      
+    })
+    app.put('/pack/:id', async(req, res) => {
+      const id = req.params.id;
+      const query = {_id : new ObjectId(id)};
+      const updatedInfo = req.body;
+      const option = {upsert : true};
+      const update = {
+        $set: {
+          packageName : updatedInfo.pName,
+          price: updatedInfo.pPrice
+        }
+      }
+      const result =  await PackageListDB.updateOne(query, update, option);
       res.send(result);
     })
     app.delete('/pack/:id', async(req, res) => {
