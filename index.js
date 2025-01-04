@@ -5,7 +5,7 @@ const port = process.env.port || 5000;
 
 require("dotenv").config();
 
-app.use(cors());
+app.use(cors({ origin: 'http://localhost:5173' }));
 app.use(express.json());
 
 
@@ -26,7 +26,7 @@ async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
     
-    
+
     const adminList = client.db("adminListDB").collection("AddedUserDb");
 
     app.get('/user', async (req, res) => {
