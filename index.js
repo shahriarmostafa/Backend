@@ -29,6 +29,10 @@ async function run() {
 
     const adminList = client.db("adminListDB").collection("AddedUserDb");
 
+    app.get('/', async (req, res) => {
+      res.send("Welcome...")
+    })
+
     app.get('/user', async (req, res) => {
       const dataFromList = adminList.find();
       const result = await dataFromList.toArray();
