@@ -9,104 +9,36 @@ app.use(cors());
 app.use(express.json());
 
 
+//getting firestore
 
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const uri = `mongodb+srv://${process.env.USERNAME_DB}:${process.env.PASSWORD_DB}@cluster0.c6fvj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+const database = require("./firebase.config");
+const studentCollection = database.collection("studentCollection");
+const teacherCollection = database.collection("teacherCollection");
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  }
-});
+const chatListCollection = database.collection("chatCollection");
 
-async function run() {
-  try {
-    // Connect the client to the server	(optional starting in v4.7)
-    
+app.post("/newStudent", async(req, res) => {
+  const user = req.body;
+  const result = await studentCollection.doc(user?.uid).set(user);
+  const result2 = await chatListCollection.doc(user.uid).set({chats: []});
+  console.log(result, result2);
+})
 
-    const adminList = client.db("adminListDB").collection("AddedUserDb");
+app.post("/newTeacher", async(req, res) => {
+  const user = req.body;
+  const result = await teacherCollection.doc(user?.uid).set(user);
+  const result2 = await chatListCollection.doc(user.uid).set({chats: []});
+  res.send(result2);
+})
 
-    app.get('/', async (req, res) => {
-      res.send("Welcome...")
-    })
-
-    app.get('/user', async (req, res) => {
-      const dataFromList = adminList.find();
-      const result = await dataFromList.toArray();
-      res.send(result)
-    })
-    
-    
-
-    app.post('/user', async(req, res) => {
-      const user = req.body;
-      const result = await adminList.insertOne(user);   
-    })
-
-    app.delete('/user/:id', async(req, res) => {
-      const id = req.params.id;
-      const condition = {_id: new ObjectId(id)};
-      const result = await adminList.deleteOne(condition);
-      res.send(result);
-    })
-
-
-    // code for the packages
-
-    const PackageListDB = client.db("packagesDB").collection("AddedPackage");
-    app.post('/pack', async(req, res) => {
-      const pack = req.body;
-      const result = await PackageListDB.insertOne(pack);
-      res.send(result);   
-
-    })
-    app.get('/pack', async(req, res) => {
-      const Packages = PackageListDB.find();
-      const result = await Packages.toArray();
-      res.send(result);
-    })
-
-    app.get('/pack/:id', async(req, res) => {
-      const id = req.params.id;
-      const query = {_id : new ObjectId(id)};
-      const result = await PackageListDB.findOne(query);
-      res.send(result);
-      
-    })
-    app.put('/pack/:id', async(req, res) => {
-      const id = req.params.id;
-      const query = {_id : new ObjectId(id)};
-      const updatedInfo = req.body;
-      const option = {upsert : true};
-      const update = {
-        $set: {
-          packageName : updatedInfo.pName,
-          price: updatedInfo.pPrice
-        }
-      }
-      const result =  await PackageListDB.updateOne(query, update, option);
-      res.send(result);
-    })
-    app.delete('/pack/:id', async(req, res) => {
-      const id = req.params.id;
-      const condition = {_id: new ObjectId(id)};
-      const result = await PackageListDB.deleteOne(condition);
-      res.send(result)
-    })
-
-
-  } finally {
-    // Ensures that the client will close when you finish/error
-    // await client.close();
-  }
-}
-run().catch(console.dir);
-
-
-
+app.get("/teacherList", async(req, res) => {
+  const result = await teacherCollection.where('approved', "==", true).get();
+  const teacherList = [];
+  result.forEach(doc => {
+      teacherList.push({ id: doc.id, ...doc.data() });
+    });
+    res.send(teacherList)
+})
 
 
 
