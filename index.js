@@ -8,6 +8,39 @@ require("dotenv").config();
 app.use(cors());
 app.use(express.json());
 
+const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
+
+//setting up agora access token
+const APP_ID = process.env.APP_ID;
+const APP_CERTIFICATE = process.env.APP_CERTIFICATE;
+
+app.post("/generate-token", (req, res) => {
+  
+  const {channelName, uid} = req.body;
+  
+  if(!channelName){    
+    return res.status(400).json({ error: "Channel name is required" });
+  }
+  const role = RtcRole.PUBLISHER;
+    const expirationTimeInSeconds = 3600; // 1 hour
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+        APP_ID,
+        APP_CERTIFICATE,
+        channelName,
+        uid || 0, // Auto-generate UID if not provided
+        role,
+        privilegeExpiredTs
+    );
+    
+    
+
+    res.json({ token, uid: uid || Math.floor(Math.random() * 100000) });
+})
+
+
 
 //getting firestore
 
