@@ -30,14 +30,14 @@ app.post("/generate-token", (req, res) => {
         APP_ID,
         APP_CERTIFICATE,
         channelName,
-        uid || 0, // Auto-generate UID if not provided
+        uid, // Auto-generate UID if not provided
         role,
         privilegeExpiredTs
     );
     
     
 
-    res.json({ token, uid: uid || Math.floor(Math.random() * 100000) });
+    res.json({ token, uid});
 })
 
 
