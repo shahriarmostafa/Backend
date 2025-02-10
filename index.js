@@ -16,7 +16,7 @@ const APP_CERTIFICATE = process.env.APP_CERTIFICATE;
 
 app.post("/generate-token", (req, res) => {
   
-  const {channelName, uid} = req.body;
+  const {channelName, receiverID} = req.body;
   
   if(!channelName){    
     return res.status(400).json({ error: "Channel name is required" });
@@ -25,7 +25,7 @@ app.post("/generate-token", (req, res) => {
     const expirationTimeInSeconds = 3600; // 1 hour
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-
+    const uid = receiverID;
     const token = RtcTokenBuilder.buildTokenWithUid(
         APP_ID,
         APP_CERTIFICATE,
