@@ -4,7 +4,7 @@ const cors =  require("cors");
 const port = process.env.port || 5000;
 
 require("dotenv").config();
-
+const axios = require("axios");
 app.use(cors());
 app.use(express.json());
 
@@ -13,6 +13,76 @@ const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
 //setting up agora access token
 const APP_ID = process.env.APP_ID;
 const APP_CERTIFICATE = process.env.APP_CERTIFICATE;
+
+
+
+//setting agora white board token
+
+const AUTHORIZATION_TOKEN = process.env.AUTHORIZATION_TOKEN;  // Make sure this is in .env
+
+
+app.post('/create-whiteboard-room', async(req, res) => {
+  const url = `https://api.netless.link/v5/rooms`;
+
+    try {
+        const response = await axios.post(url, 
+          {
+          isRecord: false
+        }, 
+        {
+            headers: {
+                'token': 'NETLESSSDK_YWs9Wk8xVHlldTdFM0RJa1RoeCZub25jZT1iNWE3N2NmMC1lOTliLTExZWYtYTdmZi1mMWQ4MmIxZjEwMDUmcm9sZT0wJnNpZz0wMjViYjg1NmU3ZmZmNWM2NTExODJiNjYyZjU2NjcxNGJhNTRjMGY0ZDFlNDU0NGU0ZjIxZDlkNzE3ZTJjOTA4',
+                'Content-Type': 'application/json',
+                'region': 'us-sv'
+            },
+        });
+        
+      
+
+        res.status(200).json({uuid: response.data.uuid});
+        
+        
+    } catch (error) {
+        console.error("Error generating whiteboard token:", error.response?.data || error.message);
+        return res.status(500).json({ error: "Failed to generate whiteboard token" });
+    }
+
+})
+
+app.post('/generate-whiteboard-token', async (req, res) => {
+
+  const uuid = req.body.UUID;
+
+  
+
+
+    try {
+        
+        const response = await axios.post(`https://api.netless.link/v5/tokens/rooms/${uuid}`,
+          {lifespan:3600000,role:"admin"},
+          {
+            headers: {
+              "token":"NETLESSSDK_YWs9Wk8xVHlldTdFM0RJa1RoeCZub25jZT0yZjU5NzllMC1lOTYwLTExZWYtYTdmZi1mMWQ4MmIxZjEwMDUmcm9sZT0wJnNpZz0zZDViZWFkOGM3Y2JiZTkzODdmMjJiNjkwNDY5OTQ3NDlmYmYyMjAyY2E4YWI3MDA1MTlhZDIwMDQyM2ZkMjVi",
+              "Content-Type": "application/json",
+              "region": "us-sv"
+            }
+          }
+        )
+        console.log(uuid);
+        
+      
+
+        res.status(200).json({token: response.data});
+        
+        
+    } catch (error) {
+        console.error("Error generating whiteboard token:", error.response?.data || error.message);
+        return res.status(500).json({ error: "Failed to generate whiteboard token" });
+    }
+});
+
+
+//agora call token
 
 app.post("/generate-token", (req, res) => {
   
