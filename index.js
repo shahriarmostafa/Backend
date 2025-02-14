@@ -189,26 +189,33 @@ app.get("/teacherList", async (req, res) => {
 
 // inbox message sending
 
-app.post("/send-nottfication", async(req, res) => {
-  const {nottificationToken, senderName, nottificationMessage} = req.body;
+app.post("/send-notification", async (req, res) => {
+  const { nottificationToken, senderName, nottificationMessage } = req.body;
 
-  if(!nottificationToken || !nottificationMessage || !senderName) return res.status(400).json({error: "token or message was un availabe"});
+  if (!nottificationToken || !nottificationMessage || !senderName) {
+    return res.status(400).json({ error: "Token or message was unavailable" });
+  }
 
   const payload = {
-    nottification: {
+    notification: { // ✅ Corrected 'nottification' → 'notification'
       title: senderName,
       body: nottificationMessage
     },
-    nottificationToken
-  }
-  try{
-    await admin.messaging().send(payload);
-    return
-  }catch(err){
-    console.error("Error sending nottification:", err);
-  }
+    token: nottificationToken // ✅ Corrected 'nottificationToken' → 'token'
+  };
 
-})
+  console.log(payload);
+
+  try {
+    await admin.messaging().send(payload);
+    console.log("Notification sent successfully");
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Error sending notification:", err);
+    res.status(500).json({ error: "Failed to send notification" });
+  }
+});
+
 
 
 
