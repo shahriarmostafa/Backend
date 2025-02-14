@@ -190,16 +190,16 @@ app.get("/teacherList", async (req, res) => {
 // inbox message sending
 
 app.post("/send-nottfication", async(req, res) => {
-  const {token, name, message} = req.body;
+  const {nottificationToken, senderName, nottificationMessage} = req.body;
 
-  if(!token || !message || !name) return res.status(400).json({error: "token or message was un availabe"});
+  if(!nottificationToken || !nottificationMessage || !senderName) return res.status(400).json({error: "token or message was un availabe"});
 
   const payload = {
     nottification: {
-      title: name,
-      body: message
+      title: senderName,
+      body: nottificationMessage
     },
-    token
+    nottificationToken
   }
   try{
     await admin.messaging().send(payload);
