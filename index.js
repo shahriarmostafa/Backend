@@ -114,7 +114,7 @@ app.post("/generate-token", (req, res) => {
 
 //getting firestore
 
-const database = require("./firebase.config");
+const {database, admin} = require("./firebase.config");
 const studentCollection = database.collection("studentCollection");
 const teacherCollection = database.collection("teacherCollection");
 
@@ -185,6 +185,30 @@ app.get("/teacherList", async (req, res) => {
     res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
   }
 });
+
+
+// inbox message sending
+
+app.post("/send-nottfication", async(req, res) => {
+  const {token, name, message} = req.body;
+
+  if(!token || !message || !name) return res.status(400).json({error: "token or message was un availabe"});
+
+  const payload = {
+    nottification: {
+      title: name,
+      body: message
+    },
+    token
+  }
+  try{
+    await admin.messaging().send(payload);
+    return
+  }catch(err){
+    console.error("Error sending nottification:", err);
+  }
+
+})
 
 
 

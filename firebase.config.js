@@ -22,4 +22,4 @@ admin.initializeApp({
 
 const database = admin.firestore();
 
-module.exports = database;
+module.exports = {database, admin};
