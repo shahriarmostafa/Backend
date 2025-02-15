@@ -51,11 +51,7 @@ app.post('/create-whiteboard-room', async(req, res) => {
 
 app.post('/generate-whiteboard-token', async (req, res) => {
 
-  const uuid = req.body.UUID;
-
-  
-
-
+  const uuid = req.body.UUID;  
     try {
         
         const response = await axios.post(`https://api.netless.link/v5/tokens/rooms/${uuid}`,
@@ -240,7 +236,7 @@ app.post("/send-notification", async (req, res) => {
   }
 
   const payload = {
-    data: { // ✅ Corrected 'nottification' → 'notification'
+    notification: { // ✅ Corrected 'nottification' → 'notification'
       title: senderName,
       body: nottificationMessage
     },
