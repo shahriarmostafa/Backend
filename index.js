@@ -216,6 +216,44 @@ app.post("/send-notification", async (req, res) => {
   }
 });
 
+app.post("/send-call-notification", async (req, res) => {
+  
+  const { nottificationToken, callerName, callerID } = req.body;
+  console.log(nottificationToken, callerName, callerID);
+  const callerId = callerID;
+
+
+  if (!nottificationToken || !callerName || !callerID) {
+    return res.status(400).json({ error: "Token or message was unavailable" });
+  }
+
+  const payload = {
+    notification: { // ✅ Add this
+      title: callerName,
+      body: "Incoming call..."
+    },
+    data: { 
+      callType: "incoming",
+      callerName,
+      callerId
+    },
+    token: nottificationToken
+  };
+
+  console.log(payload);
+
+  try {
+    await admin.messaging().send(payload);
+    console.log("Notification sent successfully");
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Error sending notification:", err);
+    res.status(500).json({ error: "Failed to send notification" });
+  }
+});
+
+
+
 
 
 
