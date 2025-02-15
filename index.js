@@ -240,7 +240,7 @@ app.post("/send-notification", async (req, res) => {
   }
 
   const payload = {
-    notification: { // ✅ Corrected 'nottification' → 'notification'
+    data: { // ✅ Corrected 'nottification' → 'notification'
       title: senderName,
       body: nottificationMessage
     },
@@ -271,10 +271,6 @@ app.post("/send-call-notification", async (req, res) => {
   }
 
   const payload = {
-    notification: { // ✅ Add this
-      title: callerName,
-      body: "Incoming call..."
-    },
     data: { 
       callType: "incoming",
       callerName,
