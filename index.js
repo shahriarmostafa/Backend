@@ -187,6 +187,47 @@ app.get("/teacherList", async (req, res) => {
 });
 
 
+
+
+//setting notification token
+
+app.post("/setTokenToProfile", async(req, res) => {
+  const {token, uid} = req.body;
+  if(!token || uid) return;
+
+  try {
+    let userRef;
+
+    // Check in studentCollection
+    const studentQuery = await studentCollection.where("uid", "==", uid).get();
+    if (!studentQuery.empty) {
+      userRef = studentQuery.docs[0].ref;
+    }
+
+    // Check in teacherCollection if not found in studentCollection
+    if (!userRef) {
+      const teacherQuery = await teacherCollection.where("uid", "==", uid).get();
+      if (!teacherQuery.empty) {
+        userRef = teacherQuery.docs[0].ref;
+      }
+    }
+
+    // If user found, update token
+    if (userRef) {
+      await userRef.update({ FCMToken: token });
+    }
+
+
+  } catch (error) {
+    console.error("Error updating token:", error);
+  }
+
+})
+
+
+
+
+
 // inbox message sending
 
 app.post("/send-notification", async (req, res) => {
