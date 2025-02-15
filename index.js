@@ -193,7 +193,9 @@ app.get("/teacherList", async (req, res) => {
 
 app.post("/setTokenToProfile", async(req, res) => {
   const {token, uid} = req.body;
-  if(!token || uid) return;
+
+  if(!token || !uid) return;
+  
 
   try {
     let userRef;
