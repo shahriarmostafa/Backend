@@ -353,6 +353,15 @@ app.delete("/deleteUser/:uid", async (req, res) => {
   }
 })
 
+app.put("/subjects", async(req, res) => {
+  const subjects = req.body.subjects;
+  const uid = req.body.uid;
+  
+  const teacher = teacherCollection.doc(uid);
+  const result = await teacher.update({subjects: subjects})
+  res.status(200).json({success: true})
+})
+
 
 
 
