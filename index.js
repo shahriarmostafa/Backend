@@ -262,7 +262,7 @@ app.post("/send-call-notification", async (req, res) => {
   const callerId = callerID;
 
 
-  if (!nottificationToken || !callerName || !callerID) {
+  if (!nottificationToken || !callerName || !callerId) {
     return res.status(400).json({ error: "Token or message was unavailable" });
   }
 
