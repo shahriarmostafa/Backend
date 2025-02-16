@@ -294,11 +294,63 @@ app.get("/teacherList", async (req, res) => {
 
 
 
+app.get("/disabledTeacherList", async (req, res) => {
+  try {
+    // Fetch approved teachers from the teacher collection
+    const result = await teacherCollection.where('approved', "==", false).get();
+
+    const teacherList = [];
+    result.forEach(doc => {
+      teacherList.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Send the list of teachers as the response
+    res.status(200).send({ success: true, teachers: teacherList });
+  } catch (error) {
+    console.error(error);
+
+    // Handle errors and send an appropriate response
+    res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
+  }
+});
+
+
+
+
 app.put("/disableTeacher/:uid", async (req, res) => {
   const uid = req.params.uid;
-  const teacher = teacherCollection.doc(uid);
-  const result = await teacher.update({approved: false})
-  res.status(200).json({done: true, result})
+  try{
+    const teacher = teacherCollection.doc(uid);
+    const result = await teacher.update({approved: false})
+    res.status(200).json({result})
+  } catch(err){
+    console.log(err);
+  }
+})
+
+app.put("/enableTeacher/:uid", async (req, res) => {
+  const uid = req.params.uid;
+  try{
+    const teacher = teacherCollection.doc(uid);
+    const result = await teacher.update({approved: true})
+    res.status(200).json({result})
+  } catch(err){
+    console.log(err);
+  }
+})
+
+
+// have to do something about permanently deleting data from firestore in future
+
+app.delete("/deleteUser/:uid", async (req, res) => {
+  const uid = req.params.uid;
+  try{
+    const teacher = teacherCollection.doc(uid);
+    const result = await teacher.delete();
+    res.status(200).json(result);
+  } catch(err){
+    res.status(400).json({err})
+  }
 })
 
 
