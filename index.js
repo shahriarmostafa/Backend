@@ -162,25 +162,7 @@ app.post("/newTeacher", async (req, res) => {
 });
 
 
-app.get("/teacherList", async (req, res) => {
-  try {
-    // Fetch approved teachers from the teacher collection
-    const result = await teacherCollection.where('approved', "==", true).get();
 
-    const teacherList = [];
-    result.forEach(doc => {
-      teacherList.push({ id: doc.id, ...doc.data() });
-    });
-
-    // Send the list of teachers as the response
-    res.status(200).send({ success: true, teachers: teacherList });
-  } catch (error) {
-    console.error(error);
-
-    // Handle errors and send an appropriate response
-    res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
-  }
-});
 
 
 
@@ -243,7 +225,6 @@ app.post("/send-notification", async (req, res) => {
     token: nottificationToken // ✅ Corrected 'nottificationToken' → 'token'
   };
 
-  console.log(payload);
 
   try {
     await admin.messaging().send(payload);
@@ -275,7 +256,6 @@ app.post("/send-call-notification", async (req, res) => {
     token: nottificationToken
   };
 
-  console.log(payload);
 
   try {
     await admin.messaging().send(payload);
@@ -288,6 +268,38 @@ app.post("/send-call-notification", async (req, res) => {
 });
 
 
+
+// admin
+
+app.get("/teacherList", async (req, res) => {
+  try {
+    // Fetch approved teachers from the teacher collection
+    const result = await teacherCollection.where('approved', "==", true).get();
+
+    const teacherList = [];
+    result.forEach(doc => {
+      teacherList.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Send the list of teachers as the response
+    res.status(200).send({ success: true, teachers: teacherList });
+  } catch (error) {
+    console.error(error);
+
+    // Handle errors and send an appropriate response
+    res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
+  }
+});
+
+
+
+
+app.put("/disableTeacher/:uid", async (req, res) => {
+  const uid = req.params.uid;
+  const teacher = teacherCollection.doc(uid);
+  const result = await teacher.update({approved: false})
+  res.status(200).json({done: true, result})
+})
 
 
 
