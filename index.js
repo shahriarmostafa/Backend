@@ -224,7 +224,7 @@ app.post("/send-notification", async (req, res) => {
     },
     token: nottificationToken // ✅ Corrected 'nottificationToken' → 'token'
   };
-
+  
 
   try {
     await admin.messaging().send(payload);
@@ -244,6 +244,7 @@ app.post("/send-call-notification", async (req, res) => {
 
 
   if (!nottificationToken || !callerName || !callerId) {
+    
     return res.status(400).json({ error: "Token or message was unavailable" });
   }
 
