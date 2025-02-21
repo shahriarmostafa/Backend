@@ -208,6 +208,11 @@ app.post("/setTokenToProfile", async(req, res) => {
 
 
 
+
+
+
+
+
 // inbox message sending
 
 app.post("/send-notification", async (req, res) => {
@@ -361,6 +366,37 @@ app.put("/subjects", async(req, res) => {
   const teacher = teacherCollection.doc(uid);
   const result = await teacher.update({subjects: subjects})
   res.status(200).json({success: true})
+})
+
+
+
+//get profile information
+app.get("/userProfile/:uid", async(req, res) => {
+  const uid = req.params.uid;
+  console.log(uid);
+  
+  
+
+  try {
+    if(!uid) return;
+    const teacherRef = teacherCollection.doc(uid);
+    const doc = await teacherRef.get()
+    
+    if(doc.exists){
+      res.status(200).json({data: doc.data()})
+      console.log(doc.data());
+    }
+    else{
+      console.log("Not doc found");
+      
+    }
+
+
+  } catch (error) {
+    res.status(400).json({err: error})
+    console.error("Error updating token:", error);
+  }
+
 })
 
 
