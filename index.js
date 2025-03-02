@@ -279,8 +279,20 @@ app.post("/send-call-notification", async (req, res) => {
 
 app.get("/teacherList", async (req, res) => {
   try {
+
+    const {category, subject} = req.query;
+    let query = teacherCollection.where("approved", "==", true);
+
+    if(category) {
+      query = query.where("subjects", "array-contains", category);
+    }
+
+    if(subject){
+      query = query.where("subjects", "array-contains", subject)
+    }
+
     // Fetch approved teachers from the teacher collection
-    const result = await teacherCollection.where('approved', "==", true).get();
+    const result = await query.get();
 
     const teacherList = [];
     result.forEach(doc => {
