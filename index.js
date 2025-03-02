@@ -281,10 +281,12 @@ app.get("/teacherList", async (req, res) => {
   try {
 
     const {category, subject} = req.query;
+    
     let query = teacherCollection.where("approved", "==", true);
 
+
     if(category) {
-      query = query.where("subjects", "array-contains", category);
+      query = query.where("category", "==", category);
     }
 
     if(subject){
@@ -293,6 +295,7 @@ app.get("/teacherList", async (req, res) => {
 
     // Fetch approved teachers from the teacher collection
     const result = await query.get();
+    
 
     const teacherList = [];
     result.forEach(doc => {
