@@ -423,6 +423,35 @@ app.get("/userProfile/:uid", async(req, res) => {
 })
 
 
+// reset user points
+
+app.post("/resetPoints", async (req, res) => {
+  try{
+    const teachers = await teacherCollection.get();
+
+    const batch = database.batch();
+
+    teachers.forEach(doc => {
+      batch.update(doc.ref, {points: 0});
+    })
+
+    await batch.commit();
+
+    res.json({
+      success: true,
+      message: "Teacher Points reset success!"
+    })
+
+
+  } catch(error){
+    console.error("Error resetting points:", error);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+})
+
+
+
+
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const uri = `mongodb+srv://ssmustafasahir:${process.env.PASSWORD_DB}@cluster0.c6fvj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
@@ -444,46 +473,49 @@ async function run() {
 
   
 
-    // app.post("/closeCalculation", async(req, res) => {
-    //   try{
-    //     const teachers = await teacherCollection.get();
-    //     let totalPoints = 0;
-    //     let teacherEarnings = [];
+    app.post("/closeCalculation", async(req, res) => {
+      try{
+        const teachers = await teacherCollection.get();
+        let totalPoints = 0;
+        let teacherEarnings = [];
+        const totalRevenueResult = await databaseinmongo.collection("subscriptions").aggregate([
+          {$group: {_id: null, totalRevenue: {$sum: "$price"}}}
+        ]).toArray();
+        const totalRevenue = totalRevenueResult[0]?.totalRevenue || 0;
 
-    //     let totalRevenue; // get from mongodb
+        teachers.forEach(doc => {
+          totalPoints += doc.data().points || 0;
+        })
 
-    //     teachers.forEach(doc => {
-    //       totalPoints += doc.data().points || 0;
-    //     })
-    //     teachers.forEach(doc => {
-    //       const teacher = doc.data().points || 0;
-    //       const percentage = totalPoints > 0? (teacher.points /totalPoints): 0;
-    //       const income = (percentage) * totalRevenue;
+        teachers.forEach(doc => {
+          const teacher = doc.data();
+          const teacherPercentage = teacher.revenuePercent || 0;
+          const income = totalPoints > 0 ? ((teacher.points/totalPoints) * totalRevenue * teacherPercentage) : 0;
 
-    //       teacherEarnings.push({
-    //         id: doc.uid,
-    //         name: teacher.name,
-    //         whatsapp: teacher.wha,
-    //         points: teacher.points,
-    //         percentage: percentage,
-    //         income: parseInt(income)
-    //       })
-    //     });
+          
+          teacherEarnings.push({
+            uid: teacher.uid,
+            name: teacher.displayName,
+            whatsapp: teacher.whatsapp,
+            points: teacher.points,
+            income: parseInt(income)
+          })
+        });
 
-    //     const salaryHistory = databaseinmongo.collection("salaryHistory");
-    //     await salaryHistory.insertOne({
-    //       month: new Date().toLocaleDateString("default", {month: "long", year: "numeric"}),
-    //       totalPoints,
-    //       totalRevenue,
-    //       teachers: teacherEarnings,
-    //       createdAt: new Date()
-    //     });
+        const salaryHistory = databaseinmongo.collection("salaryHistory");
+        await salaryHistory.insertOne({
+          month: new Date().toLocaleDateString("default", {month: "long", year: "numeric"}),
+          totalPoints,
+          totalRevenue,
+          teachers: teacherEarnings,
+          createdAt: new Date()
+        });
 
-    //   }catch(err) {
-    //     console.log(err);
+      }catch(err) {
+        console.log(err);
         
-    //   }
-    // })
+      }
+    })
 
     app.post("/subscriptions", async (req, res) => {
       try{
@@ -493,6 +525,7 @@ async function run() {
         console.log(err);
       }
     })
+
     
     
 
