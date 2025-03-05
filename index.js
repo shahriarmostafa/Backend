@@ -3,10 +3,15 @@ const app = express();
 const cors =  require("cors");
 const port = process.env.port || 5000;
 
+
 require("dotenv").config();
 const axios = require("axios");
 app.use(cors());
 app.use(express.json());
+
+
+
+
 
 const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
 
@@ -162,12 +167,15 @@ app.post("/newTeacher", async (req, res) => {
 });
 
 
-
-
-
-
-
 //setting notification token
+
+
+
+
+
+
+
+
 
 app.post("/setTokenToProfile", async(req, res) => {
   const {token, uid} = req.body;
@@ -414,6 +422,86 @@ app.get("/userProfile/:uid", async(req, res) => {
 
 })
 
+
+const { MongoClient, ServerApiVersion } = require('mongodb');
+const uri = `mongodb+srv://ssmustafasahir:${process.env.PASSWORD_DB}@cluster0.c6fvj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+
+// Create a MongoClient with a MongoClientOptions object to set the Stable API version
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  }
+});
+
+async function run() {
+  try {
+    // Connect the client to the server	(optional starting in v4.7)
+    await client.connect();
+
+    const databaseinmongo = client.db("PoperL");
+
+  
+
+    // app.post("/closeCalculation", async(req, res) => {
+    //   try{
+    //     const teachers = await teacherCollection.get();
+    //     let totalPoints = 0;
+    //     let teacherEarnings = [];
+
+    //     let totalRevenue; // get from mongodb
+
+    //     teachers.forEach(doc => {
+    //       totalPoints += doc.data().points || 0;
+    //     })
+    //     teachers.forEach(doc => {
+    //       const teacher = doc.data().points || 0;
+    //       const percentage = totalPoints > 0? (teacher.points /totalPoints): 0;
+    //       const income = (percentage) * totalRevenue;
+
+    //       teacherEarnings.push({
+    //         id: doc.uid,
+    //         name: teacher.name,
+    //         whatsapp: teacher.wha,
+    //         points: teacher.points,
+    //         percentage: percentage,
+    //         income: parseInt(income)
+    //       })
+    //     });
+
+    //     const salaryHistory = databaseinmongo.collection("salaryHistory");
+    //     await salaryHistory.insertOne({
+    //       month: new Date().toLocaleDateString("default", {month: "long", year: "numeric"}),
+    //       totalPoints,
+    //       totalRevenue,
+    //       teachers: teacherEarnings,
+    //       createdAt: new Date()
+    //     });
+
+    //   }catch(err) {
+    //     console.log(err);
+        
+    //   }
+    // })
+
+    app.post("/subscriptions", async (req, res) => {
+      try{
+        const subscriptions = databaseinmongo.collection("subscriptions");
+        const result = await subscriptions.insertOne(req.body);
+      }catch(err){
+        console.log(err);
+      }
+    })
+    
+    
+
+  } catch(err){
+    console.log(err);
+    
+  }
+}
+run().catch(console.dir);
 
 
 
