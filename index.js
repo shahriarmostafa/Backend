@@ -498,18 +498,21 @@ async function run() {
             name: teacher.displayName,
             whatsapp: teacher.whatsapp,
             points: teacher.points,
-            income: parseInt(income)
+            income: parseInt(income),
+            paid: false
           })
         });
 
-        const salaryHistory = databaseinmongo.collection("salaryHistory");
-        await salaryHistory.insertOne({
-          month: new Date().toLocaleDateString("default", {month: "long", year: "numeric"}),
+        const revenueHistory = databaseinmongo.collection("revenueHistory");
+        await revenueHistory.insertOne({
           totalPoints,
           totalRevenue,
-          teachers: teacherEarnings,
-          createdAt: new Date()
+          createdAt: new Date(),
+          enrols: await databaseinmongo.collection("subscriptions").countDocuments()
         });
+
+        const salaryHistory = databaseinmongo.collection("salaryHistory");
+        await salaryHistory.insertMany(teacherEarnings);
 
       }catch(err) {
         console.log(err);
@@ -522,6 +525,48 @@ async function run() {
         const subscriptions = databaseinmongo.collection("subscriptions");
         const result = await subscriptions.insertOne(req.body);
       }catch(err){
+        console.log(err);
+      }
+    })
+
+    app.get("/salaryData", async(req, res) => {
+      try{
+        const salaryCollection = databaseinmongo.collection("salaryHistory");
+        const result = await salaryCollection.find().toArray()
+        
+        res.status(200).json({success: true, data: result})
+      }catch(err){
+        console.log(err);
+        
+      }
+      
+    })
+
+    app.get("/historyData", async (req, res) => {
+      try{
+
+        const revenueHistory = databaseinmongo.collection("revenueHistory");
+        const result = await revenueHistory.find().toArray()
+        res.status(200).json({success: true, data: result})
+
+      }catch(error){
+        console.log(error);
+        
+      }
+    })
+
+    app.patch("/paySalary/:id", async (req, res) => {
+      try{
+        const id = req.params.id;
+      const salaryCollection = databaseinmongo.collection("salaryHistory");
+      await salaryCollection.updateOne({uid: id},
+        {
+          $set: {
+            paid: true
+          }
+        });
+        res.status(200).json({success: true})
+      } catch(err){
         console.log(err);
       }
     })
