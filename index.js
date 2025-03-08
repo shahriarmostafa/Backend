@@ -69,7 +69,6 @@ app.post('/generate-whiteboard-token', async (req, res) => {
             }
           }
         )
-        console.log(uuid);
         
       
 
@@ -125,13 +124,18 @@ app.post("/newStudent", async (req, res) => {
   try {
     const user = req.body;
 
+    const query = await studentCollection.where("email", "==", user.email).get();
+
+    if(!query.empty){
+      return res.status(200).json({success: true})
+    }
+
     // Save user to the student collection
     const result = await studentCollection.doc(user?.uid).set(user);
 
     // Initialize an empty chat list for the user
     const result2 = await chatListCollection.doc(user.uid).set({ chats: [] });
 
-    console.log(result, result2);
 
     // Send response with HTTP status 200 and response body
     res.status(200).send({ result, result2 });
@@ -147,6 +151,19 @@ app.post("/newTeacher", async (req, res) => {
   try {
     const user = req.body;
 
+
+
+    const query = await teacherCollection.where("email", "==", user.email).get();
+
+
+    if(!query.empty){
+      return res.status(200).json({success: true})
+    }
+
+    if (!user.rating){
+      return res.status(200).json({success: false})
+    }
+
     // Add teacher data to the teacher collection
     const result = await teacherCollection.doc(user?.uid).set(user);
 
@@ -154,7 +171,6 @@ app.post("/newTeacher", async (req, res) => {
     const result2 = await chatListCollection.doc(user.uid).set({ chats: [] });
 
     // Log both results for debugging
-    console.log(result, result2);
 
     // Send a success response
     res.status(200).send({ success: true, message: "Teacher added successfully." });
@@ -252,7 +268,6 @@ app.post("/send-notification", async (req, res) => {
 app.post("/send-call-notification", async (req, res) => {
   
   const { nottificationToken, callerName, callerID } = req.body;
-  console.log(nottificationToken, callerName, callerID);
   const callerId = callerID;
 
 
@@ -396,7 +411,6 @@ app.put("/subjects", async(req, res) => {
 //get profile information
 app.get("/userProfile/:uid", async(req, res) => {
   const uid = req.params.uid;
-  console.log(uid);
   
   
 
@@ -404,10 +418,11 @@ app.get("/userProfile/:uid", async(req, res) => {
     if(!uid) return;
     const teacherRef = teacherCollection.doc(uid);
     const doc = await teacherRef.get()
+    console.log(uid);
+    
     
     if(doc.exists){
       res.status(200).json({data: doc.data()})
-      console.log(doc.data());
     }
     else{
       console.log("Not doc found");
@@ -452,7 +467,7 @@ app.post("/resetPoints", async (req, res) => {
 
 
 
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const uri = `mongodb+srv://ssmustafasahir:${process.env.PASSWORD_DB}@cluster0.c6fvj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -570,6 +585,105 @@ async function run() {
         console.log(err);
       }
     })
+
+    app.post("/complain", async (req, res) => {
+      try{
+        const complains = databaseinmongo.collection("complains");
+        const result = await complains.insertOne(req.body)
+        res.status(200).json({success: true})
+      } catch(err){
+        console.log(err);
+        
+      }
+    })
+
+    app.get("/complain/:id", async (req, res) => {
+      try{
+        const uid = req.params.id;
+        const complains = databaseinmongo.collection("complains");
+        const result = await complains.find({uid: uid}).toArray()
+        res.status(200).json({success: true, data: result})
+      } catch(err){
+        console.log(err);
+      }
+    })
+
+    app.get("/complain", async (req, res) => {
+      try{
+        const complains = databaseinmongo.collection("complains");
+        const result = await complains.find().toArray()
+        res.status(200).json({success: true, data: result})
+      } catch(err){
+        console.log(err);
+      }
+    })
+
+    app.delete("/complain/:id", async (req, res) => {
+      try{
+        const _id = req.params.id;
+        const complains = databaseinmongo.collection("complains");
+        const result = await complains.deleteOne({_id: new ObjectId(_id)})
+        res.status(200).json({success: true})
+      } catch(err){
+        console.log(err);
+      }
+    })
+
+
+    //packages
+
+    app.post("/pack", async (req, res) => {
+      try{
+        const packages = databaseinmongo.collection("packages");
+        const result = await packages.insertOne(req.body);
+        res.status(200).json({success: true})
+      } catch(err){
+        console.log(err);
+      }
+    })
+
+    app.get("/pack", async (req, res) => {
+      try{
+        const packages = databaseinmongo.collection("packages");
+        const result = await packages.find().toArray();
+        res.status(200).json({success: true, data: result})
+      } catch(err){
+        console.log(err);
+      }
+    })
+
+    app.delete("/pack/:id", async (req, res) => {
+      try{
+        const _id = req.params.id;
+        const packages = databaseinmongo.collection("packages");
+        const result = await packages.deleteOne({_id: new ObjectId(_id)});
+        res.status(200).json({success: true})
+      } catch(err){
+        console.log(err);
+      }
+    })
+
+    app.put("/pack/:id", async (req, res) => {
+      try{
+        const _id = req.params.id;
+        const packages = databaseinmongo.collection("packages");
+        const result = await packages.updateOne(
+          {_id: new ObjectId(_id)},
+          {
+            $set: {
+              price: req.body.price,
+              dailyMinutesLimit: req.body.callDuration,
+              name: req.body.name
+            }
+          }
+        );
+        res.status(200).json({success: true})
+      } catch(err){
+        console.log(err);
+      }
+    })
+
+
 
     
     
