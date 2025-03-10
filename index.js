@@ -1,13 +1,35 @@
 const express = require("express");
 const app = express();
 const cors =  require("cors");
-const port = process.env.port || 5000;
-
+const port = process.env.PORT || 5000;
 
 require("dotenv").config();
 const axios = require("axios");
 app.use(cors());
 app.use(express.json());
+
+
+const http = require("http");
+
+const {Server} = require("socket.io")
+
+const server = http.createServer(app);
+
+
+const io = require("socket.io")(server,{
+  cors: {
+    origin: "http://localhost:5173", // Allow frontend to connect (replace with frontend URL in production)
+    methods: ["GET", "POST"]
+  }
+})
+
+
+
+
+
+
+
+
 
 
 
@@ -120,67 +142,7 @@ const teacherCollection = database.collection("teacherCollection");
 
 const chatListCollection = database.collection("chatCollection");
 
-app.post("/newStudent", async (req, res) => {
-  try {
-    const user = req.body;
 
-    const query = await studentCollection.where("email", "==", user.email).get();
-
-    if(!query.empty){
-      return res.status(200).json({success: true})
-    }
-
-    // Save user to the student collection
-    const result = await studentCollection.doc(user?.uid).set(user);
-
-    // Initialize an empty chat list for the user
-    const result2 = await chatListCollection.doc(user.uid).set({ chats: [] });
-
-
-    // Send response with HTTP status 200 and response body
-    res.status(200).send({ result, result2 });
-  } catch (error) {
-    console.error(error);
-
-    // Handle errors and send appropriate error response
-    res.status(500).send({ error: "An error occurred while processing the request." });
-  }
-});
-
-app.post("/newTeacher", async (req, res) => {
-  try {
-    const user = req.body;
-
-
-
-    const query = await teacherCollection.where("email", "==", user.email).get();
-
-
-    if(!query.empty){
-      return res.status(200).json({success: true})
-    }
-
-    if (!user.rating){
-      return res.status(200).json({success: false})
-    }
-
-    // Add teacher data to the teacher collection
-    const result = await teacherCollection.doc(user?.uid).set(user);
-
-    // Initialize an empty chat list for the teacher
-    const result2 = await chatListCollection.doc(user.uid).set({ chats: [] });
-
-    // Log both results for debugging
-
-    // Send a success response
-    res.status(200).send({ success: true, message: "Teacher added successfully." });
-  } catch (error) {
-    console.error(error);
-
-    // Handle errors and send an appropriate response
-    res.status(500).send({ success: false, error: "Failed to add a new teacher." });
-  }
-});
 
 
 //setting notification token
@@ -486,6 +448,534 @@ async function run() {
 
     const databaseinmongo = client.db("PoperL");
 
+    //check if admin
+
+    app.get("/isOwner/:uid", async (req, res) => {
+      try{
+        const uid = req.params.uid;
+        console.log(uid);
+        
+        const ownerCollection = databaseinmongo.collection("owner");
+        const result = await ownerCollection.findOne({uid: uid})
+        
+        if(result.owner === "1"){
+          res.status(200).json({owner: true})
+        }
+        else{
+          res.status(200).json({owner: false})
+        }
+        
+      }catch(err){
+        console.log(err);
+        
+      }
+    })
+
+
+    //userProfile Informations
+    app.post("/newStudent", async (req, res) => {
+      try {
+        const user = req.body;
+    
+        const query = await studentCollection.where("email", "==", user.email).get();
+    
+        if(!query.empty){
+          return res.status(200).json({success: true})
+        }
+    
+        // Save user to the student collection
+        const result = await studentCollection.doc(user?.uid).set(user);
+    
+        // Initialize an empty chat list for the user
+        const result2 = await databaseinmongo.collection("chatCollection").insertOne({_id: user?.uid,  chats: []});
+    
+    
+        // Send response with HTTP status 200 and response body
+        res.status(200).send({ result, result2 });
+      } catch (error) {
+        console.error(error);
+    
+        // Handle errors and send appropriate error response
+        res.status(500).send({ error: "An error occurred while processing the request." });
+      }
+    });
+    
+    app.post("/newTeacher", async (req, res) => {
+      try {
+        const user = req.body;
+    
+    
+    
+        const query = await teacherCollection.where("email", "==", user.email).get();
+    
+    
+        if(!query.empty){
+          return res.status(200).json({success: true})
+        }
+    
+        if (!user.rating){
+          return res.status(200).json({success: false})
+        }
+    
+        // Add teacher data to the teacher collection
+        const result = await teacherCollection.doc(user?.uid).set(user);
+    
+        // Initialize an empty chat list for the teacher
+        const result2 = await databaseinmongo.collection("chatCollection").updateOne(
+          { _id: user?.uid },  // Check if the document for this user already exists
+          {
+            $setOnInsert: { chats: [] }, // Ensure 'chats' is initialized as an empty array if document is created
+          },
+          { upsert: true } // This will create the document if it doesn't exist
+        );    
+        // Log both results for debugging
+    
+        // Send a success response
+        res.status(200).send({ success: true, message: "Teacher added successfully." });
+      } catch (error) {
+        console.error(error);
+    
+        // Handle errors and send an appropriate response
+        res.status(500).send({ success: false, error: "Failed to add a new teacher." });
+      }
+    });
+
+    //chat codes
+    //check if a chat already exist
+    app.get("/chatExist/:userId/:receiverId", async (req, res) => {
+      const { userId, receiverId } = req.params;
+      const userChatCollection = databaseinmongo.collection("chatCollection");
+    
+      // Fetch the user's chat document
+      const userChat = await userChatCollection.findOne({ _id: userId });
+    
+    
+      // Check if the chat with the receiver exists
+      const existingChat = userChat.chats.find(chat => chat.receiverId === receiverId);
+    
+      if (existingChat) {
+        return res.json({ exists: true, chatId: existingChat.chatId });
+      } else {
+        return res.json({ exists: false });
+      }
+    });
+
+    app.post("/createChat", async (req, res) => {
+      const { userId, receiverId } = req.body;
+      const chatDB = databaseinmongo.collection("chatDB");
+      const userChatCollection = databaseinmongo.collection("chatCollection");
+    
+      // Create a new chat document
+      const newChat = await chatDB.insertOne({
+        createdAt: new Date(),
+        messages: [],
+      });
+    
+      const chatId = newChat.insertedId.toString();
+    
+      // Update chatCollection for both users
+      await userChatCollection.updateOne(
+        { _id: receiverId },
+        {
+          $push: {
+            chats: {
+              yourRole: "student",
+              chatId,
+              lastMessage: "",
+              receiverId: userId,
+              updatedAt: Date.now(),
+            },
+          },
+        },
+        { upsert: true }
+      );
+    
+      await userChatCollection.updateOne(
+        { _id: userId },
+        {
+          $push: {
+            chats: {
+              yourRole: "teacher",
+              chatId,
+              lastMessage: "",
+              receiverId,
+              updatedAt: Date.now(),
+            },
+          },
+        },
+        { upsert: true }
+      );
+    
+      res.json({ chatId });
+    });
+
+
+  // Backend: sendVoiceMessage route
+  app.post('/sendVoiceMessage', async (req, res) => {
+    const { chatId, senderId, receiverId, audioUrl } = req.body;
+    
+    if (!chatId || !senderId || !receiverId || !audioUrl) {
+        return res.status(400).json({ error: 'Missing required fields.' });
+    }
+
+    const chatDB = databaseinmongo.collection('chatDB');
+    const chatCollection = databaseinmongo.collection('chatCollection');
+  
+    try {
+        // Add voice message to chatDB collection
+        const message = {
+            senderId,
+            audioUrl,
+            createdAt: new Date(),
+            lastMessageFeedback: null,
+        };
+
+        const result = await chatDB.updateOne(
+            { _id: new ObjectId(chatId) },
+            { $push: { messages: message } }
+        );
+
+        if (result.modifiedCount === 0) {
+            return res.status(404).json({ error: 'Chat not found.' });
+        }
+
+        // Fetch the updated chat document after the message is added
+        const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+
+        if (chatDoc) {
+            // Emit the updated chat data to the sender and receiver
+            io.to(senderId).emit('chatUpdate', chatDoc);
+            io.to(receiverId).emit('chatUpdate', chatDoc);
+
+            // Calculate and emit the last message timestamp for both users
+            const lastMessageIndex = chatDoc.messages.length - 1;
+            if (lastMessageIndex >= 0) {
+                const createdAtValue = chatDoc.messages[lastMessageIndex].createdAt;
+                const mntsAgoValue = Math.floor((Date.now() - createdAtValue) / 60000);
+                io.to(senderId).emit('lastMessageTimestamp', mntsAgoValue);
+                io.to(receiverId).emit('lastMessageTimestamp', mntsAgoValue);
+            }
+        }
+
+        // Emit the updated chat list to both users
+        io.to(senderId).emit('chatListUpdate', { success: true });
+        io.to(receiverId).emit('chatListUpdate', { success: true });
+
+        res.status(200).json({ success: true, message: 'Voice message sent.' });
+    } catch (error) {
+        console.error('Error sending voice message:', error);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+
+
+
+    //sending message
+    app.post('/sendMessage', async (req, res) => {
+      const chatCollection = databaseinmongo.collection("chatCollection");
+      const chatDB = databaseinmongo.collection("chatDB");
+
+      try {
+          const { chatId, senderId, text, imgUrl, receiverId } = req.body;
+  
+          if (!chatId || !senderId || !receiverId) {
+              return res.status(400).json({ error: 'Missing required fields.' });
+          }
+  
+          const message = {
+              senderId,
+              ...(text && { text }), // Only include text if it exists
+              createdAt: new Date(),
+              ...(imgUrl && { imageUrl: imgUrl }), // Only include image if provided
+              lastMessageFeedback: null,
+          };
+  
+          // Add message to chatDB collection
+          const result = await chatDB.updateOne(
+              { _id: new ObjectId(chatId) },
+              { $push: { messages: message } }
+          );
+  
+          if (result.modifiedCount === 0) {
+              return res.status(404).json({ error: 'Chat not found.' });
+          }
+  
+          // Update last message details for both users in chatCollection
+          const userIds = [senderId, receiverId];
+  
+          await Promise.all(
+              userIds.map(async (id) => {
+                  await chatCollection.updateOne(
+                      { _id: id, 'chats.chatId': chatId },
+                      {
+                          $set: {
+                              'chats.$.lastMessage': text || '📷 Image',
+                              'chats.$.isSeen': id === senderId,
+                              'chats.$.lastMessageFeedback': null,
+                              'chats.$.updatedAt': Date.now(),
+                          },
+                      }
+                  );
+              })
+          );
+  
+          // Fetch the updated chat document
+          const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+  
+          // Emit the updated chat to all users in the chat room
+          io.to(chatId).emit('chatUpdate', updatedChat);
+          
+
+
+          // Fetch the updated chat list for both users and populate `userss`
+        const updatedChatLists = await Promise.all(
+          userIds.map(async (id) => {
+              const userChatDoc = await chatCollection.findOne({ _id: id });
+              if (!userChatDoc) return [];
+
+              const chatInfos = userChatDoc.chats || [];
+              const populatedChats = await Promise.all(
+                  chatInfos.map(async (item) => {
+                      const collectionName = item.yourRole === 'student' ? 'studentCollection' : 'teacherCollection';
+                      const userDoc = await database.collection(collectionName).doc(item.receiverId).get();
+                        const userss = userDoc.exists ? userDoc.data() : {};
+
+                      return { ...item, userss };
+                  })
+              );
+
+              return populatedChats;
+          })
+      );
+
+      // Emit the updated chat list to both users
+      userIds.forEach((id, index) => {
+          const chatList = updatedChatLists[index];
+          const unseenCount = chatList.filter(chat => !chat.isSeen).length;
+          io.to(id).emit('chatListUpdate', { chatList, unseenCount });
+      });
+
+          
+  
+          res.json({ success: true, message });
+      } catch (error) {
+          console.error('Error sending message:', error);
+          res.status(500).json({ error: 'Internal server error.' });
+      }
+  });
+
+    //mark message as seen
+    app.put('/mark-chat-as-seen', async (req, res) => {
+      const { userId, chatId } = req.body;
+
+      const chatCollection = databaseinmongo.collection("chatCollection");
+  
+      if (!userId || !chatId) {
+          return res.status(400).json({ message: 'userId and chatId are required' });
+      }
+  
+      try {
+          // Find the user's chat document in MongoDB
+          const userChatDoc = await chatCollection.findOne({ _id: userId });
+  
+          if (!userChatDoc) {
+              return res.status(404).json({ message: 'User chat document not found' });
+          }
+  
+          // Find the chat to mark as seen
+          const chatIndex = userChatDoc.chats.findIndex((item) => item.chatId === chatId);
+  
+          if (chatIndex === -1) {
+              return res.status(404).json({ message: 'Chat not found' });
+          }
+  
+          // Update the isSeen status
+          userChatDoc.chats[chatIndex].isSeen = true;
+  
+          // Update the chat document in MongoDB
+          await chatCollection.updateOne(
+              {_id: userId },
+              { $set: { chats: userChatDoc.chats } }
+          );
+  
+          return res.status(200).json({ message: 'Chat marked as seen successfully' });
+      } catch (err) {
+          console.error('Error marking chat as seen:', err);
+          return res.status(500).json({ message: 'Internal server error' });
+      }
+  });
+
+  app.put('/update-feedback', async (req, res) => {
+    const { chatId, index, isLike } = req.body;
+    if (!index || !chatId) {
+        return;
+    }
+
+    try {
+        const chatDB = databaseinmongo.collection('chatDB');
+
+        const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+
+        if (!chat) {
+            return;
+        }
+
+        let messages = chat.messages || [];
+
+        if (messages[index]) {
+            messages[index] = {
+                ...messages[index],
+                lastMessageFeedback: isLike ? 'liked' : 'disliked',
+            };
+
+            await chatDB.updateOne(
+                { _id: new ObjectId(chatId) },
+                { $set: { messages } }
+            );
+
+            const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+            io.to(chatId).emit('chatUpdate', updatedChat);
+
+            return;
+        } else {
+            return;
+        }
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Internal server error.');
+    }
+});
+
+
+    io.on('connection', (socket) => {
+      console.log('A user connected:', socket.id);
+      const chatDB = databaseinmongo.collection("chatDB");
+      socket.on('sendVoiceMessage', async ({ chatId, senderId, audioUrl }) => {
+        try {    
+            // Find the chat document
+            const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+    
+            if (!chatDoc) {
+                socket.emit('chatError', { message: 'Chat not found' });
+                return;
+            }
+    
+            // Ensure `messages` field is an array before updating
+            const updatedMessages = Array.isArray(chatDoc.messages) ? [...chatDoc.messages] : [];
+    
+            // Add the new voice message
+            const newMessage = {
+                audioUrl: audioUrl,
+                senderId: senderId,
+                lastMessageFeedback: null,
+                createdAt: Date.now()
+            };
+            updatedMessages.push(newMessage);
+    
+            // Update the chat document in MongoDB
+            await chatDB.updateOne(
+                { _id: new ObjectId(chatId) },
+                { $set: { messages: updatedMessages, updatedAt: Date.now() } }
+            );
+    
+            // Fetch the updated chat and emit it
+            const updatedChatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+    
+            if (updatedChatDoc) {
+                // Emit the updated chat to both users
+                io.to(chatId).emit('chatUpdate', updatedChatDoc);
+    
+                // Emit the last message timestamp
+                const mntsAgoValue = Math.floor((Date.now() - newMessage.createdAt) / 60000);
+                io.to(chatId).emit('lastMessageTimestamp', mntsAgoValue);
+            }
+        } catch (err) {
+            console.error('Error sending voice message:', err);
+            socket.emit('chatError', { message: 'Failed to send voice message' });
+        }
+    });
+
+      socket.on('joinChatRoom', async (chatId) => {
+        const chatDB = databaseinmongo.collection("chatDB");
+
+        socket.join(chatId);
+        console.log(`User joined chat room: ${chatId}`);
+
+        try {
+            // Fetch the chat document from MongoDB
+            const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+
+            
+
+            if (chatDoc) {
+                // Emit the initial chat data to the user
+                socket.emit('chatUpdate', chatDoc);
+
+                // Calculate and emit the last message timestamp
+                const lastMessageIndex = chatDoc.messages.length - 1;
+                if (lastMessageIndex >= 0) {
+                    const createdAtValue = chatDoc.messages[lastMessageIndex].createdAt;
+                    const mntsAgoValue = Math.floor((Date.now() - createdAtValue) / 60000);
+                    socket.emit('lastMessageTimestamp', mntsAgoValue);
+                }
+            } else {
+                socket.emit('chatError', { message: 'Chat not found' });
+            }
+        } catch (err) {
+            console.error('Error fetching chat:', err);
+            socket.emit('chatError', { message: 'Failed to fetch chat' });
+        }
+    });
+
+  
+      // Listen for user joining (e.g., when a user logs in)
+      socket.on('joinRoom', async (userId) => {
+          socket.join(userId);
+          console.log(`User ${userId} joined the room.`);
+  
+          // Fetch and send the chat list for the user
+          try {
+              const chatCollection = databaseinmongo.collection('chatCollection');
+              const userChatDoc = await chatCollection.findOne({ _id: userId });
+  
+              if (userChatDoc) {
+                  const chatInfos = userChatDoc.chats || [];
+                  let totalUnseen = 0;
+  
+                  const promises = chatInfos.map(async (item) => {
+                      const collectionName = item.yourRole === 'student' ? 'studentCollection' : 'teacherCollection';
+                      const userDoc = await database.collection(collectionName).doc(item.receiverId).get();
+                      const userss = userDoc.exists ? userDoc.data() : {};
+  
+                      // Count unseen messages
+                      if (item.isSeen === false) {
+                          totalUnseen++;
+                      }
+  
+                      return { ...item, userss };
+                  });
+  
+                  const chatData = await Promise.all(promises);
+                  const sortedChatData = chatData.sort((a, b) => b.updatedAt - a.updatedAt);
+  
+                  // Emit the chat list to the user
+                  socket.emit('chatListUpdate', { chatList: sortedChatData, unseenCount: totalUnseen });
+              }
+          } catch (err) {
+              console.error('Error fetching chat list:', err);
+              socket.emit('chatListError', { message: 'Failed to fetch chat list' });
+          }
+      });
+  
+      
+  });
+    
+
+
+
+
+
   
 
     app.post("/closeCalculation", async(req, res) => {
@@ -698,7 +1188,11 @@ run().catch(console.dir);
 
 
 
-app.listen(port, () => {
-    console.log("The Server Is running...")
+// app.listen(port, () => {
+//     console.log("The Server Is running...")
     
+// });
+server.listen(port, () => {
+  console.log("The Server Is running...")
+  
 });
