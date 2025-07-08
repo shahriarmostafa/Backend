@@ -117,18 +117,16 @@ app.post("/generate-token", (req, res) => {
     const expirationTimeInSeconds = 3600; // 1 hour
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-    const uid = receiverID;
+    const uid = Math.floor(100000 + Math.random() * 900000);
     const token = RtcTokenBuilder.buildTokenWithUid(
         APP_ID,
         APP_CERTIFICATE,
         channelName,
-        uid, // Auto-generate UID if not provided
+        uid,
         role,
         privilegeExpiredTs
     );
     
-    
-
     res.json({ token, uid});
 })
 
@@ -1188,10 +1186,7 @@ run().catch(console.dir);
 
 
 
-// app.listen(port, () => {
-//     console.log("The Server Is running...")
-    
-// });
+
 server.listen(port, () => {
   console.log("The Server Is running...")
   
