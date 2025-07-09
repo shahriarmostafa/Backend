@@ -18,7 +18,7 @@ const server = http.createServer(app);
 
 const io = require("socket.io")(server,{
   cors: {
-    origin: "http://localhost:5173", // Allow frontend to connect (replace with frontend URL in production)
+    origin: "https://app.poperl.com", // Allow frontend to connect (replace with frontend URL in production)
     methods: ["GET", "POST"]
   }
 })
@@ -113,7 +113,9 @@ app.post("/generate-token", (req, res) => {
   if(!channelName){    
     return res.status(400).json({ error: "Channel name is required" });
   }
-  const role = RtcRole.PUBLISHER;
+  
+  try{
+    const role = RtcRole.PUBLISHER;
     const expirationTimeInSeconds = 3600; // 1 hour
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
@@ -126,8 +128,16 @@ app.post("/generate-token", (req, res) => {
         role,
         privilegeExpiredTs
     );
+
+    console.log(token);
+    
+    
     
     res.json({ token, uid});
+  }
+  catch(err){
+    console.log(err);
+  }
 })
 
 
