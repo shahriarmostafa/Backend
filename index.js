@@ -199,6 +199,19 @@ app.post("/setTokenToProfile", async(req, res) => {
 })
 
 
+app.post('/createCustomToken', async (req, res) => {
+  const { uid } = req.body;
+
+  try {
+    const customToken = await admin.auth().createCustomToken(uid);
+    res.json({ token: customToken });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error creating token');
+  }
+});
+
+
 
 
 
