@@ -997,6 +997,7 @@ async function run() {
       //call functions with socket.io
       socket.on('start-call', ({ receiverId, channelName, callerName }) => {
         // Send to the receiver only
+        console.log("Started call for :" + receiverId);
         
         io.to(receiverId).emit('incoming-call', {
           receiverId,
