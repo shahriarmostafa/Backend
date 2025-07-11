@@ -989,6 +989,11 @@ async function run() {
           }
       });
 
+      socket.on('register-user', ({ userId }) => {
+        socket.join(userId);
+        console.log(`✅ ${userId} joined room`);
+      });
+
       //call functions with socket.io
       socket.on('start-call', ({ receiverId, channelName, callerName }) => {
         // Send to the receiver only
