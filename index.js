@@ -988,8 +988,17 @@ async function run() {
               socket.emit('chatListError', { message: 'Failed to fetch chat list' });
           }
       });
-  
-      
+
+      //call functions with socket.io
+      socket.on('start-call', ({ receiverId, channelName, callerName }) => {
+        // Send to the receiver only
+        io.to(receiverId).emit('incoming-call', {
+          callerId,
+          channelName,
+          callerName,
+          timestamp: Date.now()
+        });
+      });
   });
     
 
