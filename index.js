@@ -18,10 +18,30 @@ const server = http.createServer(app);
 
 const io = require("socket.io")(server,{
   cors: {
-    origin: "https://app.poperl.com", // Allow frontend to connect (replace with frontend URL in production)
+    origin: "*", // Allow frontend to connect (replace with frontend URL in production)
     methods: ["GET", "POST"]
   }
 })
+
+// const allowedOrigins = [
+//   "https://app.poperl.com", // web
+//   "http://localhost:19006", // Expo Go
+//   "exp://192.168.x.x:19000", // Expo dev URLs (mobile)
+// ];
+
+// const io = require("socket.io")(server, {
+//   cors: {
+//     origin: (origin, callback) => {
+//       if (!origin || allowedOrigins.includes(origin)) {
+//         callback(null, true);
+//       } else {
+//         callback(new Error("Not allowed by CORS"));
+//       }
+//     },
+//     methods: ["GET", "POST"]
+//   }
+// });
+
 
 
 
