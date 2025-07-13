@@ -128,7 +128,7 @@ app.post('/generate-whiteboard-token', async (req, res) => {
 
 app.post("/generate-token", (req, res) => {
   
-  const {channelName, receiverID} = req.body;
+  const {channelName} = req.body;
   
   if(!channelName){    
     return res.status(400).json({ error: "Channel name is required" });
