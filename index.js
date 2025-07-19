@@ -653,9 +653,14 @@ async function run() {
 
     //call session and point update...
     app.post("/start-call", async (req, res) => {
-      const callData = req.body;
+      const {sessionId, studentId, teacherId, startTime} = req.body;
       const callSession = databaseinmongo.collection("callSession");
-      await callSession.insertOne({callData})
+      await callSession.insertOne({
+        sessionId,
+        studentId,
+        teacherId,
+        startTime
+      });
     })
 
     app.post("/end-call", async (req, res) => {
