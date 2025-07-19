@@ -651,6 +651,92 @@ async function run() {
     });
 
 
+    //call session and point update...
+    app.post("/start-call", async (req, res) => {
+      const callData = req.body;
+      const callSession = databaseinmongo.collection("callSession");
+      await callSession.insertOne({callData})
+    })
+
+    app.post("/end-call", async (req, res) => {
+  try {
+    const { sessionId, endTime } = req.body;
+
+    const callSession = databaseinmongo.collection("callSession");
+
+    // Find session by sessionId
+    const session = await callSession.findOne({ sessionId });
+
+    if (!session) {
+      return res.status(404).json({ success: false, message: "Session not found" });
+    }
+
+    // Calculate duration
+    const seconds = Math.floor((endTime - session.startTime) / 1000);
+
+    // Determine call points
+    let callPoints = 0;
+    if (seconds >= 30 && seconds < 180) callPoints = 2;
+    else if (seconds >= 180 && seconds < 300) callPoints = 3;
+    else if (seconds >= 300 && seconds < 600) callPoints = 5;
+    else if (seconds >= 600 && seconds < 900) callPoints = 8;
+    else if (seconds >= 900 && seconds < 1200) callPoints = 12;
+    else if (seconds >= 1200 && seconds < 1500) callPoints = 15;
+    else if (seconds >= 1500) callPoints = 20;
+
+    // Update session with end data
+    await callSession.updateOne(
+      { sessionId },
+      {
+        $set: {
+          endTime,
+          seconds,
+          callPoints,
+          endedAt: new Date(endTime),
+        },
+      }
+    );
+
+    // Update teacher points in Firestore
+    if (callPoints > 0 && session.teacherId) {
+      const teacherRef = teacherCollection.doc(session.teacherId);
+      const teacherSnap = await teacherRef.get();
+
+      if (teacherSnap.exists) {
+        const prevPoints = teacherSnap.data().points || 0;
+        await teacherRef.update({
+          points: prevPoints + callPoints,
+        });
+      }
+    }
+
+    // Fetch student document
+      const studentRef = studentCollection.doc(session.studentId);
+      const studentSnap = await studentRef.get();
+
+      if (studentSnap.exists) {
+        const sub = studentSnap.data()?.subscription || {};
+        let currentCredit = sub?.credit || 0;
+
+        const creditToDeduct = Math.ceil(seconds / 10); // 1 credit per 10 seconds
+
+        if (creditToDeduct > 0) {
+          currentCredit = Math.max(currentCredit - creditToDeduct, 0); // don't go negative
+
+          await studentRef.update({
+            "subscription.credit": currentCredit,
+          });
+        }
+      }
+
+    return res.status(200).json({ success: true, pointsGiven: callPoints });
+  } catch (err) {
+    console.error("Error in /end-call:", err);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+
   // Backend: sendVoiceMessage route
   app.post('/sendVoiceMessage', async (req, res) => {
     const { chatId, senderId, receiverId, audioUrl } = req.body;
