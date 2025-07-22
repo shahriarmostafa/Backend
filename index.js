@@ -725,10 +725,10 @@ async function run() {
         const sub = studentSnap.data()?.subscription || {};
         let currentCredit = sub?.credit || 0;
 
-        const creditToDeduct = Math.ceil(seconds / 10); // 1 credit per 10 seconds
+        const creditToDeduct = Math.round(seconds / 10); // 1 credit per 10 seconds
 
         if (creditToDeduct > 0) {
-          currentCredit = Math.min(currentCredit - creditToDeduct, 0); // don't go negative
+          currentCredit = Math.max(currentCredit - creditToDeduct, 0); // don't go negative
 
           await studentRef.update({
             "subscription.credit": currentCredit,
