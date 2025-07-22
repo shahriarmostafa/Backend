@@ -726,7 +726,7 @@ async function run() {
         const creditToDeduct = Math.ceil(seconds / 10); // 1 credit per 10 seconds
 
         if (creditToDeduct > 0) {
-          currentCredit = Math.max(currentCredit - creditToDeduct, 0); // don't go negative
+          currentCredit = Math.min(currentCredit - creditToDeduct, 0); // don't go negative
 
           await studentRef.update({
             "subscription.credit": currentCredit,
