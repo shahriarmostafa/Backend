@@ -653,16 +653,35 @@ async function run() {
 
     //call session and point update...
     app.post("/start-call", async (req, res) => {
-      const {sessionId, studentId, teacherId} = req.body;
-      const callSession = databaseinmongo.collection("callSession");
-      const startTime = Date.now();
-      await callSession.insertOne({
-        sessionId,
-        studentId,
-        teacherId,
-        startTime
-      });
-    })
+  try {
+    const { sessionId, studentId, teacherId } = req.body;
+    const callSession = databaseinmongo.collection("callSession");
+
+    const startTime = Date.now();
+
+    const result = await callSession.updateOne(
+      { sessionId },
+      {
+        $setOnInsert: {
+          studentId,
+          teacherId,
+          startTime
+        }
+      },
+      { upsert: true }
+    );
+
+    if (result.upsertedCount > 0) {
+      return res.status(201).json({ success: true, message: "Call session created" });
+    } else {
+      return res.status(200).json({ success: false, message: "Call session already exists" });
+    }
+  } catch (error) {
+    console.error("Error starting call session:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
 
     app.post("/end-call", async (req, res) => {
   try {
