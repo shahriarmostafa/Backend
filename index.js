@@ -697,6 +697,15 @@ async function run() {
       return res.status(404).json({ success: false, message: "Session not found" });
     }
 
+    // Check if session already ended
+    if (session.endTime) {
+      return res.status(200).json({ 
+        success: true, 
+        message: "Call already ended", 
+        pointsGiven: session.callPoints || 0 
+      });
+    }
+
     // Calculate duration
     const seconds = Math.floor((endTime - session.startTime) / 1000);
 
@@ -737,23 +746,23 @@ async function run() {
     }
 
     // Fetch student document
-      const studentRef = studentCollection.doc(session.studentId);
-      const studentSnap = await studentRef.get();
+    const studentRef = studentCollection.doc(session.studentId);
+    const studentSnap = await studentRef.get();
 
-      if (studentSnap.exists) {
-        const sub = studentSnap.data()?.subscription || {};
-        let currentCredit = sub?.credit || 0;
+    if (studentSnap.exists) {
+      const sub = studentSnap.data()?.subscription || {};
+      let currentCredit = sub?.credit || 0;
 
-        const creditToDeduct = Math.round(seconds / 10); // 1 credit per 10 seconds
+      const creditToDeduct = Math.round(seconds / 10); // 1 credit per 10 seconds
 
-        if (creditToDeduct > 0) {
-          currentCredit = Math.max(currentCredit - creditToDeduct, 0); // don't go negative
+      if (creditToDeduct > 0) {
+        currentCredit = Math.max(currentCredit - creditToDeduct, 0); // avoid negative credit
 
-          await studentRef.update({
-            "subscription.credit": currentCredit,
-          });
-        }
+        await studentRef.update({
+          "subscription.credit": currentCredit,
+        });
       }
+    }
 
     return res.status(200).json({ success: true, pointsGiven: callPoints });
   } catch (err) {
@@ -761,6 +770,7 @@ async function run() {
     return res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
+
 
 
   // Backend: sendVoiceMessage route
