@@ -514,72 +514,79 @@ async function run() {
 
 
     //userProfile Informations
-    app.post("/newStudent", async (req, res) => {
-      try {
-        const user = req.body;
-    
-        const query = await studentCollection.where("email", "==", user.email).get();
-    
-        if(!query.empty){
-          return res.status(200).json({success: true})
-        }
-    
-        // Save user to the student collection
-        const result = await studentCollection.doc(user?.uid).set(user);
-    
-        // Initialize an empty chat list for the user
-        const result2 = await databaseinmongo.collection("chatCollection").insertOne({_id: user?.uid,  chats: []});
-    
-    
-        // Send response with HTTP status 200 and response body
-        res.status(200).send({ result, result2 });
-      } catch (error) {
-        console.error(error);
-    
-        // Handle errors and send appropriate error response
-        res.status(500).send({ error: "An error occurred while processing the request." });
-      }
-    });
+
+app.post("/newStudent", async (req, res) => {
+  try {
+    const user = req.body;
+
+    // Check if user already exists in teacherCollection
+    const teacherQuery = await teacherCollection.where("email", "==", user.email).get();
+    if (!teacherQuery.empty) {
+      return res.status(200).json({ success: true, message: "User is a teacher, skipping student registration." });
+    }
+
+    // Check if user already exists in studentCollection
+    const studentQuery = await studentCollection.where("email", "==", user.email).get();
+    if (!studentQuery.empty) {
+      return res.status(200).json({ success: true, message: "User already registered as student." });
+    }
+
+    // Save user to the student collection
+    const result = await studentCollection.doc(user?.uid).set(user);
+
+    // Initialize an empty chat list for the user
+    const result2 = await databaseinmongo
+      .collection("chatCollection")
+      .insertOne({ _id: user?.uid, chats: [] });
+
+    // Send response
+    res.status(200).send({ result, result2 });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ error: "An error occurred while processing the request." });
+  }
+});
+
     
     app.post("/newTeacher", async (req, res) => {
-      try {
-        const user = req.body;
-    
-    
-    
-        const query = await teacherCollection.where("email", "==", user.email).get();
-    
-    
-        if(!query.empty){
-          return res.status(200).json({success: true})
-        }
-    
-        if (!user.rating){
-          return res.status(200).json({success: false})
-        }
-    
-        // Add teacher data to the teacher collection
-        const result = await teacherCollection.doc(user?.uid).set(user);
-    
-        // Initialize an empty chat list for the teacher
-        const result2 = await databaseinmongo.collection("chatCollection").updateOne(
-          { _id: user?.uid },  // Check if the document for this user already exists
-          {
-            $setOnInsert: { chats: [] }, // Ensure 'chats' is initialized as an empty array if document is created
-          },
-          { upsert: true } // This will create the document if it doesn't exist
-        );    
-        // Log both results for debugging
-    
-        // Send a success response
-        res.status(200).send({ success: true, message: "Teacher added successfully." });
-      } catch (error) {
-        console.error(error);
-    
-        // Handle errors and send an appropriate response
-        res.status(500).send({ success: false, error: "Failed to add a new teacher." });
-      }
-    });
+  try {
+    const user = req.body;
+
+    // Check if user already exists in studentCollection
+    const studentQuery = await studentCollection.where("email", "==", user.email).get();
+    if (!studentQuery.empty) {
+      return res.status(200).json({ success: true, message: "User is a student, skipping teacher registration." });
+    }
+
+    // Check if user already exists in teacherCollection
+    const teacherQuery = await teacherCollection.where("email", "==", user.email).get();
+    if (!teacherQuery.empty) {
+      return res.status(200).json({ success: true, message: "User already registered as teacher." });
+    }
+
+    // Check if rating exists
+    if (!user.rating) {
+      return res.status(200).json({ success: false, message: "Missing rating in teacher data." });
+    }
+
+    // Add teacher data to the teacher collection
+    const result = await teacherCollection.doc(user?.uid).set(user);
+
+    // Initialize an empty chat list for the teacher
+    const result2 = await databaseinmongo.collection("chatCollection").updateOne(
+      { _id: user?.uid },
+      { $setOnInsert: { chats: [] } },
+      { upsert: true }
+    );
+
+    // Send a success response
+    res.status(200).send({ success: true, message: "Teacher added successfully." });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ success: false, error: "Failed to add a new teacher." });
+  }
+});
+
 
     //chat codes
     //check if a chat already exist
