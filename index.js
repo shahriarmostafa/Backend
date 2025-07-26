@@ -43,7 +43,15 @@ const io = require("socket.io")(server,{
 // });
 
 
-
+const shurjopay = require("shurjopay")();
+shurjopay.config(
+  process.env.SP_ENDPOINT,
+  process.env.SP_USERNAME,
+  process.env.SP_PASSWORD,
+  process.env.SP_PREFIX,
+  process.env.SP_RETURN_URL,
+  process.env.SP_CANCEL_URL
+);
 
 
 
@@ -466,6 +474,36 @@ app.post("/resetPoints", async (req, res) => {
     res.status(500).json({ success: false, message: "Server error." });
   }
 })
+
+
+//payment
+app.post('/pay-poperl', async (req, res) => {
+  const { amount, order_id, customer_name, customer_phone } = req.body;
+
+  shurjopay.makePayment({
+    amount,
+    order_id,
+    customer_name,
+    customer_phone,
+    client_ip: req.ip || "127.0.0.1",
+  }, (resp) => {
+    res.json({ checkout_url: resp.checkout_url });
+  }, (err) => {
+    res.status(500).json({ error: err.message });
+  });
+});
+
+
+app.get('/verify-payment/:orderId', (req, res) => {
+  const { orderId } = req.params;
+  shurjopay.verifyPayment(orderId, (result) => {
+    res.json(result);
+  }, (err) => {
+    res.status(500).json({ error: err.message });
+  });
+});
+
+
 
 
 
@@ -1156,6 +1194,99 @@ app.post("/newStudent", async (req, res) => {
         });
       });
   });
+
+
+  //payment
+  app.post('/pay-poperl', async (req, res) => {
+  const {
+    amount,
+    order_id,
+    customer_name,
+    customer_phone,
+    uid,
+    displayName,
+    packageName,
+    price,
+    durationDays
+  } = req.body;
+
+  const metadata = {
+    uid,
+    displayName,
+    packageName,
+    price,
+    durationDays
+  };
+
+  shurjopay.makePayment({
+    amount,
+    order_id,
+    customer_name,
+    customer_phone,
+    client_ip: req.ip || "127.0.0.1",
+    value_a: JSON.stringify(metadata) // Pass metadata here
+  }, (resp) => {
+    res.json({ checkout_url: resp.checkout_url });
+  }, (err) => {
+    console.error("Payment error:", err);
+    res.status(500).json({ error: err.message });
+  });
+});
+
+
+app.get('/payment-success', async (req, res) => {
+  const { order_id } = req.query;
+
+  shurjopay.verifyPayment(order_id, async (result) => {
+    if (result.sp_code === '1000') {
+      // Payment success
+      const userData = JSON.parse(result.value_a); // You passed this from frontend
+
+      const { uid, displayName, packageName, durationDays, price } = userData;
+      const startDate = new Date();
+      const expiryDate = new Date();
+      expiryDate.setDate(startDate.getDate() + durationDays);
+
+      // Firestore
+      const userRef = doc(db, "studentCollection", uid);
+      await updateDoc(userRef, {
+        subscription: {
+          packageName,
+          startDate: startDate.toISOString(),
+          expiryDate: expiryDate.toISOString(),
+          credit: 0,
+          isActive: true,
+          paymentStatus: "approved",
+          purchasedAt: serverTimestamp()
+        }
+      });
+
+      // MongoDB
+      const subscriptions = databaseinmongo.collection("subscriptions");
+      await subscriptions.insertOne({
+        uid,
+        name: displayName,
+        packageName,
+        price,
+        startDate: startDate.toISOString(),
+        paymentId: result.sp_payment_option,
+        orderId: order_id,
+        createdAt: new Date()
+      });
+
+      // Redirect to app
+      res.redirect("poperl://subscription-success");
+    } else {
+      res.redirect("poperl://subscription-failure");
+    }
+  }, (err) => {
+    console.error(err);
+    res.redirect("poperl://subscription-failure");
+  });
+});
+
+
+
     
 
 
@@ -1211,14 +1342,14 @@ app.post("/newStudent", async (req, res) => {
       }
     })
 
-    app.post("/subscriptions", async (req, res) => {
-      try{
-        const subscriptions = databaseinmongo.collection("subscriptions");
-        const result = await subscriptions.insertOne(req.body);
-      }catch(err){
-        console.log(err);
-      }
-    })
+    // app.post("/subscriptions", async (req, res) => {
+    //   try{
+    //     const subscriptions = databaseinmongo.collection("subscriptions");
+    //     const result = await subscriptions.insertOne(req.body);
+    //   }catch(err){
+    //     console.log(err);
+    //   }
+    // })
 
     app.get("/salaryData", async(req, res) => {
       try{
