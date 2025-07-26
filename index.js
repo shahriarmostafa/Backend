@@ -176,8 +176,6 @@ const {database, admin} = require("./firebase.config");
 const studentCollection = database.collection("studentCollection");
 const teacherCollection = database.collection("teacherCollection");
 
-const chatListCollection = database.collection("chatCollection");
-
 
 
 
@@ -501,6 +499,9 @@ async function run() {
     await client.connect();
 
     const databaseinmongo = client.db("PoperL");
+
+    const tempCollection = databaseinmongo.collection("tempCollection");
+
 
     //check if admin
 
@@ -1199,6 +1200,16 @@ app.post("/newStudent", async (req, res) => {
     credit
   };
 
+    await tempCollection.insertOne({
+    order_id,
+    uid,
+    packageName,
+    price,
+    durationDays,
+    credit: credit,
+    createdAt: new Date(),
+  });
+
   shurjopay.makePayment({
     amount,
     order_id,
@@ -1216,6 +1227,53 @@ app.post("/newStudent", async (req, res) => {
     res.status(500).json({ error: err.message });
   });
 });
+
+app.post("/finalize-subscription", async (req, res) => {
+  const { order_id } = req.body;
+
+  if (!order_id) return res.status(400).json({ error: "Missing order_id" });
+
+  // Fetch metadata from temp collection
+  const orderData = await tempCollection.findOne({ order_id });
+  if (!orderData) return res.status(404).json({ error: "Order not found" });
+
+  const { uid, displayName, packageName, price, durationDays, credit } = orderData;
+
+  const startDate = new Date();
+  const expiryDate = new Date();
+  expiryDate.setDate(startDate.getDate() + durationDays);
+
+  const userRef = studentCollection.doc(uid);
+
+// Perform the update
+await userRef.update({
+  subscription: {
+    packageName,
+    startDate: startDate.toISOString(),
+    expiryDate: expiryDate.toISOString(),
+    credit,
+    isActive: true,
+    paymentStatus: "approved",
+    purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+  },
+});
+
+  // MongoDB
+  const subscriptions = databaseinmongo.collection("subscriptions");
+  await subscriptions.insertOne({
+    uid,
+    name: displayName,
+    packageName,
+    price,
+    startDate: startDate.toISOString(),
+    paymentId: "unknown", // or pull from ShurjoPay if you want
+    orderId: order_id,
+    createdAt: new Date(),
+  });
+
+  return res.json({ success: true });
+});
+
 
 
 app.get('/payment-success', async (req, res) => {
