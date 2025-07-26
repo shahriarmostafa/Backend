@@ -1186,7 +1186,8 @@ app.post("/newStudent", async (req, res) => {
     durationDays,
     customer_city,
     currency,
-    customer_address
+    customer_address,
+    credit
   } = req.body;
 
   const metadata = {
@@ -1194,7 +1195,8 @@ app.post("/newStudent", async (req, res) => {
     displayName,
     packageName,
     price,
-    durationDays
+    durationDays,
+    credit
   };
 
   shurjopay.makePayment({
@@ -1224,7 +1226,7 @@ app.get('/payment-success', async (req, res) => {
       // Payment success
       const userData = JSON.parse(result.value_a); // You passed this from frontend
 
-      const { uid, displayName, packageName, durationDays, price } = userData;
+      const { uid, displayName, packageName, durationDays, price, credit } = userData;
       const startDate = new Date();
       const expiryDate = new Date();
       expiryDate.setDate(startDate.getDate() + durationDays);
@@ -1236,7 +1238,7 @@ app.get('/payment-success', async (req, res) => {
           packageName,
           startDate: startDate.toISOString(),
           expiryDate: expiryDate.toISOString(),
-          credit: 0,
+          credit: credit,
           isActive: true,
           paymentStatus: "approved",
           purchasedAt: serverTimestamp()
