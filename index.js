@@ -476,32 +476,7 @@ app.post("/resetPoints", async (req, res) => {
 })
 
 
-//payment
-app.post('/pay-poperl', async (req, res) => {
-  const { amount, order_id, customer_name, customer_phone } = req.body;
 
-  shurjopay.makePayment({
-    amount,
-    order_id,
-    customer_name,
-    customer_phone,
-    client_ip: req.ip || "127.0.0.1",
-  }, (resp) => {
-    res.json({ checkout_url: resp.checkout_url });
-  }, (err) => {
-    res.status(500).json({ error: err.message });
-  });
-});
-
-
-app.get('/verify-payment/:orderId', (req, res) => {
-  const { orderId } = req.params;
-  shurjopay.verifyPayment(orderId, (result) => {
-    res.json(result);
-  }, (err) => {
-    res.status(500).json({ error: err.message });
-  });
-});
 
 
 
@@ -1198,6 +1173,7 @@ app.post("/newStudent", async (req, res) => {
 
   //payment
   app.post('/pay-poperl', async (req, res) => {
+    
   const {
     amount,
     order_id,
@@ -1207,7 +1183,10 @@ app.post("/newStudent", async (req, res) => {
     displayName,
     packageName,
     price,
-    durationDays
+    durationDays,
+    customer_city,
+    currency,
+    customer_address
   } = req.body;
 
   const metadata = {
@@ -1224,9 +1203,12 @@ app.post("/newStudent", async (req, res) => {
     customer_name,
     customer_phone,
     client_ip: req.ip || "127.0.0.1",
+    customer_city,
+    currency,
+    customer_address,
     value_a: JSON.stringify(metadata) // Pass metadata here
   }, (resp) => {
-    res.json({ checkout_url: resp.checkout_url });
+    res.json({ checkout_url: resp.checkout_url });    
   }, (err) => {
     console.error("Payment error:", err);
     res.status(500).json({ error: err.message });
