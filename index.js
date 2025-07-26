@@ -1200,15 +1200,7 @@ app.post("/newStudent", async (req, res) => {
     credit
   };
 
-    await tempCollection.insertOne({
-    order_id,
-    uid,
-    packageName,
-    price,
-    durationDays,
-    credit: credit,
-    createdAt: new Date(),
-  });
+    
 
   shurjopay.makePayment({
     amount,
@@ -1220,7 +1212,17 @@ app.post("/newStudent", async (req, res) => {
     currency,
     customer_address,
     value_a: JSON.stringify(metadata) // Pass metadata here
-  }, (resp) => {
+  }, async (resp) => {
+    await tempCollection.insertOne({
+    order_id: resp.sp_order_id,
+    uid,
+    packageName,
+    price,
+    durationDays,
+    credit: credit,
+    createdAt: new Date(),
+  });
+  
     res.json({ checkout_url: resp.checkout_url });    
   }, (err) => {
     console.error("Payment error:", err);
