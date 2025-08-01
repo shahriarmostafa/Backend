@@ -732,13 +732,13 @@ app.post("/newStudent", async (req, res) => {
 
     // Determine call points
     let callPoints = 0;
-    if (seconds >= 30 && seconds < 180) callPoints = 2;
+    if (seconds >= 60 && seconds < 180) callPoints = 2;
     else if (seconds >= 180 && seconds < 300) callPoints = 3;
     else if (seconds >= 300 && seconds < 600) callPoints = 5;
     else if (seconds >= 600 && seconds < 900) callPoints = 8;
     else if (seconds >= 900 && seconds < 1200) callPoints = 12;
     else if (seconds >= 1200 && seconds < 1500) callPoints = 15;
-    else if (seconds >= 1500) callPoints = 20;
+    else if (seconds >= 1500) callPoints = 18;
 
     // Update session with end data
     await callSession.updateOne(
@@ -1523,7 +1523,7 @@ app.get('/payment-success', async (req, res) => {
           {
             $set: {
               price: req.body.price,
-              dailyMinutesLimit: req.body.callDuration,
+              credit: req.body.credit,
               name: req.body.name
             }
           }
