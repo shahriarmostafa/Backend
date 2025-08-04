@@ -307,6 +307,43 @@ app.post("/send-call-notification", async (req, res) => {
 
 
 
+
+app.get("/ActiveTeacherList", async (req, res) => {
+  try {
+    const { category, subject } = req.query;
+
+    // Start with approved and active teachers
+    let query = teacherCollection
+      .where("approved", "==", true)
+      .where("isActive", "==", true);
+
+    if (category) {
+      query = query.where("category", "==", category);
+    }
+
+    if (subject) {
+      query = query.where("subjects", "array-contains", subject);
+    }
+
+    // Fetch filtered teachers from the teacher collection
+    const result = await query.get();
+
+    const teacherList = [];
+    result.forEach(doc => {
+      teacherList.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Send the list of teachers as the response
+    res.status(200).send({ success: true, teachers: teacherList });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
+  }
+});
+
+
+
+
 // admin
 
 app.get("/teacherList", async (req, res) => {
