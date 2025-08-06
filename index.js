@@ -248,62 +248,71 @@ app.post('/createCustomToken', async (req, res) => {
 
 // inbox message sending
 
+// ✅ General Push Notification
 app.post("/send-notification", async (req, res) => {
   const { nottificationToken, senderName, nottificationMessage } = req.body;
 
   if (!nottificationToken || !nottificationMessage || !senderName) {
-    return res.status(400).json({ error: "Token or message was unavailable" });
+    return res.status(400).json({ error: "Token, sender name, or message missing" });
   }
 
   const payload = {
-    notification: { // ✅ Corrected 'nottification' → 'notification'
+    notification: { 
       title: senderName,
-      body: nottificationMessage
+      body: nottificationMessage,
+      sound: "default" // ✅ Ensures sound on mobile
     },
-    token: nottificationToken // ✅ Corrected 'nottificationToken' → 'token'
-  };
-  
-
-  try {
-    await admin.messaging().send(payload);
-    console.log("Notification sent successfully");
-    res.status(200).json({ success: true });
-  } catch (err) {
-    console.error("Error sending notification:", err);
-    res.status(500).json({ error: "Failed to send notification" });
-  }
-});
-
-app.post("/send-call-notification", async (req, res) => {
-  
-  const { nottificationToken, callerName, callerID } = req.body;
-  const callerId = callerID;
-
-
-  if (!nottificationToken || !callerName || !callerId) {
-    
-    return res.status(400).json({ error: "Token or message was unavailable" });
-  }
-
-  const payload = {
-    data: { 
-      callType: "incoming",
-      callerName,
-      callerId
+    data: { // ✅ Optional custom data for mobile/Web handlers
+      type: "chat_message",
+      senderName,
+      message: nottificationMessage
     },
     token: nottificationToken
   };
 
-
   try {
     await admin.messaging().send(payload);
-    console.log("Notification sent successfully");
+    console.log("📩 Notification sent successfully");
     res.status(200).json({ success: true });
   } catch (err) {
-    console.error("Error sending notification:", err);
+    console.error("❌ Error sending notification:", err);
     res.status(500).json({ error: "Failed to send notification" });
   }
 });
+
+
+// ✅ Call Notification (Auto open UI in RN or Web)
+app.post("/send-call-notification", async (req, res) => {
+  const { nottificationToken, callerName, callerID } = req.body;
+
+  if (!nottificationToken || !callerName || !callerID) {
+    return res.status(400).json({ error: "Token, caller name, or caller ID missing" });
+  }
+
+  const payload = {
+    notification: {
+      title: "Incoming Call",
+      body: `${callerName} is calling you`,
+      sound: "default"
+    },
+    data: {
+      type: "incoming_call",
+      callerName,
+      callerId: callerID
+    },
+    token: nottificationToken
+  };
+
+  try {
+    await admin.messaging().send(payload);
+    console.log("📞 Call notification sent successfully");
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("❌ Error sending call notification:", err);
+    res.status(500).json({ error: "Failed to send call notification" });
+  }
+});
+
 
 
 
