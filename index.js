@@ -1297,7 +1297,7 @@ app.post("/newStudent", async (req, res) => {
     customer_city,
     currency,
     customer_address,
-    value_a: JSON.stringify(metadata) // Pass metadata here
+    value_1: JSON.stringify(metadata) // Pass metadata here
   }, async (resp) => {
     
     res.json({ checkout_url: resp.checkout_url });    
@@ -1309,7 +1309,7 @@ app.post("/newStudent", async (req, res) => {
 
 
 
-app.get('/ipn', async (req, res) => {
+app.get('/ipn', async(req, res) => {
   const { order_id } = req.query;
 
   if (!order_id) {
@@ -1320,21 +1320,19 @@ app.get('/ipn', async (req, res) => {
     console.log("🔍 Verifying ShurjoPay payment for order_id:", order_id);
 
     // Await the verification result (Promise-based)
-    const result = await shurjopay.verifyPayment(order_id);
-
-    console.log(result);
-    
-
-    if (!result || result.length === 0) {
+    shurjopay.verifyPayment(order_id, async (result) => {
+        if (!result || result.length === 0) {
       console.warn("⚠️ No verification result returned.");
       return res.status(200).json({ message: "Payment not verified." });
     }
 
     const data = result[0];
-    console.log("✅ Verification result:", data);
 
-    if (data.sp_code === '1000' && data.order_status === 'Success') {
+    if (data.sp_code === '1000' && data.sp_message === 'Success') {
       // Parse metadata passed in value_a
+      console.log(data);
+      
+      return
       const {
         uid,
         displayName,
@@ -1383,7 +1381,11 @@ app.get('/ipn', async (req, res) => {
     } else {
       console.warn(`⚠️ Payment failed or incomplete for order_id: ${order_id}`);
       return res.status(200).json({ message: "Payment failed or not verified." });
-    }
+    }    
+      },
+      (error) => {
+        // TODO Handle error response
+      });
 
   } catch (error) {
     console.error("❌ Error during IPN verification:", error);
