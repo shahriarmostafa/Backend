@@ -257,35 +257,35 @@ app.post("/send-notification", async (req, res) => {
   }
 
   const payload = {
+  notification: {
+    title: senderName,
+    body: nottificationMessage
+    // ❌ REMOVE: sound, android_channel_id
+  },
+  android: {
+    priority: "high",
     notification: {
-      title: senderName,
-      body: nottificationMessage,
       sound: "default",
-      android_channel_id: "high_importance_channel" // for foreground & background
-    },
-    android: {
-      priority: "high",
-      notification: {
+      channelId: "high_importance_channel",
+      clickAction: "FLUTTER_NOTIFICATION_CLICK"
+    }
+  },
+  apns: {
+    payload: {
+      aps: {
         sound: "default",
-        channelId: "high_importance_channel",
-        clickAction: "FLUTTER_NOTIFICATION_CLICK" // required for RN or PWA
+        contentAvailable: true
       }
-    },
-    apns: {
-      payload: {
-        aps: {
-          sound: "default",
-          contentAvailable: true
-        }
-      }
-    },
-    data: {
-      type: "chat_message",
-      senderName,
-      message: nottificationMessage
-    },
-    token: nottificationToken
-  };
+    }
+  },
+  data: {
+    type: "chat_message",
+    senderName,
+    message: nottificationMessage
+  },
+  token: nottificationToken
+};
+
 
   try {
     await admin.messaging().send(payload);
