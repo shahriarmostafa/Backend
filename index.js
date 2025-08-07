@@ -1344,7 +1344,7 @@ app.get('/ipn', async(req, res) => {
         price,
         credit,
         durationDays
-      } = JSON.parse(data.value_1);
+      } = JSON.parse(data.value1);
 
       // Calculate subscription dates
       const startDate = new Date();
