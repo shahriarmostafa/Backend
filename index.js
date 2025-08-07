@@ -1311,7 +1311,7 @@ app.post("/newStudent", async (req, res) => {
 
 
 app.post('/ipn', async(req, res) => {
-  const { order_id } = req.query;
+  const { order_id } = req.body;
 
   if (!order_id) {
     return res.status(400).json({ error: 'Missing order_id' });
