@@ -1317,70 +1317,77 @@ app.get('/ipn', async (req, res) => {
   }
 
   try {
-    // Use SDK's verifyPayment method
-    shurjopay.verifyPayment(order_id, async (result) => {
-      if (!result || result.length === 0) {
-        console.warn("⚠️ No verification result returned.");
-        return res.status(200).json({ message: "Payment not verified." });
-      }
+    console.log("🔍 Verifying ShurjoPay payment for order_id:", order_id);
 
-      const data = result[0];
+    // Await the verification result (Promise-based)
+    const result = await shurjopay.verifyPayment(order_id);
 
-      if (data.sp_code === '1000' && data.order_status === 'Success') {
-        // Parse metadata passed in value_a
-        const {
-          uid,
-          displayName,
+    if (!result || result.length === 0) {
+      console.warn("⚠️ No verification result returned.");
+      return res.status(200).json({ message: "Payment not verified." });
+    }
+
+    const data = result[0];
+    console.log("✅ Verification result:", data);
+
+    if (data.sp_code === '1000' && data.order_status === 'Success') {
+      // Parse metadata passed in value_a
+      const {
+        uid,
+        displayName,
+        packageName,
+        price,
+        credit,
+        durationDays
+      } = JSON.parse(data.value_a);
+
+      // Calculate subscription dates
+      const startDate = new Date();
+      const expiryDate = new Date();
+      expiryDate.setDate(startDate.getDate() + Number(durationDays));
+
+      // Update Firestore
+      const userRef = studentCollection.doc(uid);
+      await userRef.update({
+        subscription: {
           packageName,
-          price,
-          credit,
-          durationDays
-        } = JSON.parse(data.value_a);
-
-        // Calculate subscription dates
-        const startDate = new Date();
-        const expiryDate = new Date();
-        expiryDate.setDate(startDate.getDate() + Number(durationDays));
-
-        // Update Firestore
-        const userRef = studentCollection.doc(uid);
-        await userRef.update({
-          subscription: {
-            packageName,
-            startDate: startDate.toISOString(),
-            expiryDate: expiryDate.toISOString(),
-            credit,
-            isActive: true,
-            paymentStatus: "approved",
-            purchasedAt: admin.firestore.FieldValue.serverTimestamp()
-          }
-        });
-
-        const subscriptions = databaseinmongo.collection("subscriptions");
-        // Insert into MongoDB subscriptions
-        await subscriptions.insertOne({
-          uid,
-          name: displayName,
-          packageName,
-          price,
           startDate: startDate.toISOString(),
-          paymentId: data.bank_transaction_id || "unknown",
-          orderId: order_id,
-          createdAt: new Date()
-        });
+          expiryDate: expiryDate.toISOString(),
+          credit,
+          isActive: true,
+          paymentStatus: "approved",
+          purchasedAt: admin.firestore.FieldValue.serverTimestamp()
+        }
+      });
 
-        console.log(`✅ Subscription granted for UID: ${uid}`);
-        return res.status(200).json({ message: "Subscription activated." });
-      } else {
-        console.warn(`⚠️ Payment failed or incomplete for order_id: ${order_id}`);
-        return res.status(200).json({ message: "Payment failed or not verified." });
-      }
-    });
+      // Insert into MongoDB subscriptions collection
+      const subscriptions = databaseinmongo.collection("subscriptions");
+      await subscriptions.insertOne({
+        uid,
+        name: displayName,
+        packageName,
+        price,
+        credit,
+        startDate: startDate.toISOString(),
+        expiryDate: expiryDate.toISOString(),
+        paymentId: data.bank_transaction_id || "unknown",
+        orderId: order_id,
+        createdAt: new Date()
+      });
+
+      console.log(`✅ Subscription granted for UID: ${uid}`);
+      return res.status(200).json({ message: "Subscription activated." });
+    } else {
+      console.warn(`⚠️ Payment failed or incomplete for order_id: ${order_id}`);
+      return res.status(200).json({ message: "Payment failed or not verified." });
+    }
+
   } catch (error) {
     console.error("❌ Error during IPN verification:", error);
     return res.status(500).json({ error: "Internal server error." });
   }
 });
+
 
 
 
