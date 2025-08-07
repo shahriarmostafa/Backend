@@ -1310,7 +1310,7 @@ app.post("/newStudent", async (req, res) => {
 
 
 
-app.get('/ipn', async(req, res) => {
+app.post('/ipn', async(req, res) => {
   const { order_id } = req.query;
 
   if (!order_id) {
