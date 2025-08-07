@@ -257,12 +257,23 @@ app.post("/send-notification", async (req, res) => {
   }
 
   const payload = {
-    notification: { 
+    notification: {
       title: senderName,
-      body: nottificationMessage,
-      sound: "default" // ✅ Ensures sound on mobile
+      body: nottificationMessage
     },
-    data: { // ✅ Optional custom data for mobile/Web handlers
+    android: {
+      notification: {
+        sound: "default"
+      }
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: "default"
+        }
+      }
+    },
+    data: {
       type: "chat_message",
       senderName,
       message: nottificationMessage
@@ -279,6 +290,7 @@ app.post("/send-notification", async (req, res) => {
     res.status(500).json({ error: "Failed to send notification" });
   }
 });
+
 
 
 // ✅ Call Notification (Auto open UI in RN or Web)
