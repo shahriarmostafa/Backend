@@ -1299,6 +1299,7 @@ app.post("/newStudent", async (req, res) => {
     customer_address,
     value_1: JSON.stringify(metadata) // Pass metadata here
   }, async (resp) => {
+    console.log(resp);
     
     res.json({ checkout_url: resp.checkout_url });    
   }, (err) => {
