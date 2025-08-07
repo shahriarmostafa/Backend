@@ -1286,8 +1286,7 @@ app.post("/newStudent", async (req, res) => {
     durationDays,
     credit
   };
-
-    
+  
 
   shurjopay.makePayment({
     amount,
@@ -1300,10 +1299,10 @@ app.post("/newStudent", async (req, res) => {
     customer_address,
     value_a: JSON.stringify(metadata) // Pass metadata here
   }, async (resp) => {
-  
+    
     res.json({ checkout_url: resp.checkout_url });    
   }, (err) => {
-    console.error("Payment error:", err);
+    console.error("Payment error:", err);    
     res.status(500).json({ error: err.message });
   });
 });
