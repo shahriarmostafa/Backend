@@ -1300,15 +1300,6 @@ app.post("/newStudent", async (req, res) => {
     customer_address,
     value_a: JSON.stringify(metadata) // Pass metadata here
   }, async (resp) => {
-    await tempCollection.insertOne({
-    order_id: resp.sp_order_id,
-    uid,
-    packageName,
-    price,
-    durationDays,
-    credit: credit,
-    createdAt: new Date(),
-  });
   
     res.json({ checkout_url: resp.checkout_url });    
   }, (err) => {
@@ -1317,104 +1308,88 @@ app.post("/newStudent", async (req, res) => {
   });
 });
 
-app.post("/finalize-subscription", async (req, res) => {
+
+
+app.post('/ipn', async (req, res) => {
   const { order_id } = req.body;
 
-  if (!order_id) return res.status(400).json({ error: "Missing order_id" });
+  if (!order_id) {
+    return res.status(400).json({ error: 'Missing order_id' });
+  }
 
-  // Fetch metadata from temp collection
-  const orderData = await tempCollection.findOne({ order_id });
-  if (!orderData) return res.status(404).json({ error: "Order not found" });
+  try {
+    // Use SDK's verifyPayment method
+    shurjopay.verifyPayment(order_id, async (result) => {
+      if (!result || result.length === 0) {
+        console.warn("⚠️ No verification result returned.");
+        return res.status(200).json({ message: "Payment not verified." });
+      }
 
-  const { uid, displayName, packageName, price, durationDays, credit } = orderData;
+      const data = result[0];
 
-  const startDate = new Date();
-  const expiryDate = new Date();
-  expiryDate.setDate(startDate.getDate() + durationDays);
-
-  const userRef = studentCollection.doc(uid);
-
-// Perform the update
-await userRef.update({
-  subscription: {
-    packageName,
-    startDate: startDate.toISOString(),
-    expiryDate: expiryDate.toISOString(),
-    credit,
-    isActive: true,
-    paymentStatus: "approved",
-    purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
-  },
-});
-
-  // MongoDB
-  const subscriptions = databaseinmongo.collection("subscriptions");
-  await subscriptions.insertOne({
-    uid,
-    name: displayName,
-    packageName,
-    price,
-    startDate: startDate.toISOString(),
-    paymentId: "unknown", // or pull from ShurjoPay if you want
-    orderId: order_id,
-    createdAt: new Date(),
-  });
-
-  return res.json({ success: true });
-});
-
-
-
-app.get('/payment-success', async (req, res) => {
-  const { order_id } = req.query;
-
-  shurjopay.verifyPayment(order_id, async (result) => {
-    if (result.sp_code === '1000') {
-      // Payment success
-      const userData = JSON.parse(result.value_a); // You passed this from frontend
-
-      const { uid, displayName, packageName, durationDays, price, credit } = userData;
-      const startDate = new Date();
-      const expiryDate = new Date();
-      expiryDate.setDate(startDate.getDate() + durationDays);
-
-      // Firestore
-      const userRef = doc(db, "studentCollection", uid);
-      await updateDoc(userRef, {
-        subscription: {
+      if (data.sp_code === '1000' && data.order_status === 'Success') {
+        // Parse metadata passed in value_a
+        const {
+          uid,
+          displayName,
           packageName,
+          price,
+          credit,
+          durationDays
+        } = JSON.parse(data.value_a);
+
+        // Calculate subscription dates
+        const startDate = new Date();
+        const expiryDate = new Date();
+        expiryDate.setDate(startDate.getDate() + Number(durationDays));
+
+        // Update Firestore
+        const userRef = studentCollection.doc(uid);
+        await userRef.update({
+          subscription: {
+            packageName,
+            startDate: startDate.toISOString(),
+            expiryDate: expiryDate.toISOString(),
+            credit,
+            isActive: true,
+            paymentStatus: "approved",
+            purchasedAt: admin.firestore.FieldValue.serverTimestamp()
+          }
+        });
+
+        const subscriptions = databaseinmongo.collection("subscriptions");
+        // Insert into MongoDB subscriptions
+        await subscriptions.insertOne({
+          uid,
+          name: displayName,
+          packageName,
+          price,
           startDate: startDate.toISOString(),
-          expiryDate: expiryDate.toISOString(),
-          credit: credit,
-          isActive: true,
-          paymentStatus: "approved",
-          purchasedAt: serverTimestamp()
-        }
-      });
+          paymentId: data.bank_transaction_id || "unknown",
+          orderId: order_id,
+          createdAt: new Date()
+        });
 
-      // MongoDB
-      const subscriptions = databaseinmongo.collection("subscriptions");
-      await subscriptions.insertOne({
-        uid,
-        name: displayName,
-        packageName,
-        price,
-        startDate: startDate.toISOString(),
-        paymentId: result.sp_payment_option,
-        orderId: order_id,
-        createdAt: new Date()
-      });
-
-      // Redirect to app
-      res.redirect("poperl://subscription-success");
-    } else {
-      res.redirect("poperl://subscription-failure");
-    }
-  }, (err) => {
-    console.error(err);
-    res.redirect("poperl://subscription-failure");
-  });
+        console.log(`✅ Subscription granted for UID: ${uid}`);
+        return res.status(200).json({ message: "Subscription activated." });
+      } else {
+        console.warn(`⚠️ Payment failed or incomplete for order_id: ${order_id}`);
+        return res.status(200).json({ message: "Payment failed or not verified." });
+      }
+    });
+  } catch (error) {
+    console.error("❌ Error during IPN verification:", error);
+    return res.status(500).json({ error: "Internal server error." });
+  }
 });
+
+
+
+
+
+
+
+
 
 
 
