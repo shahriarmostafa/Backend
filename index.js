@@ -295,24 +295,36 @@ app.post("/send-notification", async (req, res) => {
 
 // ✅ Call Notification (Auto open UI in RN or Web)
 app.post("/send-call-notification", async (req, res) => {
-  const { nottificationToken, callerName, callerID } = req.body;
+  const { receiverToken, callerName, callType, roomId } = req.body;
 
-  if (!nottificationToken || !callerName || !callerID) {
-    return res.status(400).json({ error: "Token, caller name, or caller ID missing" });
+  if (!receiverToken || !callerName || !roomId) {
+    return res.status(400).json({ error: "Missing required fields" });
   }
 
   const payload = {
+    token: receiverToken,
     notification: {
       title: "Incoming Call",
-      body: `${callerName} is calling you`,
-      sound: "default"
+      body: `${callerName} is calling you (${callType})`,
     },
     data: {
       type: "incoming_call",
       callerName,
-      callerId: callerID
+      callType,
+      roomId
     },
-    token: nottificationToken
+    android: {
+      notification: {
+        sound: "default",
+      }
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: "default",
+        }
+      }
+    }
   };
 
   try {
@@ -324,6 +336,8 @@ app.post("/send-call-notification", async (req, res) => {
     res.status(500).json({ error: "Failed to send call notification" });
   }
 });
+
+
 
 
 
