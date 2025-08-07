@@ -1330,9 +1330,7 @@ app.get('/ipn', async(req, res) => {
 
     if (data.sp_code === '1000' && data.sp_message === 'Success') {
       // Parse metadata passed in value_a
-      console.log(data);
       
-      return
       const {
         uid,
         displayName,
@@ -1340,7 +1338,7 @@ app.get('/ipn', async(req, res) => {
         price,
         credit,
         durationDays
-      } = JSON.parse(data.value_a);
+      } = JSON.parse(data.value_1);
 
       // Calculate subscription dates
       const startDate = new Date();
