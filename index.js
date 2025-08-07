@@ -1322,6 +1322,9 @@ app.get('/ipn', async (req, res) => {
     // Await the verification result (Promise-based)
     const result = await shurjopay.verifyPayment(order_id);
 
+    console.log(result);
+    
+
     if (!result || result.length === 0) {
       console.warn("⚠️ No verification result returned.");
       return res.status(200).json({ message: "Payment not verified." });
