@@ -1297,7 +1297,7 @@ app.post("/newStudent", async (req, res) => {
     customer_city,
     currency,
     customer_address,
-    value_1: JSON.stringify(metadata) // Pass metadata here
+    value1: JSON.stringify(metadata) // Pass metadata here
   }, async (resp) => {
     console.log(resp);
     
@@ -1310,7 +1310,7 @@ app.post("/newStudent", async (req, res) => {
 
 
 
-app.post('/ipn', async(req, res) => {
+app.get('/ipn', async(req, res) => {
   const { order_id } = req.query;
 
   console.log(req.body);
@@ -1332,7 +1332,8 @@ app.post('/ipn', async(req, res) => {
     }
 
     const data = result[0];
-
+    console.log(data);
+    
     if (data.sp_code === '1000' && data.sp_message === 'Success') {
       // Parse metadata passed in value_a
       
