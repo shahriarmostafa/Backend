@@ -1311,7 +1311,10 @@ app.post("/newStudent", async (req, res) => {
 
 
 app.post('/ipn', async(req, res) => {
-  const { order_id } = req.body;
+  const { order_id } = req.query;
+
+  console.log(req.body);
+  
   
 
   if (!order_id) {
