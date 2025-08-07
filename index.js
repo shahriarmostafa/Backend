@@ -259,17 +259,23 @@ app.post("/send-notification", async (req, res) => {
   const payload = {
     notification: {
       title: senderName,
-      body: nottificationMessage
+      body: nottificationMessage,
+      sound: "default",
+      android_channel_id: "high_importance_channel" // for foreground & background
     },
     android: {
+      priority: "high",
       notification: {
-        sound: "default"
+        sound: "default",
+        channelId: "high_importance_channel",
+        clickAction: "FLUTTER_NOTIFICATION_CLICK" // required for RN or PWA
       }
     },
     apns: {
       payload: {
         aps: {
-          sound: "default"
+          sound: "default",
+          contentAvailable: true
         }
       }
     },
@@ -293,6 +299,7 @@ app.post("/send-notification", async (req, res) => {
 
 
 
+
 // ✅ Call Notification (Auto open UI in RN or Web)
 app.post("/send-call-notification", async (req, res) => {
   const { receiverToken, callerName, callType, roomId } = req.body;
@@ -302,10 +309,27 @@ app.post("/send-call-notification", async (req, res) => {
   }
 
   const payload = {
-    token: receiverToken,
     notification: {
       title: "Incoming Call",
       body: `${callerName} is calling you (${callType})`,
+      sound: "default",
+      android_channel_id: "high_importance_channel"
+    },
+    android: {
+      priority: "high",
+      notification: {
+        sound: "default",
+        channelId: "high_importance_channel",
+        clickAction: "FLUTTER_NOTIFICATION_CLICK"
+      }
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: "default",
+          contentAvailable: true
+        }
+      }
     },
     data: {
       type: "incoming_call",
@@ -313,18 +337,7 @@ app.post("/send-call-notification", async (req, res) => {
       callType,
       roomId
     },
-    android: {
-      notification: {
-        sound: "default",
-      }
-    },
-    apns: {
-      payload: {
-        aps: {
-          sound: "default",
-        }
-      }
-    }
+    token: receiverToken
   };
 
   try {
@@ -336,6 +349,8 @@ app.post("/send-call-notification", async (req, res) => {
     res.status(500).json({ error: "Failed to send call notification" });
   }
 });
+
+
 
 
 
