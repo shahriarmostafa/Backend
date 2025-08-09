@@ -1010,14 +1010,12 @@ app.post("/newStudent", async (req, res) => {
               return populatedChats;
           })
       );
-      const mntsAgoValue = Math.floor(Date.now() / 60000);
       // Emit the updated chat list to both users
       userIds.forEach((id, index) => {
           const chatList = updatedChatLists[index];
           const unseenCount = chatList.filter(chat => !chat.isSeen).length;
           io.to(id).emit('chatListUpdate', { chatList, unseenCount });
 
-          io.to(id).emit('lastMessageTimestamp', mntsAgoValue);
       });
 
           
