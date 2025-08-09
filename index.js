@@ -260,20 +260,20 @@ app.post("/send-notification", async (req, res) => {
   notification: {
     title: senderName,
     body: nottificationMessage
-    // ❌ REMOVE: sound, android_channel_id
+    // Do NOT put `sound` here
   },
   android: {
     priority: "high",
     notification: {
-      sound: "default",
-      channelId: "high_importance_channel",
+      sound: "default", // ✅ REQUIRED for sound in killed state
+      channelId: "high_importance_channel", // ✅ must match AndroidManifest
       clickAction: "FLUTTER_NOTIFICATION_CLICK"
     }
   },
   apns: {
     payload: {
       aps: {
-        sound: "default",
+        sound: "default", // ✅ for iOS
         contentAvailable: true
       }
     }
@@ -285,6 +285,7 @@ app.post("/send-notification", async (req, res) => {
   },
   token: nottificationToken
 };
+
 
 
   try {
@@ -309,27 +310,24 @@ app.post("/send-call-notification", async (req, res) => {
   }
 
   const payload = {
-    notification: {
-      title: "Incoming Call",
-      body: `${callerName} is calling you (${callType})`,
-      sound: "default",
-      android_channel_id: "high_importance_channel"
-    },
     android: {
       priority: "high",
       notification: {
-        sound: "default",
         channelId: "high_importance_channel",
-        clickAction: "FLUTTER_NOTIFICATION_CLICK"
+        clickAction: "FLUTTER_NOTIFICATION_CLICK",
+        sound: "default" // ✅ Correct place for Android
       }
     },
-    apns: {
+    apns: { // ✅ Needed if you want iOS sound
       payload: {
         aps: {
-          sound: "default",
-          contentAvailable: true
+          sound: "default"
         }
       }
+    },
+    notification: {
+      title: "Incoming Call",
+      body: `${callerName} is calling you`
     },
     data: {
       type: "incoming_call",
@@ -342,13 +340,13 @@ app.post("/send-call-notification", async (req, res) => {
 
   try {
     await admin.messaging().send(payload);
-    console.log("📞 Call notification sent successfully");
-    res.status(200).json({ success: true });
-  } catch (err) {
-    console.error("❌ Error sending call notification:", err);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error sending call notification:", error);
     res.status(500).json({ error: "Failed to send call notification" });
   }
 });
+
 
 
 
