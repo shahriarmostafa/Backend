@@ -310,33 +310,26 @@ app.post("/send-call-notification", async (req, res) => {
   }
 
   const payload = {
-    android: {
-      priority: "high",
-      notification: {
-        channelId: "high_importance_channel",
-        clickAction: "FLUTTER_NOTIFICATION_CLICK",
-        sound: "default" // ✅ Correct place for Android
-      }
-    },
-    apns: { // ✅ Needed if you want iOS sound
-      payload: {
-        aps: {
-          sound: "default"
-        }
-      }
-    },
+  notification: {
+    title: "Incoming Call",
+    body: `${callerName} is calling you`
+  },
+  android: {
+    priority: "high",
     notification: {
-      title: "Incoming Call",
-      body: `${callerName} is calling you`
-    },
-    data: {
-      type: "incoming_call",
-      callerName,
-      callType,
-      roomId
-    },
-    token: receiverToken
-  };
+      channelId: "high_importance_channel", // ✅ correct place
+      sound: "default",
+      clickAction: "FLUTTER_NOTIFICATION_CLICK"
+    }
+  },
+  data: {
+    type: "incoming_call",
+    callerName,
+    callType,
+    roomId
+  },
+  token: receiverToken
+};
 
   try {
     await admin.messaging().send(payload);
