@@ -1158,10 +1158,9 @@ app.post("/newStudent", async (req, res) => {
               if (userChatDoc) {
                   const chatInfos = userChatDoc.chats || [];
                   let totalUnseen = 0;
-  
                   const promises = chatInfos.map(async (item) => {
-                      const collectionName = item.yourRole === 'student' ? 'studentCollection' : 'teacherCollection';
-                      const userDoc = await database.collection(collectionName).doc(item.receiverId).get();
+                    
+                      const userDoc = await userCollection.doc(item.receiverId).get();
                       const userss = userDoc.exists ? userDoc.data() : {};
   
                       // Count unseen messages
@@ -1293,11 +1292,11 @@ app.get('/ipn', async(req, res) => {
 
       // Calculate subscription dates
       const startDate = new Date();
-      const expiryDate = new Date();
-      expiryDate.setDate(startDate.getDate() + Number(durationDays));
+      const expiryDate = new Date(startDate); // Make a copy of startDate
+      expiryDate.setHours(expiryDate.getHours() + Number(durationHours));
 
       // Update Firestore
-      const userRef = studentCollection.doc(uid);
+      const userRef = userCollection.doc(uid);
       await userRef.update({
         subscription: {
           packageName,
