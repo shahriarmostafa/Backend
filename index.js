@@ -764,7 +764,7 @@ app.post("/newStudent", async (req, res) => {
 
     // Determine call points
     let callPoints = 0;
-    if (seconds >= 60 && seconds < 180) callPoints = 2;
+    if (seconds >= 40 && seconds < 180) callPoints = 2;
     else if (seconds >= 180 && seconds < 300) callPoints = 3;
     else if (seconds >= 300 && seconds < 600) callPoints = 5;
     else if (seconds >= 600 && seconds < 900) callPoints = 8;
@@ -1221,6 +1221,27 @@ app.post("/newStudent", async (req, res) => {
     customer_address,
     credit
   } = req.body;
+  if(amount < 10){
+    // Calculate subscription dates
+      const startDate = new Date();
+      const expiryDate = new Date(startDate); // Make a copy of startDate
+      expiryDate.setHours(expiryDate.getHours() + Number(durationHours));
+
+      // Update Firestore
+      const userRef = userCollection.doc(uid);
+      await userRef.update({
+        subscription: {
+          packageName,
+          startDate: startDate.toISOString(),
+          expiryDate: expiryDate.toISOString(),
+          credit,
+          isActive: true,
+          paymentStatus: "approved",
+          purchasedAt: admin.firestore.FieldValue.serverTimestamp()
+        }
+      });
+      return;
+  }
 
   const metadata = {
     uid,
