@@ -1225,7 +1225,7 @@ app.post("/newStudent", async (req, res) => {
     // Calculate subscription dates
       const startDate = new Date();
       const expiryDate = new Date(startDate); // Make a copy of startDate
-      expiryDate.setHours(expiryDate.getHours() + Number(durationHours));
+      expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
 
       // Update Firestore
       const userRef = userCollection.doc(uid);
@@ -1237,9 +1237,11 @@ app.post("/newStudent", async (req, res) => {
           credit,
           isActive: true,
           paymentStatus: "approved",
-          purchasedAt: admin.firestore.FieldValue.serverTimestamp()
+          purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+          
         }
       });
+      res.json({ checkout_url: 'poperl://webview' });   
       return;
   }
 
@@ -1314,7 +1316,7 @@ app.get('/ipn', async(req, res) => {
       // Calculate subscription dates
       const startDate = new Date();
       const expiryDate = new Date(startDate); // Make a copy of startDate
-      expiryDate.setHours(expiryDate.getHours() + Number(durationHours));
+      expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
 
       // Update Firestore
       const userRef = userCollection.doc(uid);
