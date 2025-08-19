@@ -377,6 +377,19 @@ app.get("/teacherList", async (req, res) => {
   }
 });
 
+app.get('/download', (req, res) => {
+  const ua = req.headers['user-agent'] || '';
+  let apkUrl;
+
+  if (ua.includes('arm64')) {
+    apkUrl = 'https://www.dropbox.com/scl/fi/jv183z6fo0ywkl3sj0i3r/PoperL-android-64bit.apk?rlkey=5eiwrnguqvt5l5v4l8llz5hmi&st=y29g63si&dl=1';
+  } else {
+    apkUrl = 'https://www.dropbox.com/scl/fi/lkmh1gsgerx9p0owjja3y/PoperL-android-32bit.apk?rlkey=rdzczako0lzi4xlunnmab2vsl&st=wpceufgp&dl=1';
+  }
+
+  res.redirect(apkUrl); // send user to correct APK
+});
+
 
 
 
