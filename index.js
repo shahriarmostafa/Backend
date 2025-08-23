@@ -1234,7 +1234,8 @@ app.post("/newStudent", async (req, res) => {
     customer_city,
     currency,
     customer_address,
-    credit
+    credit,
+    category
   } = req.body;
   if(amount < 10){
     // Calculate subscription dates
@@ -1253,7 +1254,7 @@ app.post("/newStudent", async (req, res) => {
           isActive: true,
           paymentStatus: "approved",
           purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
-          
+          category 
         }
       });
       res.json({ checkout_url: 'poperl://webview' });   
@@ -1266,7 +1267,8 @@ app.post("/newStudent", async (req, res) => {
     packageName,
     price,
     durationDays,
-    credit
+    credit,
+    category
   };
   
 
@@ -1325,7 +1327,8 @@ app.get('/ipn', async(req, res) => {
         packageName,
         price,
         credit,
-        durationDays
+        durationDays,
+        category
       } = JSON.parse(data.value1);
 
       // Calculate subscription dates
@@ -1343,7 +1346,8 @@ app.get('/ipn', async(req, res) => {
           credit,
           isActive: true,
           paymentStatus: "approved",
-          purchasedAt: admin.firestore.FieldValue.serverTimestamp()
+          purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
+          category
         }
       });
 
