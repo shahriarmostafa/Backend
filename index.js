@@ -266,8 +266,8 @@ app.post("/send-call-notification", async (req, res) => {
 
   const payload = {
   notification: {
-    title: "Incoming Call",
-    body: `${callerName} is calling you`
+    title: "Class invitation",
+    body: `${callerName} is requesting a class session`
   },
   android: {
     priority: "high",
@@ -908,7 +908,7 @@ app.post("/newStudent", async (req, res) => {
       const chatDB = databaseinmongo.collection("chatDB");
 
       try {
-          const { chatId, senderId, text, imgUrl, receiverId } = req.body;
+          const { chatId, senderId, text, imageUrl, receiverId } = req.body;
   
           if (!chatId || !senderId || !receiverId) {
               return res.status(400).json({ error: 'Missing required fields.' });
@@ -918,7 +918,7 @@ app.post("/newStudent", async (req, res) => {
               senderId,
               ...(text && { text }), // Only include text if it exists
               createdAt: new Date(),
-              ...(imgUrl && { imageUrl: imgUrl }), // Only include image if provided
+              ...(imageUrl && { imageUrl: imageUrl }), // Only include image if provided
               lastMessageFeedback: null,
           };
   
@@ -1126,6 +1126,18 @@ app.post("/newStudent", async (req, res) => {
             socket.emit('chatError', { message: 'Failed to send voice message' });
         }
     });
+    //get data of user typing
+    socket.on('typing', (chatId) => {
+    // Broadcast to everyone in the same chat room except sender
+    console.log(socket.id);
+    
+      socket.to(chatId).emit('userTyping', { userId: socket.id });
+    });
+
+    socket.on('stopTyping', (chatId) => {
+        socket.to(chatId).emit('userStopTyping', { userId: socket.id });
+    });
+
 
       socket.on('joinChatRoom', async (chatId) => {
         const chatDB = databaseinmongo.collection("chatDB");
@@ -1203,18 +1215,7 @@ app.post("/newStudent", async (req, res) => {
         console.log(`✅ ${userId} joined room`);
       });
 
-      //call functions with socket.io
-      socket.on('start-call', ({ receiverId, channelName, callerName }) => {
-        // Send to the receiver only
-        console.log("Started call for :" + receiverId);
-        
-        io.to(receiverId).emit('incoming-call', {
-          receiverId,
-          channelName,
-          callerName,
-          timestamp: Date.now()
-        });
-      });
+      
   });
 
 
