@@ -173,7 +173,6 @@ app.post("/generate-token", (req, res) => {
 //getting firestore
 
 const {database, admin} = require("./firebase.config");
-const userCollection = database.collection("userCollection");
 
 
 
@@ -304,78 +303,7 @@ app.post("/send-call-notification", async (req, res) => {
 
 
 
-app.get("/ActiveTeacherList", async (req, res) => {
-  try {
-    const { category, subject } = req.query;
 
-    // Start with approved and active teachers
-    let query = userCollection
-      .where("approved", "==", true)
-      .where("isActive", "==", true);
-
-    if (category) {
-      query = query.where("category", "==", category);
-    }
-
-    if (subject) {
-      query = query.where("subjects", "array-contains", subject);
-    }
-
-    // Fetch filtered teachers from the teacher collection
-    const result = await query.get();
-
-    const teacherList = [];
-    result.forEach(doc => {
-      teacherList.push({ id: doc.id, ...doc.data() });
-    });
-
-    // Send the list of teachers as the response
-    res.status(200).send({ success: true, teachers: teacherList });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
-  }
-});
-
-
-
-
-// admin
-
-app.get("/teacherList", async (req, res) => {
-  try {
-
-    const {category, subject} = req.query;
-    
-    let query = userCollection.where("role", "==", "teacher").where("approved", "==", true);
-
-
-    if(category) {
-      query = query.where("category", "==", category);
-    }
-
-    if(subject){
-      query = query.where("subjects", "array-contains", subject)
-    }
-
-    // Fetch approved teachers from the teacher collection
-    const result = await query.get();
-    
-
-    const teacherList = [];
-    result.forEach(doc => {
-      teacherList.push({ id: doc.id, ...doc.data() });
-    });
-
-    // Send the list of teachers as the response
-    res.status(200).send({ success: true, teachers: teacherList });
-  } catch (error) {
-    console.error(error);
-
-    // Handle errors and send an appropriate response
-    res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
-  }
-});
 const newOne = 'https://www.dropbox.com/scl/fi/jv183z6fo0ywkl3sj0i3r/PoperL-android-64bit.apk?rlkey=5eiwrnguqvt5l5v4l8llz5hmi&st=y29g63si&dl=1';
 const oldOne = 'https://www.dropbox.com/scl/fi/lkmh1gsgerx9p0owjja3y/PoperL-android-32bit.apk?rlkey=rdzczako0lzi4xlunnmab2vsl&st=wpceufgp&dl=1';
 
@@ -395,141 +323,12 @@ app.get('/download-link', (req, res) => {
 
 
 
-app.get("/disabledTeacherList", async (req, res) => {
-  try {
-    // Fetch approved teachers from the teacher collection
-    const result = await userCollection.where("role", "==", "teacher").where('approved', "==", false).get();
 
-    const teacherList = [];
-    result.forEach(doc => {
-      teacherList.push({ id: doc.id, ...doc.data() });
-    });
-
-    // Send the list of teachers as the response
-    res.status(200).send({ success: true, teachers: teacherList });
-  } catch (error) {
-    console.error(error);
-
-    // Handle errors and send an appropriate response
-    res.status(500).send({ success: false, error: "Failed to retrieve the teacher list." });
-  }
-});
-
-
-
-
-app.put("/disableTeacher/:uid", async (req, res) => {
-  const uid = req.params.uid;
-  try{
-    const teacher = userCollection.doc(uid);
-    const result = await teacher.update({approved: false})
-    res.status(200).json({result})
-  } catch(err){
-    console.log(err);
-  }
-})
-
-app.put("/enableTeacher/:uid", async (req, res) => {
-  const uid = req.params.uid;
-  try{
-    const teacher = userCollection.doc(uid);
-    const result = await teacher.update({approved: true})
-    res.status(200).json({result})
-  } catch(err){
-    console.log(err);
-  }
-})
-
-
-// have to do something about permanently deleting data from firestore in future
-
-app.delete("/deleteUser/:uid", async (req, res) => {
-  const uid = req.params.uid;
-  try{
-    const teacher = userCollection.doc(uid);
-    const result = await teacher.delete();
-    res.status(200).json(result);
-  } catch(err){
-    res.status(400).json({err})
-  }
-})
-
-app.put("/subjects", async(req, res) => {
-  const subjects = req.body.subjects;
-  const uid = req.body.uid;
-  const teacher = userCollection.doc(uid);
-  const result = await teacher.update({subjects: subjects})
-  res.status(200).json({success: true})
-})
-
-
-
-//get profile information
-app.get("/userProfile/:uid", async(req, res) => {
-  const uid = req.params.uid;
-  try {
-    if(!uid) return;
-    const teacherRef = userCollection.doc(uid);
-    const doc = await teacherRef.get();
-
-    if (doc.exists) {
-      const data = doc.data();
-      
-      if (data.role === "teacher") {
-        res.status(200).json({ data });
-      } else {
-        res.status(403).json({ error: "User is not a teacher" });
-      }
-    } else {
-      console.log("No document found");
-      res.status(404).json({ error: "User not found" });
-    }
-
-
-
-  } catch (error) {
-    res.status(400).json({err: error})
-    console.error("Error updating token:", error);
-  }
-
-})
 
 
 // reset user points
 
-app.post("/resetPoints", async (req, res) => {
-  try {
-    // Query only users where role == "teacher"
-    const teachersSnapshot = await userCollection.where("role", "==", "teacher").get();
 
-    if (teachersSnapshot.empty) {
-      return res.status(404).json({
-        success: false,
-        message: "No teachers found."
-      });
-    }
-
-    const batch = database.batch();
-
-    teachersSnapshot.docs.forEach(doc => {
-      batch.update(doc.ref, { points: 0 });
-    });
-
-    await batch.commit();
-
-    res.json({
-      success: true,
-      message: "Teacher points reset successfully!"
-    });
-
-  } catch (error) {
-    console.error("Error resetting points:", error);
-    res.status(500).json({
-      success: false,
-      message: "Server error while resetting teacher points."
-    });
-  }
-});
 
 
 
@@ -558,9 +357,10 @@ async function run() {
     await client.connect();
 
     const databaseinmongo = client.db("PoperL");
-
-    const tempCollection = databaseinmongo.collection("tempCollection");
-
+    const subscriptions = databaseinmongo.collection("subscriptions");
+    const withdrawals = databaseinmongo.collection("withdrawals");
+    const activepackages = databaseinmongo.collection("activePackages");
+    const userCollection = databaseinmongo.collection("userCollection");
 
     //check if admin
 
@@ -587,66 +387,233 @@ async function run() {
 
     //userProfile Informations
 
-app.post("/newStudent", async (req, res) => {
-  try {
-    const user = req.body;
 
-    // Check if user already exists in teacherCollection
-    const teacherQuery = await userCollection.where("email", "==", user.email).get();
-    if (!teacherQuery.empty) {
-      await userCollection.doc(user?.uid).update({
-        FCMToken: user.FCMToken
-      });
-      return res.status(200).json({ success: true, message: "User is a teacher, skipping student registration." });
+
+// For teachers
+
+// ========== 3. Active Teacher List ==========
+app.get("/ActiveTeacherList", async (req, res) => {
+  try {
+    const { category, subject } = req.query;
+
+    // Base filter for active + approved teachers
+    let filter = { role: "teacher", approved: true, isActive: true };
+
+    if (category) {
+      filter.category = category;
     }
 
-    // Save user to the student collection
-    const result = await userCollection.doc(user?.uid).set(user);
+    if (subject) {
+      filter.subjects = subject; // matches if subject is inside the array
+    }
 
-    // Initialize an empty chat list for the user
-    const result2 = await databaseinmongo
-      .collection("chatCollection")
-      .insertOne({ _id: user?.uid, chats: [] });
+    const result = await userCollection.find(filter).toArray();
 
-    // Send response
-    res.status(200).send({ result, result2 });
+    const teacherList = result.map(doc => ({
+      id: doc._id,
+      ...doc,
+    }));
+
+    res.status(200).send({ success: true, teachers: teacherList });
   } catch (error) {
     console.error(error);
-    res.status(500).send({ error: "An error occurred while processing the request." });
+    res.status(500).send({
+      success: false,
+      error: "Failed to retrieve the teacher list.",
+    });
   }
 });
 
-    
-    app.post("/newTeacher", async (req, res) => {
-  try {
-    const user = req.body;
 
-    // Check if user already exists in studentCollection
-    const studentQuery = await userCollection.where("email", "==", user.email).get();
-    if (!studentQuery.empty) {
-      await userCollection.doc(user?.uid).update({
-        FCMToken: user.FCMToken
-      });
-      return res.status(200).json({ success: true, message: "User is a student, skipping teacher registration." });
+
+
+// admin
+
+// ========== 4. Admin Teacher List ==========
+app.get("/teacherList", async (req, res) => {
+  try {
+    const { category, subject } = req.query;
+
+    // Base filter for approved teachers
+    let filter = { role: "teacher", approved: true };
+
+    if (category) {
+      filter.category = category;
     }
 
-    // Add teacher data to the teacher collection
-    const result = await userCollection.doc(user?.uid).set(user);
+    if (subject) {
+      filter.subjects = subject;
+    }
 
-    // Initialize an empty chat list for the teacher
-    const result2 = await databaseinmongo.collection("chatCollection").updateOne(
-      { _id: user?.uid },
-      { $setOnInsert: { chats: [] } },
-      { upsert: true }
+    const result = await userCollection.find(filter).toArray();
+
+    const teacherList = result.map(doc => ({
+      id: doc._id,
+      ...doc,
+    }));
+
+    res.status(200).send({ success: true, teachers: teacherList });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      success: false,
+      error: "Failed to retrieve the teacher list.",
+    });
+  }
+});
+
+// ========== Disabled Teacher List ==========
+app.get("/disabledTeacherList", async (req, res) => {
+  try {
+    const result = await userCollection
+      .find({ role: "teacher", approved: false })
+      .toArray();
+
+    const teacherList = result.map(doc => ({
+      id: doc._id,
+      ...doc,
+    }));
+
+    res.status(200).send({ success: true, teachers: teacherList });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      success: false,
+      error: "Failed to retrieve the teacher list.",
+    });
+  }
+});
+
+
+// ========== Disable Teacher ==========
+app.put("/disableTeacher/:uid", async (req, res) => {
+  const uid = req.params.uid;
+  try {
+    const result = await userCollection.updateOne(
+      { _id: uid, role: "teacher" },
+      { $set: { approved: false } }
     );
 
-    // Send a success response
-    res.status(200).send({ success: true, message: "Teacher added successfully." });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ success: false, error: "Failed to add a new teacher." });
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
+
+
+// ========== Enable Teacher ==========
+app.put("/enableTeacher/:uid", async (req, res) => {
+  const uid = req.params.uid;
+  try {
+    const result = await userCollection.updateOne(
+      { _id: uid, role: "teacher" },
+      { $set: { approved: true } }
+    );
+
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// ========== Delete User ==========
+app.delete("/deleteUser/:uid", async (req, res) => {
+  const uid = req.params.uid;
+  try {
+    const result = await userCollection.deleteOne({ _id: uid });
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+
+// ========== Update Teacher Subjects ==========
+app.put("/subjects", async (req, res) => {
+  const { subjects, uid } = req.body;
+  try {
+    const result = await userCollection.updateOne(
+      { _id: uid, role: "teacher" },
+      { $set: { subjects: subjects } }
+    );
+
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+
+// ========== Get Teacher Profile ==========
+app.get("/userProfile/:uid", async (req, res) => {
+  
+  const uid = req.params.uid;
+
+  try {
+    const user = await userCollection.findOne({ uid: uid });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.status(200).json({ data: user });
+  } catch (error) {
+    console.error("Error fetching profile:", error);
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+
+//set active for teachers
+  app.post("/api/users/toggle-active", async (req, res) => {
+  try {
+    const { userId, isActive } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "Missing userId" });
+    }
+
+    const updateResult = await userCollection.updateOne(
+      { uid: userId },
+      { $set: { isActive: isActive } }
+    );
+
+    res.json({ success: true, updateResult });
+  } catch (err) {
+    console.error("Error toggling active:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+//update fcm token
+
+app.post("/api/users/update-fcm", async (req, res) => {
+  try {
+    const { userId, FCMToken } = req.body;
+
+    if (!userId || !FCMToken) {
+      return res.status(400).json({ error: "Missing userId or FCMToken" });
+    }
+
+    await userCollection.updateOne(
+      { uid: userId },
+      { $set: { FCMToken } }
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error updating FCM token:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
 
 
     //chat codes
@@ -800,37 +767,32 @@ app.post("/newStudent", async (req, res) => {
       }
     );
 
-    // Update teacher points in Firestore
-    if (callPoints > 0 && session.teacherId) {
-      const teacherRef = userCollection.doc(session.teacherId);
-      const teacherSnap = await teacherRef.get();
-
-      if (teacherSnap.exists) {
-        const prevPoints = teacherSnap.data().points || 0;
-        await teacherRef.update({
-          points: prevPoints + callPoints,
-        });
+        // Update teacher points in MongoDB
+    // ✅ Update teacher points atomically
+      if (callPoints > 0 && session.teacherId) {
+        await userCollection.updateOne(
+          { _id: session.teacherId },
+          { $inc: { points: callPoints } }
+        );
       }
-    }
 
-    // Fetch student document
-    const studentRef = userCollection.doc(session.studentId);
-    const studentSnap = await studentRef.get();
+      // ✅ Deduct student credits atomically (avoid going below 0)
+      if (session.studentId) {
+        const creditToDeduct = Math.round(seconds / 10); // 1 credit per 10 seconds
 
-    if (studentSnap.exists) {
-      const sub = studentSnap.data()?.subscription || {};
-      let currentCredit = sub?.credit || 0;
+        if (creditToDeduct > 0) {
+          const student = await userCollection.findOne({ _id: session.studentId });
+          if (student) {
+            const currentCredit = student.subscription?.credit || 0;
+            const newCredit = Math.max(currentCredit - creditToDeduct, 0);
 
-      const creditToDeduct = Math.round(seconds / 10); // 1 credit per 10 seconds
-
-      if (creditToDeduct > 0) {
-        currentCredit = Math.max(currentCredit - creditToDeduct, 0); // avoid negative credit
-
-        await studentRef.update({
-          "subscription.credit": currentCredit,
-        });
+            await userCollection.updateOne(
+              { _id: session.studentId },
+              { $set: { "subscription.credit": newCredit } }
+            );
+          }
+        }
       }
-    }
 
     return res.status(200).json({ success: true, pointsGiven: callPoints });
   } catch (err) {
@@ -842,62 +804,62 @@ app.post("/newStudent", async (req, res) => {
 
 
   // Backend: sendVoiceMessage route
-  app.post('/sendVoiceMessage', async (req, res) => {
-    const { chatId, senderId, receiverId, audioUrl } = req.body;
+//   app.post('/sendVoiceMessage', async (req, res) => {
+//     const { chatId, senderId, receiverId, audioUrl } = req.body;
     
-    if (!chatId || !senderId || !receiverId || !audioUrl) {
-        return res.status(400).json({ error: 'Missing required fields.' });
-    }
+//     if (!chatId || !senderId || !receiverId || !audioUrl) {
+//         return res.status(400).json({ error: 'Missing required fields.' });
+//     }
 
-    const chatDB = databaseinmongo.collection('chatDB');
-    const chatCollection = databaseinmongo.collection('chatCollection');
+//     const chatDB = databaseinmongo.collection('chatDB');
+//     const chatCollection = databaseinmongo.collection('chatCollection');
   
-    try {
-        // Add voice message to chatDB collection
-        const message = {
-            senderId,
-            audioUrl,
-            createdAt: new Date(),
-            lastMessageFeedback: null,
-        };
+//     try {
+//         // Add voice message to chatDB collection
+//         const message = {
+//             senderId,
+//             audioUrl,
+//             createdAt: new Date(),
+//             lastMessageFeedback: null,
+//         };
 
-        const result = await chatDB.updateOne(
-            { _id: new ObjectId(chatId) },
-            { $push: { messages: message } }
-        );
+//         const result = await chatDB.updateOne(
+//             { _id: new ObjectId(chatId) },
+//             { $push: { messages: message } }
+//         );
 
-        if (result.modifiedCount === 0) {
-            return res.status(404).json({ error: 'Chat not found.' });
-        }
+//         if (result.modifiedCount === 0) {
+//             return res.status(404).json({ error: 'Chat not found.' });
+//         }
 
-        // Fetch the updated chat document after the message is added
-        const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+//         // Fetch the updated chat document after the message is added
+//         const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
 
-        if (chatDoc) {
-            // Emit the updated chat data to the sender and receiver
-            io.to(senderId).emit('chatUpdate', chatDoc);
-            io.to(receiverId).emit('chatUpdate', chatDoc);
+//         if (chatDoc) {
+//             // Emit the updated chat data to the sender and receiver
+//             io.to(senderId).emit('chatUpdate', chatDoc);
+//             io.to(receiverId).emit('chatUpdate', chatDoc);
 
-            // Calculate and emit the last message timestamp for both users
-            const lastMessageIndex = chatDoc.messages.length - 1;
-            if (lastMessageIndex >= 0) {
-                const createdAtValue = chatDoc.messages[lastMessageIndex].createdAt;
-                const mntsAgoValue = Math.floor((Date.now() - createdAtValue) / 60000);
-                io.to(senderId).emit('lastMessageTimestamp', mntsAgoValue);
-                io.to(receiverId).emit('lastMessageTimestamp', mntsAgoValue);
-            }
-        }
+//             // Calculate and emit the last message timestamp for both users
+//             const lastMessageIndex = chatDoc.messages.length - 1;
+//             if (lastMessageIndex >= 0) {
+//                 const createdAtValue = chatDoc.messages[lastMessageIndex].createdAt;
+//                 const mntsAgoValue = Math.floor((Date.now() - createdAtValue) / 60000);
+//                 io.to(senderId).emit('lastMessageTimestamp', mntsAgoValue);
+//                 io.to(receiverId).emit('lastMessageTimestamp', mntsAgoValue);
+//             }
+//         }
 
-        // Emit the updated chat list to both users
-        io.to(senderId).emit('chatListUpdate', { success: true });
-        io.to(receiverId).emit('chatListUpdate', { success: true });
+//         // Emit the updated chat list to both users
+//         io.to(senderId).emit('chatListUpdate', { success: true });
+//         io.to(receiverId).emit('chatListUpdate', { success: true });
 
-        res.status(200).json({ success: true, message: 'Voice message sent.' });
-    } catch (error) {
-        console.error('Error sending voice message:', error);
-        res.status(500).json({ error: 'Internal server error.' });
-    }
-});
+//         res.status(200).json({ success: true, message: 'Voice message sent.' });
+//     } catch (error) {
+//         console.error('Error sending voice message:', error);
+//         res.status(500).json({ error: 'Internal server error.' });
+//     }
+// });
 
 
 
@@ -968,10 +930,8 @@ app.post("/newStudent", async (req, res) => {
               const chatInfos = userChatDoc.chats || [];
               const populatedChats = await Promise.all(
                   chatInfos.map(async (item) => {
-                      const collectionName = 'userCollection';
-                      const userDoc = await database.collection(collectionName).doc(item.receiverId).get();
-                        const userss = userDoc.exists ? userDoc.data() : {};
-
+                      const userDoc = await userCollection.findOne({ uid: item.receiverId });
+                      const userss = userDoc || {};
                       return { ...item, userss };
                   })
               );
@@ -984,7 +944,6 @@ app.post("/newStudent", async (req, res) => {
           const chatList = updatedChatLists[index];
           const unseenCount = chatList.filter(chat => !chat.isSeen).length;
           io.to(id).emit('chatListUpdate', { chatList, unseenCount });
-
       });
 
           
@@ -1029,7 +988,6 @@ app.post("/newStudent", async (req, res) => {
               {_id: userId },
               { $set: { chats: userChatDoc.chats } }
           );
-  
           return res.status(200).json({ message: 'Chat marked as seen successfully' });
       } catch (err) {
           console.error('Error marking chat as seen:', err);
@@ -1038,12 +996,37 @@ app.post("/newStudent", async (req, res) => {
   });
 
   app.put('/update-feedback', async (req, res) => {
-    const { chatId, index, isLike } = req.body;
+    const {teacherId, chatId, index, isLike } = req.body;
     if (!index || !chatId) {
         return;
     }
 
     try {
+      if (!teacherId) {
+      return res.status(400).json({ error: "teacherId required" });
+    }
+
+      // Find teacher
+      const teacher = await userCollection.findOne({ uid: teacherId }); 
+      if (!teacher) {
+        return res.status(404).json({ error: "Teacher not found" });
+      }
+
+      const { points = 0, rating = 0 } = teacher;
+
+      // Calculate new values
+      const newPoints = isLike && chatId ? points + 2 : points - 2;
+      const newRating = isLike ? (5 - rating) / 10 : -((5 - rating) / 10);
+
+      // Update in MongoDB
+      const updateResult = await userCollection.updateOne(
+        { uid: teacherId },
+        {
+          $set: { points: newPoints },
+          $inc: { rating: newRating },
+        }
+      );
+
         const chatDB = databaseinmongo.collection('chatDB');
 
         const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
@@ -1187,8 +1170,8 @@ app.post("/newStudent", async (req, res) => {
                   let totalUnseen = 0;
                   const promises = chatInfos.map(async (item) => {
                     
-                      const userDoc = await userCollection.doc(item.receiverId).get();
-                      const userss = userDoc.exists ? userDoc.data() : {};
+                      const userDoc = await userCollection.findOne({ uid: item.receiverId });
+                      const userss = userDoc || {};
   
                       // Count unseen messages
                       if (item.isSeen === false) {
@@ -1244,20 +1227,25 @@ app.post("/newStudent", async (req, res) => {
       const expiryDate = new Date(startDate); // Make a copy of startDate
       expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
 
-      // Update Firestore
-      const userRef = userCollection.doc(uid);
-      await userRef.update({
-        subscription: {
-          packageName,
-          startDate: startDate.toISOString(),
-          expiryDate: expiryDate.toISOString(),
-          credit,
-          isActive: true,
-          paymentStatus: "approved",
-          purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
-          category 
-        }
-      });
+      await activepackages.updateOne(
+        { uid }, // match by uid + package + startDate to prevent duplicates
+        {
+          $set: {
+            uid,
+            packageName,
+            startDate: startDate.toISOString(),
+            expiryDate: expiryDate.toISOString(),
+            credit: Number(credit),
+            totalCredit: credit,
+            isActive: true,
+            paymentStatus: "approved",
+            purchasedAt: new Date(),
+            category,
+            price: Number(price)
+          }
+        },
+        { upsert: true } // insert if not exists
+      );
       res.json({ checkout_url: 'poperl://webview' });   
       return;
   }
@@ -1338,35 +1326,39 @@ app.get('/ipn', async(req, res) => {
       expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
 
       // Update Firestore
-      const userRef = userCollection.doc(uid);
-      await userRef.update({
-        subscription: {
-          packageName,
-          startDate: startDate.toISOString(),
-          expiryDate: expiryDate.toISOString(),
-          credit,
-          isActive: true,
-          paymentStatus: "approved",
-          purchasedAt: admin.firestore.FieldValue.serverTimestamp(),
-          category
-        }
-      });
+      await activepackages.updateOne(
+        { uid }, // match by uid + package + startDate to prevent duplicates
+        {
+          $set: {
+            uid,
+            packageName,
+            startDate: startDate.toISOString(),
+            expiryDate: expiryDate.toISOString(),
+            credit: Number(credit),
+            totalCredit: Number(credit),
+            isActive: true,
+            paymentStatus: "approved",
+            purchasedAt: new Date(),
+            category,
+            price: Number(price)
+          }
+        },
+        { upsert: true } // insert if not exists
+      );
+
+
 
       // Insert into MongoDB subscriptions collection
-      const subscriptions = databaseinmongo.collection("subscriptions");
+
       await subscriptions.insertOne({
         uid,
         name: displayName,
         packageName,
-        price,
-        credit,
-        startDate: startDate.toISOString(),
-        expiryDate: expiryDate.toISOString(),
-        paymentId: data.bank_transaction_id || "unknown",
+        credit: Number(credit),
+        price: Number(price),
         orderId: order_id,
         createdAt: new Date()
       });
-
       console.log(`✅ Subscription granted for UID: ${uid}`);
       return res.status(200).json({ message: "Subscription activated." });
     } else {
@@ -1383,6 +1375,122 @@ app.get('/ipn', async(req, res) => {
     return res.status(500).json({ error: "Internal server error." });
   }
 });
+
+
+
+
+
+
+app.get('/api/getUserRole/:userId', async (req, res) => {
+  const userId = req.params.userId;
+  
+  try {
+    // Try to find the user by _id
+    const userDoc = await userCollection.findOne({ uid: userId });
+
+    if (userDoc) {
+      res.json({ userRole: userDoc.role, userDoc });
+    } else {
+      res.status(404).json({ message: 'User not found or not a student' });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+//check subscription
+// GET /api/subscription/:userId
+app.get("/api/subscription/:userId", async (req, res) => {
+  const { userId } = req.params;  
+
+  try {
+    
+    const sub = await activepackages.findOne({ uid: userId });
+    
+
+    if (!sub) {
+      return res.json({subscription: null });
+    }
+    
+    const isValid =
+      new Date(sub.expiryDate) > new Date() && sub.credit > 0 && sub.isActive === true;
+
+    res.json({
+      isSubscribed: isValid,
+      subscription: sub,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+//change points and credit
+app.post("/api/messages/credit-point", async (req, res) => {
+  try {
+    const { userId, role, creditToDeduct, pointsToAdd } = req.body;
+
+    if (!userId || !role) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    if (role === "teacher" && pointsToAdd) {
+      // Teacher gets points
+
+      if (pointsToAdd > 0) {
+        await userCollection.updateOne(
+          { uid: userId, role: "teacher" },
+          { $inc: { points: pointsToAdd } }
+        );
+      }
+    } else if (role === "student") {
+      // Student loses credit
+      
+
+      if (creditToDeduct > 0 && userId) {
+        await activepackages.updateOne(
+          { uid: userId },
+          { $inc: { credit: -creditToDeduct } }
+        );
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error in process route:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/sub-check/:callerId", async (req, res) => {
+  try {
+    const { callerId } = req.params;
+
+    // 🔹 if you store callerId as uid instead of _id, change query to { uid: callerId }
+    const subscription = await activepackages.findOne({
+      uid: callerId,
+    });
+
+    if (!subscription) {
+      return res.json({ isValid: false, credit: 0 });
+    }    
+
+    const now = new Date();
+    const expiryDate = new Date(subscription.expiryDate);
+
+    const isValid =
+      subscription?.isActive === true &&
+      expiryDate > now &&
+      subscription.credit > 0;
+
+    res.json({ isValid, credit: subscription.credit });
+  } catch (err) {
+    console.error("Error fetching subscription:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 
 
 
@@ -1416,7 +1524,7 @@ app.get('/ipn', async(req, res) => {
     }
 
     // 2. Calculate total revenue from MongoDB
-    const totalRevenueResult = await databaseinmongo.collection("subscriptions").aggregate([
+    const totalRevenueResult = await subscriptions.aggregate([
       { $group: { _id: null, totalRevenue: { $sum: "$price" } } }
     ]).toArray();
     
@@ -1480,14 +1588,161 @@ app.get('/ipn', async(req, res) => {
 });
 
 
-    // app.post("/subscriptions", async (req, res) => {
-    //   try{
-    //     const subscriptions = databaseinmongo.collection("subscriptions");
-    //     const result = await subscriptions.insertOne(req.body);
-    //   }catch(err){
-    //     console.log(err);
-    //   }
-    // })
+const calculatePlatformMoney = async () => {
+  
+  
+
+  // 1️⃣ Total subscription money (only paid subscriptions)
+  const totalMoneyAgg = await subscriptions.aggregate([
+    { $group: { _id: null, totalMoney: { $sum: "$price" } } }
+  ]).toArray();
+  const totalMoney = totalMoneyAgg[0]?.totalMoney || 0;
+
+  // 2️⃣ Total available credit (only paid + active subscriptions)
+  const now = new Date();
+
+const availableCreditWorthAgg = await activepackages.aggregate([
+  {
+    $addFields: {
+      expiryDateObj: { $toDate: "$expiryDate" } // convert string to Date
+    }
+  },
+  { 
+    $match: { 
+      expiryDateObj: { $gt: now } // only not expired
+    } 
+  },
+  { 
+    $project: { 
+      creditWorth: { $multiply: ["$credit", { $divide: ["$price", "$totalCredit"] }] } 
+    } 
+  },
+  { 
+    $group: { 
+      _id: null, 
+      totalCreditWorth: { $sum: "$creditWorth" } 
+    } 
+  }
+]).toArray();
+
+
+const totalAvailableCreditWorth = availableCreditWorthAgg[0]?.totalCreditWorth || 0;
+
+
+  // 3️⃣ Total withdrawals (only paid)
+  const totalWithdrawalsAgg = await withdrawals.aggregate([
+    { $match: { paid: true } },
+    { $group: { _id: null, totalWithdrawals: { $sum: "$amount" } } }
+  ]).toArray();
+  const totalWithdrawals = totalWithdrawalsAgg[0]?.totalWithdrawals || 0;
+
+  // 4️⃣ Money available in the platform
+  const moneyInPlatform = totalMoney - totalAvailableCreditWorth - totalWithdrawals;
+
+  const totalTeacherPoints = await calculateTotalTeacherPoints();
+
+
+
+  const summaryCollection = databaseinmongo.collection("platform_money_summary");
+
+// Define a fixed _id for the single document
+const summaryId = "current_platform_money";
+
+const summaryDoc = {
+  _id: summaryId,                     // ensures only one document exists
+  totalMoney,
+  totalAvailableCreditWorth,
+  totalWithdrawals,
+  moneyInPlatform,
+  totalTeacherPoints,
+  updatedAt: new Date()               // timestamp of latest calculation
+};
+
+// Upsert: create if not exists, otherwise update
+await summaryCollection.updateOne(
+  { _id: summaryId },
+  { $set: summaryDoc },
+  { upsert: true }
+);
+
+
+
+
+  return {
+    totalMoney,
+    totalAvailableCreditWorth,
+    totalWithdrawals,
+    moneyInPlatform,
+    totalTeacherPoints
+  };
+};
+
+
+async function calculateTotalTeacherPoints() {
+  const result = await userCollection.aggregate([
+    { $match: { role: "teacher", points: { $exists: true } } }, // only teachers with points
+    { $group: { _id: null, totalPoints: { $sum: "$points" } } } // sum points
+  ]).toArray();
+
+  return result[0]?.totalPoints || 0;
+}
+
+
+// GET endpoint to compute pointValue
+app.get('/point-value', async (req, res) => {
+  const summaryId = "current_platform_money"; 
+
+  await calculatePlatformMoney()
+  .then(console.log)
+  .catch(console.error);
+  
+  
+
+  try {
+    const summaryCollection = databaseinmongo.collection("platform_money_summary");
+
+    // Fetch the document by ID
+    const summaryDoc = await summaryCollection.findOne({ _id: summaryId });
+
+    if (!summaryDoc) {
+      return res.status(404).json({ error: "Summary document not found." });
+    }
+
+    const { moneyInPlatform, totalTeacherPoints } = summaryDoc;
+
+    // Prevent division by zero
+    if (!totalTeacherPoints || totalTeacherPoints === 0) {
+      return res.status(400).json({ error: "totalTeacherPoints is zero or missing." });
+    }
+
+    // Calculate point value
+    const pointValue = moneyInPlatform / totalTeacherPoints;
+
+    // Send result
+    res.json({ pointValue });
+
+  } catch (error) {
+    console.error("Error fetching point value:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+
+// Example usage:
+
+
+
+
+
+
+
+    app.post("/subscriptions", async (req, res) => {
+      try{
+        const result = await subscriptions.insertOne(req.body);
+      }catch(err){
+        console.log(err);
+      }
+    })
 
     app.get("/salaryData", async(req, res) => {
       try{
