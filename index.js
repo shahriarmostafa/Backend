@@ -387,6 +387,66 @@ async function run() {
 
     //userProfile Informations
 
+    //authentication
+    app.post("/newTeacher", async (req, res) => {
+    try {
+      const user = req.body;
+
+      // Check if user already exists in studentCollection
+      const studentQuery = await userCollection.where("email", "==", user.email).get();
+      if (!studentQuery.empty) {
+        await userCollection.doc(user?.uid).update({
+          FCMToken: user.FCMToken
+        });
+        return res.status(200).json({ success: true, message: "User is a student, skipping teacher registration." });
+      }
+
+      // Add teacher data to the teacher collection
+      const result = await userCollection.doc(user?.uid).set(user);
+
+      // Initialize an empty chat list for the teacher
+      const result2 = await databaseinmongo.collection("chatCollection").updateOne(
+        { _id: user?.uid },
+        { $setOnInsert: { chats: [] } },
+        { upsert: true }
+      );
+
+      // Send a success response
+      res.status(200).send({ success: true, message: "Teacher added successfully." });
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ success: false, error: "Failed to add a new teacher." });
+    }
+  });
+
+  app.post("/newStudent", async (req, res) => {
+  try {
+    const user = req.body;
+
+    // Check if user already exists in teacherCollection
+    const teacherQuery = await userCollection.where("email", "==", user.email).get();
+    if (!teacherQuery.empty) {
+      await userCollection.doc(user?.uid).update({
+        FCMToken: user.FCMToken
+      });
+      return res.status(200).json({ success: true, message: "User is a teacher, skipping student registration." });
+    }
+
+    // Save user to the student collection
+    const result = await userCollection.doc(user?.uid).set(user);
+
+    // Initialize an empty chat list for the user
+    const result2 = await databaseinmongo
+      .collection("chatCollection")
+      .insertOne({ _id: user?.uid, chats: [] });
+
+    // Send response
+    res.status(200).send({ result, result2 });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ error: "An error occurred while processing the request." });
+  }
+});
 
 
 // For teachers
