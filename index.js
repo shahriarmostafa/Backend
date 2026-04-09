@@ -1482,7 +1482,8 @@ app.get('/api/getUserRole/:userId', async (req, res) => {
   try {
     // Try to find the user by _id
     const userDoc = await userCollection.findOne({ uid: userId });
-
+    console.log(userDoc);
+    
     if (userDoc) {
       res.json({ userRole: userDoc.role, userDoc });
     } else {
