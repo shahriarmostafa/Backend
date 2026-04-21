@@ -880,11 +880,11 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
         if (creditToDeduct > 0) {
 
-          const student = await userCollection.findOne({ _id: session.studentId });
-          if (student) {
-              console.log("student found: ", student._id);
+          const studentPackage = await activepackages.findOne({ uid: session.studentId });
+          if (studentPackage) {
+              console.log("student package found: ", studentPackage.uid);
 
-            const currentCredit = student.subscription?.credit || 0;
+            const currentCredit = studentPackage.credit || 0;
             const newCredit = Math.max(currentCredit - creditToDeduct, 0);
             console.log("new credit: ", newCredit);
 
