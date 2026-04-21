@@ -888,9 +888,9 @@ app.post("/api/users/update-fcm", async (req, res) => {
             const newCredit = Math.max(currentCredit - creditToDeduct, 0);
             console.log("new credit: ", newCredit);
 
-            await userCollection.updateOne(
-              { _id: session.studentId },
-              { $set: { "subscription.credit": newCredit } }
+            await activepackages.updateOne(
+              { uid: session.studentId },
+              { $set: { credit: newCredit } }
             );
           }
         }
