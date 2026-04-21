@@ -870,16 +870,24 @@ app.post("/api/users/update-fcm", async (req, res) => {
           { $inc: { points: callPoints } }
         );
       }
-
+      
       // ✅ Deduct student credits atomically (avoid going below 0)
       if (session.studentId) {
-        const creditToDeduct = Math.round(seconds / 10); // 1 credit per 10 seconds
+              console.log("student id found!");
+
+        const creditToDeduct = Math.floor(seconds / 10); // 1 credit per 10 seconds
+      console.log("credit counted: ", creditToDeduct);
 
         if (creditToDeduct > 0) {
+          console.log("id found: ", student._id);
+
           const student = await userCollection.findOne({ _id: session.studentId });
           if (student) {
+              console.log("student found: ", student._id);
+
             const currentCredit = student.subscription?.credit || 0;
             const newCredit = Math.max(currentCredit - creditToDeduct, 0);
+            console.log("new credit: ", newCredit);
 
             await userCollection.updateOne(
               { _id: session.studentId },
@@ -1478,6 +1486,7 @@ app.get('/ipn', async(req, res) => {
 
 app.get('/api/getUserRole/:userId', async (req, res) => {
   const userId = req.params.userId;
+  console.log("role finding: ", userId);
   
   try {
     // Try to find the user by _id
