@@ -1330,6 +1330,46 @@ app.post('/pay-poperl', async (req, res) => {
     category
   } = req.body;
 
+  if (amount < 10) {
+  // Calculate subscription dates
+  const startDate = new Date();
+
+  // Make a copy of startDate
+  const expiryDate = new Date(startDate);
+
+  expiryDate.setHours(
+    expiryDate.getHours() + Number(durationDays)
+  );
+
+  await activepackages.updateOne(
+    { uid }, // match by uid to prevent duplicates
+    {
+      $set: {
+        uid,
+        packageName,
+        startDate: startDate.toISOString(),
+        expiryDate: expiryDate.toISOString(),
+        credit: Number(credit),
+        totalCredit: credit,
+        isActive: true,
+        paymentStatus: "approved",
+        purchasedAt: new Date(),
+        category,
+        price: Number(price),
+      },
+    },
+    {
+      upsert: true, // insert if not exists
+    }
+  );
+
+  res.json({
+    checkout_url: "poperl://webview",
+  });
+
+  return;
+}
+
   const metadata = {
   customOrderId: order_id,
   paymentType: "new-package",
