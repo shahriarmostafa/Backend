@@ -1305,8 +1305,14 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
 
   //payment
-  app.post('/pay-poperl', async (req, res) => {
-    
+//
+// ================================
+// PAY POPERL (NEW PACKAGE)
+// ================================
+//
+
+app.post('/pay-poperl', async (req, res) => {
+
   const {
     amount,
     order_id,
@@ -1323,47 +1329,21 @@ app.post("/api/users/update-fcm", async (req, res) => {
     credit,
     category
   } = req.body;
-  if(amount < 10){
-    // Calculate subscription dates
-      const startDate = new Date();
-      const expiryDate = new Date(startDate); // Make a copy of startDate
-      expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
-
-      await activepackages.updateOne(
-        { uid }, // match by uid + package + startDate to prevent duplicates
-        {
-          $set: {
-            uid,
-            packageName,
-            startDate: startDate.toISOString(),
-            expiryDate: expiryDate.toISOString(),
-            credit: Number(credit),
-            totalCredit: credit,
-            isActive: true,
-            paymentStatus: "approved",
-            purchasedAt: new Date(),
-            category,
-            price: Number(price)
-          }
-        },
-        { upsert: true } // insert if not exists
-      );
-      res.json({ checkout_url: 'poperl://webview' });   
-      return;
-  }
 
   const metadata = {
-    uid,
-    displayName,
-    packageName,
-    price,
-    durationDays,
-    credit,
-    category
-  };
-  
+  customOrderId: order_id,
+  paymentType: "new-package",
+  uid,
+  displayName,
+  packageName,
+  price,
+  durationDays,
+  credit,
+  category
+};
 
   shurjopay.makePayment({
+
     amount,
     order_id,
     customer_name,
@@ -1372,110 +1352,530 @@ app.post("/api/users/update-fcm", async (req, res) => {
     customer_city,
     currency,
     customer_address,
-    value1: JSON.stringify(metadata) // Pass metadata here
-  }, async (resp) => {
+    value1: JSON.stringify(metadata)
+
+  },
+
+  async (resp) => {
+
     console.log(resp);
-    
-    res.json({ checkout_url: resp.checkout_url });    
-  }, (err) => {
-    console.error("Payment error:", err);    
-    res.status(500).json({ error: err.message });
+
+    res.json({
+      checkout_url: resp.checkout_url
+    });
+
+  },
+
+  (err) => {
+
+    console.error("Payment error:", err);
+
+    res.status(500).json({
+      error: err.message
+    });
+
   });
+
 });
 
+//
+// ================================
+// EXTEND PACKAGE
+// ================================
+//
 
+app.post('/extend-package', async (req, res) => {
 
-app.get('/ipn', async(req, res) => {
-  const { order_id } = req.query;
+  const {
+    amount,
+    order_id,
+    customer_name,
+    customer_phone,
+    uid,
+    displayName,
+    packageName,
+    price,
+    durationDays,
+    customer_city,
+    currency,
+    customer_address,
+    credit,
+    category
+  } = req.body;
 
-  console.log(req.body);
-  
-  
+  //
+  // FREE / INSTANT EXTENSION
+  //
 
-  if (!order_id) {
-    return res.status(400).json({ error: req.body });
-  }
+  if (Number(amount) < 10) {
 
-  try {
-    console.log("🔍 Verifying ShurjoPay payment for order_id:", order_id);
+    try {
 
-    // Await the verification result (Promise-based)
-    shurjopay.verifyPayment(order_id, async (result) => {
-        if (!result || result.length === 0) {
-      console.warn("⚠️ No verification result returned.");
-      return res.status(200).json({ message: "Payment not verified." });
-    }
+      const existingPackage =
+        await activepackages.findOne({ uid });
 
-    const data = result[0];
-    console.log(data);
-    
-    if (data.sp_code === '1000' && data.sp_message === 'Success') {
-      // Parse metadata passed in value_a
-      
-      const {
-        uid,
-        displayName,
-        packageName,
-        price,
-        credit,
-        durationDays,
-        category
-      } = JSON.parse(data.value1);
+      if (!existingPackage) {
 
-      // Calculate subscription dates
-      const startDate = new Date();
-      const expiryDate = new Date(startDate); // Make a copy of startDate
-      expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
+        return res.status(404).json({
+          error: "No active package found"
+        });
+      }
 
-      // Update Firestore
-      await activepackages.updateOne(
-        { uid }, // match by uid + package + startDate to prevent duplicates
-        {
-          $set: {
-            uid,
-            packageName,
-            startDate: startDate.toISOString(),
-            expiryDate: expiryDate.toISOString(),
-            credit: Number(credit),
-            totalCredit: Number(credit),
-            isActive: true,
-            paymentStatus: "approved",
-            purchasedAt: new Date(),
-            category,
-            price: Number(price)
-          }
-        },
-        { upsert: true } // insert if not exists
+      const now = new Date();
+
+      let expiryDate;
+
+      if (
+        existingPackage.expiryDate &&
+        new Date(existingPackage.expiryDate) > now
+      ) {
+
+        expiryDate = new Date(
+          existingPackage.expiryDate
+        );
+
+      } else {
+
+        expiryDate = new Date(now);
+      }
+
+      // Extend duration
+      expiryDate.setHours(
+        expiryDate.getHours() +
+        Number(durationDays)
       );
 
+      // Add credits
+      const updatedCredit =
+        Number(existingPackage.credit || 0) +
+        Number(credit);
 
+      const updatedTotalCredit =
+        Number(existingPackage.totalCredit || 0) +
+        Number(credit);
 
-      // Insert into MongoDB subscriptions collection
+      // Update active package
+      await activepackages.updateOne(
 
+        { uid },
+
+        {
+          $set: {
+            expiryDate: expiryDate.toISOString(),
+            credit: updatedCredit,
+            totalCredit: updatedTotalCredit,
+            price: Number(price),
+            updatedAt: new Date()
+          }
+        }
+
+      );
+
+      // Insert history
       await subscriptions.insertOne({
+
         uid,
         name: displayName,
         packageName,
         credit: Number(credit),
         price: Number(price),
-        orderId: order_id,
+        durationDays: Number(durationDays),
+        category,
+
+        type: "extension",
+
+        paymentStatus: "free-extension",
+
+        orderId: null,
+
+        internalReference:
+          `FREE_EXT_${Date.now()}`,
+
         createdAt: new Date()
-      });
-      console.log(`✅ Subscription granted for UID: ${uid}`);
-      return res.status(200).json({ message: "Subscription activated." });
-    } else {
-      console.warn(`⚠️ Payment failed or incomplete for order_id: ${order_id}`);
-      return res.status(200).json({ message: "Payment failed or not verified." });
-    }    
-      },
-      (error) => {
-        // TODO Handle error response
+
       });
 
-  } catch (error) {
-    console.error("❌ Error during IPN verification:", error);
-    return res.status(500).json({ error: "Internal server error." });
+      return res.json({
+        success: true,
+        instantExtension: true,
+        checkout_url: 'poperl://webview'
+      });
+
+    } catch (error) {
+
+      console.error(error);
+
+      return res.status(500).json({
+        error: "Extension failed"
+      });
+    }
   }
+
+  //
+  // PAID EXTENSION
+  //
+
+  const metadata = {
+    paymentType: "extension",
+    uid,
+    displayName,
+    packageName,
+    price,
+    durationDays,
+    credit,
+    category
+  };
+
+  shurjopay.makePayment({
+
+    amount,
+    order_id,
+    customer_name,
+    customer_phone,
+    client_ip: req.ip || "127.0.0.1",
+    customer_city,
+    currency,
+    customer_address,
+    value1: JSON.stringify(metadata)
+
+  },
+
+  async (resp) => {
+
+    console.log(resp);
+
+    res.json({
+      checkout_url: resp.checkout_url
+    });
+
+  },
+
+  (err) => {
+
+    console.error("Payment error:", err);
+
+    res.status(500).json({
+      error: err.message
+    });
+
+  });
+
+});
+
+//
+// ================================
+// IPN
+// ================================
+//
+
+app.get('/ipn', async (req, res) => {
+
+  const { order_id } = req.query;
+
+  if (!order_id) {
+
+    return res.status(400).json({
+      error: "Missing order_id"
+    });
+  }
+
+  try {
+
+    console.log(
+      "🔍 Verifying payment:",
+      order_id
+    );
+
+    shurjopay.verifyPayment(
+
+      order_id,
+
+      async (result) => {
+
+        if (!result || result.length === 0) {
+
+          return res.status(200).json({
+            message: "Payment not verified"
+          });
+        }
+
+        const data = result[0];
+
+        console.log(data);
+
+        //
+        // SUCCESS
+        //
+
+        if (
+          data.sp_code === '1000' &&
+          data.sp_message === 'Success'
+        ) {
+
+          const metadata =
+            JSON.parse(data.value1);
+
+          const {
+            paymentType,
+            uid,
+            displayName,
+            packageName,
+            price,
+            credit,
+            durationDays,
+            category
+          } = metadata;
+
+          //
+          // DUPLICATE IPN PROTECTION
+          //
+
+          const existingOrder =
+            await subscriptions.findOne({
+              orderId: order_id
+            });
+
+          if (existingOrder) {
+
+            return res.status(200).json({
+              message: "Already processed"
+            });
+          }
+
+          //
+          // ==================================
+          // NEW PACKAGE PURCHASE
+          // ==================================
+          //
+
+          if (paymentType === "new-package") {
+
+            const startDate = new Date();
+
+            const expiryDate =
+              new Date(startDate);
+
+            expiryDate.setHours(
+              expiryDate.getHours() +
+              Number(durationDays)
+            );
+
+            await activepackages.updateOne(
+
+              { uid },
+
+              {
+                $set: {
+
+                  uid,
+                  packageName,
+
+                  startDate:
+                    startDate.toISOString(),
+
+                  expiryDate:
+                    expiryDate.toISOString(),
+
+                  credit: Number(credit),
+
+                  totalCredit:
+                    Number(credit),
+
+                  isActive: true,
+
+                  paymentStatus: "approved",
+
+                  purchasedAt: new Date(),
+
+                  category,
+
+                  price: Number(price)
+
+                }
+              },
+
+              { upsert: true }
+
+            );
+
+          }
+
+          //
+          // ==================================
+          // PACKAGE EXTENSION
+          // ==================================
+          //
+
+          else if (
+            paymentType === "extension"
+          ) {
+
+            const existingPackage =
+              await activepackages.findOne({
+                uid
+              });
+
+            if (!existingPackage) {
+
+              return res.status(404).json({
+                error: "Package not found"
+              });
+            }
+
+            const now = new Date();
+
+            let expiryDate;
+
+            if (
+              existingPackage.expiryDate &&
+              new Date(
+                existingPackage.expiryDate
+              ) > now
+            ) {
+
+              expiryDate = new Date(
+                existingPackage.expiryDate
+              );
+
+            } else {
+
+              expiryDate = new Date(now);
+            }
+
+            // Extend duration
+            expiryDate.setHours(
+              expiryDate.getHours() +
+              Number(durationDays)
+            );
+
+            // Add credits
+            const updatedCredit =
+              Number(
+                existingPackage.credit || 0
+              ) +
+              Number(credit);
+
+            const updatedTotalCredit =
+              Number(
+                existingPackage.totalCredit || 0
+              ) +
+              Number(credit);
+
+            // Update package
+            await activepackages.updateOne(
+
+              { uid },
+
+              {
+                $set: {
+
+                  expiryDate:
+                    expiryDate.toISOString(),
+
+                  credit: updatedCredit,
+
+                  totalCredit:
+                    updatedTotalCredit,
+
+                  price: Number(price),
+
+                  updatedAt: new Date()
+
+                }
+              }
+
+            );
+
+          }
+
+          //
+          // ==================================
+          // SUBSCRIPTION HISTORY
+          // ==================================
+          //
+
+          await subscriptions.insertOne({
+
+            uid,
+
+            name: displayName,
+
+            packageName,
+
+            credit: Number(credit),
+
+            price: Number(price),
+
+            durationDays:
+              Number(durationDays),
+
+            category,
+
+            orderId: order_id,
+
+            type: paymentType,
+
+            paymentStatus: "approved",
+
+            createdAt: new Date()
+
+          });
+
+          console.log(
+            `✅ ${paymentType} completed for UID: ${uid}`
+          );
+
+          return res.status(200).json({
+            message: "Success"
+          });
+
+        }
+
+        //
+        // FAILED PAYMENT
+        //
+
+        else {
+
+          console.warn(
+            `⚠️ Payment failed for ${order_id}`
+          );
+
+          return res.status(200).json({
+            message: "Payment failed"
+          });
+        }
+
+      },
+
+      (error) => {
+
+        console.error(
+          "Verification error:",
+          error
+        );
+
+        return res.status(500).json({
+          error: "Verification failed"
+        });
+
+      }
+
+    );
+
+  } catch (error) {
+
+    console.error(
+      "❌ IPN error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Internal server error"
+    });
+
+  }
+
 });
 
 
