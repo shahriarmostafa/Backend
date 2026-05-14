@@ -1504,7 +1504,7 @@ app.post('/extend-package', async (req, res) => {
             expiryDate: expiryDate.toISOString(),
             credit: updatedCredit,
             totalCredit: updatedTotalCredit,
-            price: Number(price),
+            price: (existingPackage.price || 0) + Number(price),
             updatedAt: new Date()
           }
         }
@@ -1817,7 +1817,7 @@ app.get('/ipn', async (req, res) => {
                   totalCredit:
                     updatedTotalCredit,
 
-                  price: Number(price),
+                  price: (existingPackage.price || 0) + Number(price),
 
                   updatedAt: new Date()
 
