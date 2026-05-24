@@ -905,63 +905,6 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
 
 
-  // Backend: sendVoiceMessage route
-//   app.post('/sendVoiceMessage', async (req, res) => {
-//     const { chatId, senderId, receiverId, audioUrl } = req.body;
-    
-//     if (!chatId || !senderId || !receiverId || !audioUrl) {
-//         return res.status(400).json({ error: 'Missing required fields.' });
-//     }
-
-//     const chatDB = databaseinmongo.collection('chatDB');
-//     const chatCollection = databaseinmongo.collection('chatCollection');
-  
-//     try {
-//         // Add voice message to chatDB collection
-//         const message = {
-//             senderId,
-//             audioUrl,
-//             createdAt: new Date(),
-//             lastMessageFeedback: null,
-//         };
-
-//         const result = await chatDB.updateOne(
-//             { _id: new ObjectId(chatId) },
-//             { $push: { messages: message } }
-//         );
-
-//         if (result.modifiedCount === 0) {
-//             return res.status(404).json({ error: 'Chat not found.' });
-//         }
-
-//         // Fetch the updated chat document after the message is added
-//         const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
-
-//         if (chatDoc) {
-//             // Emit the updated chat data to the sender and receiver
-//             io.to(senderId).emit('chatUpdate', chatDoc);
-//             io.to(receiverId).emit('chatUpdate', chatDoc);
-
-//             // Calculate and emit the last message timestamp for both users
-//             const lastMessageIndex = chatDoc.messages.length - 1;
-//             if (lastMessageIndex >= 0) {
-//                 const createdAtValue = chatDoc.messages[lastMessageIndex].createdAt;
-//                 const mntsAgoValue = Math.floor((Date.now() - createdAtValue) / 60000);
-//                 io.to(senderId).emit('lastMessageTimestamp', mntsAgoValue);
-//                 io.to(receiverId).emit('lastMessageTimestamp', mntsAgoValue);
-//             }
-//         }
-
-//         // Emit the updated chat list to both users
-//         io.to(senderId).emit('chatListUpdate', { success: true });
-//         io.to(receiverId).emit('chatListUpdate', { success: true });
-
-//         res.status(200).json({ success: true, message: 'Voice message sent.' });
-//     } catch (error) {
-//         console.error('Error sending voice message:', error);
-//         res.status(500).json({ error: 'Internal server error.' });
-//     }
-// });
 
 
 
@@ -972,17 +915,18 @@ app.post("/api/users/update-fcm", async (req, res) => {
       const chatDB = databaseinmongo.collection("chatDB");
 
       try {
-          const { chatId, senderId, text, imageUrl, receiverId } = req.body;
-  
+          const { chatId, senderId, text, imageUrl, audioUrl, receiverId } = req.body;
+
           if (!chatId || !senderId || !receiverId) {
               return res.status(400).json({ error: 'Missing required fields.' });
           }
-  
+
           const message = {
               senderId,
-              ...(text && { text }), // Only include text if it exists
+              ...(text && { text }),
               createdAt: new Date(),
-              ...(imageUrl && { imageUrl: imageUrl }), // Only include image if provided
+              ...(imageUrl && { imageUrl }),
+              ...(audioUrl && { audioUrl }),
               lastMessageFeedback: null,
           };
   
@@ -1005,7 +949,7 @@ app.post("/api/users/update-fcm", async (req, res) => {
                       { _id: id, 'chats.chatId': chatId },
                       {
                           $set: {
-                              'chats.$.lastMessage': text || '📷 Image',
+                              'chats.$.lastMessage': text || (audioUrl ? '🎙️ Voice' : '📷 Image'),
                               'chats.$.isSeen': id === senderId,
                               'chats.$.lastMessageFeedback': null,
                               'chats.$.updatedAt': Date.now(),
