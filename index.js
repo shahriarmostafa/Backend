@@ -915,10 +915,24 @@ app.post("/api/users/update-fcm", async (req, res) => {
       const chatDB = databaseinmongo.collection("chatDB");
 
       try {
-          const { chatId, senderId, text, imageUrl, audioUrl, receiverId } = req.body;
+          const { chatId, senderId, text, imageUrl, audioUrl, fileUrl, fileName, fileType, fileSize, receiverId } = req.body;
 
           if (!chatId || !senderId || !receiverId) {
               return res.status(400).json({ error: 'Missing required fields.' });
+          }
+
+          if (fileUrl) {
+              const allowedFileTypes = ['pdf', 'docx', 'pptx'];
+              const normalizedFileType = String(fileType || '').toLowerCase();
+              const fileNameExtension = String(fileName || '').split('.').pop().toLowerCase();
+
+              if (!allowedFileTypes.includes(normalizedFileType) || normalizedFileType !== fileNameExtension) {
+                  return res.status(400).json({ error: 'Only PDF, DOCX, or PPTX files are supported.' });
+              }
+
+              if (Number(fileSize) > 1024 * 1024) {
+                  return res.status(400).json({ error: 'File size should not exceed 1MB.' });
+              }
           }
 
           const message = {
@@ -927,6 +941,10 @@ app.post("/api/users/update-fcm", async (req, res) => {
               createdAt: new Date(),
               ...(imageUrl && { imageUrl }),
               ...(audioUrl && { audioUrl }),
+              ...(fileUrl && { fileUrl }),
+              ...(fileName && { fileName }),
+              ...(fileType && { fileType }),
+              ...(fileSize && { fileSize }),
               lastMessageFeedback: null,
           };
   
@@ -949,7 +967,7 @@ app.post("/api/users/update-fcm", async (req, res) => {
                       { _id: id, 'chats.chatId': chatId },
                       {
                           $set: {
-                              'chats.$.lastMessage': text || (audioUrl ? '🎙️ Voice' : '📷 Image'),
+                              'chats.$.lastMessage': text || (audioUrl ? '🎙️ Voice' : (fileUrl ? '📎 File' : '📷 Image')),
                               'chats.$.isSeen': id === senderId,
                               'chats.$.lastMessageFeedback': null,
                               'chats.$.updatedAt': Date.now(),
