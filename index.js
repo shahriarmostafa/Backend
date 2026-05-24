@@ -317,7 +317,7 @@ app.get('/download-link', (req, res) => {
     apkUrl = oldOne;
   }
 
-  res.json({ url: apkUrl });
+  res.json({ url: "https://www.dropbox.com/scl/fi/579aovz1ku3fvly98ym2x/PoperL.apk?rlkey=1rx6dilm87o93a4rgyjqwe03m&e=1&st=6odkald1&dl=1" });
 });
 
 
