@@ -1111,50 +1111,7 @@ app.post("/api/users/update-fcm", async (req, res) => {
     io.on('connection', (socket) => {
       console.log('A user connected:', socket.id);
       const chatDB = databaseinmongo.collection("chatDB");
-      socket.on('sendVoiceMessage', async ({ chatId, senderId, audioUrl }) => {
-        try {    
-            // Find the chat document
-            const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
-    
-            if (!chatDoc) {
-                socket.emit('chatError', { message: 'Chat not found' });
-                return;
-            }
-    
-            // Ensure `messages` field is an array before updating
-            const updatedMessages = Array.isArray(chatDoc.messages) ? [...chatDoc.messages] : [];
-    
-            // Add the new voice message
-            const newMessage = {
-                audioUrl: audioUrl,
-                senderId: senderId,
-                lastMessageFeedback: null,
-                createdAt: Date.now()
-            };
-            updatedMessages.push(newMessage);
-    
-            // Update the chat document in MongoDB
-            await chatDB.updateOne(
-                { _id: new ObjectId(chatId) },
-                { $set: { messages: updatedMessages, updatedAt: Date.now() } }
-            );
-    
-            // Fetch the updated chat and emit it
-            const updatedChatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
-    
-            if (updatedChatDoc) {
-                // Emit the updated chat to both users
-                io.to(chatId).emit('chatUpdate', updatedChatDoc);
-    
-                // Emit the last message timestamp
-                const mntsAgoValue = Math.floor((Date.now() - newMessage.createdAt) / 60000);
-                io.to(chatId).emit('lastMessageTimestamp', mntsAgoValue);
-            }
-        } catch (err) {
-            console.error('Error sending voice message:', err);
-            socket.emit('chatError', { message: 'Failed to send voice message' });
-        }
-    });
+
     //get data of user typing
     socket.on('typing', (chatId) => {
     // Broadcast to everyone in the same chat room except sender
