@@ -484,9 +484,12 @@ async function run() {
       };
     };
 
-    const hydrateTeacherRoomChat = async (room, session) => {
+    const hydrateTeacherRoomChat = (room, session) => {
+      const chatName = session.name || `${room.name || "Study Room"} - ${session.subject || "Teacher Chat"}`;
+
       return {
         ...session,
+        name: chatName,
         roomId: room._id.toString(),
         roomName: room.name,
         roomKeyword: room.keyword,
