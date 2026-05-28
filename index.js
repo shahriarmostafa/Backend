@@ -23,24 +23,7 @@ const io = require("socket.io")(server,{
   }
 })
 
-// const allowedOrigins = [
-//   "https://app.poperl.com", // web
-//   "http://localhost:19006", // Expo Go
-//   "exp://192.168.x.x:19000", // Expo dev URLs (mobile)
-// ];
 
-// const io = require("socket.io")(server, {
-//   cors: {
-//     origin: (origin, callback) => {
-//       if (!origin || allowedOrigins.includes(origin)) {
-//         callback(null, true);
-//       } else {
-//         callback(new Error("Not allowed by CORS"));
-//       }
-//     },
-//     methods: ["GET", "POST"]
-//   }
-// });
 
 
 const shurjopay = require("shurjopay")();
@@ -52,13 +35,6 @@ shurjopay.config(
   process.env.SP_RETURN_URL,
   process.env.SP_CANCEL_URL
 );
-
-
-
-
-
-
-
 
 
 
@@ -322,23 +298,6 @@ app.get('/download-link', (req, res) => {
 
 
 
-
-
-
-
-// reset user points
-
-
-
-
-
-
-
-
-
-
-
-
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const uri = `mongodb+srv://ssmustafasahir:${process.env.PASSWORD_DB}@cluster0.c6fvj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
@@ -361,6 +320,168 @@ async function run() {
     const withdrawals = databaseinmongo.collection("withdrawals");
     const activepackages = databaseinmongo.collection("activePackages");
     const userCollection = databaseinmongo.collection("userCollection");
+    const studyRooms = databaseinmongo.collection("studyRooms");
+    const STUDY_ROOM_MAX_STUDENTS = 10;
+    const STUDY_ROOM_JOIN_CREDIT = 20;
+    const STUDY_ROOM_CREATE_CREDIT = 50;
+    const STUDY_ROOM_TEACHER_SESSION_MS = 60 * 60 * 1000;
+    const STUDY_ROOM_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+
+    const makeRoomKeyword = () => {
+      const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      let keyword = "";
+      for (let i = 0; i < 7; i++) {
+        keyword += letters[Math.floor(Math.random() * letters.length)];
+      }
+      return keyword;
+    };
+
+    const getUniqueRoomKeyword = async () => {
+      for (let i = 0; i < 10; i++) {
+        const keyword = makeRoomKeyword();
+        const existingRoom = await studyRooms.findOne({ keyword });
+        if (!existingRoom) return keyword;
+      }
+      return `${makeRoomKeyword()}${Date.now().toString(36).slice(-1)}`.slice(0, 7);
+    };
+
+    const getStudentCreditPackage = async (studentId) => {
+      const activePackage = await activepackages.findOne({ uid: studentId });
+      if (!activePackage) return { activePackage: null, credit: 0, isValid: false };
+
+      const isValid =
+        activePackage.isActive === true &&
+        new Date(activePackage.expiryDate) > new Date();
+
+      return {
+        activePackage,
+        credit: Number(activePackage.credit) || 0,
+        isValid,
+      };
+    };
+
+    const spendStudentCredit = async (studentId, amount) => {
+      const { credit, isValid } = await getStudentCreditPackage(studentId);
+
+      if (!isValid) {
+        return { ok: false, status: 403, message: "No active package found for this student." };
+      }
+
+      if (credit < amount) {
+        return { ok: false, status: 402, message: `At least ${amount} credit is required.` };
+      }
+
+      await activepackages.updateOne(
+        { uid: studentId },
+        { $inc: { credit: -amount } }
+      );
+
+      return { ok: true, credit: credit - amount };
+    };
+
+    const getRoomMembership = (room, userId) => {
+      const rawStatus = room?.memberStatuses?.[userId];
+      const joinedAt = rawStatus?.joinedAt ? new Date(rawStatus.joinedAt) : new Date(room?.createdAt || Date.now());
+      const nextBillingAt = rawStatus?.nextBillingAt
+        ? new Date(rawStatus.nextBillingAt)
+        : new Date(joinedAt.getTime() + STUDY_ROOM_MONTH_MS);
+      const isActive = rawStatus?.isActive !== false && nextBillingAt.getTime() > Date.now();
+
+      return {
+        joinedAt,
+        lastPaymentAt: rawStatus?.lastPaymentAt ? new Date(rawStatus.lastPaymentAt) : joinedAt,
+        nextBillingAt,
+        isActive,
+      };
+    };
+
+    const buildMemberStatuses = (room) => {
+      return (room.memberIds || []).reduce((acc, memberId) => {
+        acc[memberId] = getRoomMembership(room, memberId);
+        return acc;
+      }, {});
+    };
+
+    const renewRoomMembership = async (room, userId) => {
+      if (!(room.memberIds || []).includes(userId)) {
+        return { ok: false, status: 404, message: "Student is not a member of this room." };
+      }
+
+      const creditResult = await spendStudentCredit(userId, STUDY_ROOM_JOIN_CREDIT);
+      if (!creditResult.ok) return creditResult;
+
+      const now = new Date();
+      const nextBillingAt = new Date(now.getTime() + STUDY_ROOM_MONTH_MS);
+      const membership = {
+        joinedAt: getRoomMembership(room, userId).joinedAt,
+        lastPaymentAt: now,
+        nextBillingAt,
+        isActive: true,
+      };
+
+      await studyRooms.updateOne(
+        { _id: room._id },
+        {
+          $set: {
+            [`memberStatuses.${userId}`]: membership,
+            updatedAt: Date.now(),
+          },
+        }
+      );
+
+      return { ok: true, membership, credit: creditResult.credit };
+    };
+
+    const createStudyRoomChat = async ({ name, type, participantIds, teacherId = null, subject = null }) => {
+      const chatDB = databaseinmongo.collection("chatDB");
+      const newChat = await chatDB.insertOne({
+        createdAt: new Date(),
+        messages: [],
+        roomChat: true,
+        name,
+        type,
+        participantIds,
+        teacherId,
+        subject,
+      });
+
+      return {
+        chatId: newChat.insertedId.toString(),
+        name,
+        type,
+        participantIds,
+        teacherId,
+        subject,
+        createdAt: new Date(),
+      };
+    };
+
+    const hydrateStudyRoom = async (room) => {
+      if (!room) return null;
+
+      const [members, teachers] = await Promise.all([
+        userCollection.find({ uid: { $in: room.memberIds || [] } }).toArray(),
+        userCollection.find({ uid: { $in: (room.teacherSessions || []).map((item) => item.teacherId) } }).toArray(),
+      ]);
+
+      const teachersById = teachers.reduce((acc, teacher) => {
+        acc[teacher.uid] = teacher;
+        return acc;
+      }, {});
+
+      return {
+        ...room,
+        id: room._id.toString(),
+        memberCount: (room.memberIds || []).length,
+        memberStatuses: buildMemberStatuses(room),
+        maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
+        members,
+        teacherSessions: (room.teacherSessions || []).map((session) => ({
+          ...session,
+          teacher: teachersById[session.teacherId] || null,
+        })),
+      };
+    };
 
     //check if admin
 
@@ -385,7 +506,6 @@ async function run() {
     })
 
 
-    //userProfile Informations
 
     //authentication
     app.post("/newTeacher", async (req, res) => {
@@ -711,6 +831,274 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
 
 
+    //study room codes
+    app.get("/api/study-rooms", async (req, res) => {
+      try {
+        const rooms = await studyRooms
+          .find({ visibility: "public" })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .limit(50)
+          .toArray();
+        const hydratedRooms = await Promise.all(rooms.map(hydrateStudyRoom));
+
+        res.json({
+          success: true,
+          rooms: hydratedRooms,
+          costs: { join: STUDY_ROOM_JOIN_CREDIT, create: STUDY_ROOM_CREATE_CREDIT },
+        });
+      } catch (err) {
+        console.error("Error fetching study rooms:", err);
+        res.status(500).json({ error: "Failed to fetch study rooms." });
+      }
+    });
+
+    app.get("/api/study-rooms/search/:keyword", async (req, res) => {
+      try {
+        const keyword = String(req.params.keyword || "").trim().toUpperCase();
+        const room = await studyRooms.findOne({ keyword });
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        res.json({ success: true, room: await hydrateStudyRoom(room) });
+      } catch (err) {
+        console.error("Error searching study room:", err);
+        res.status(500).json({ error: "Failed to search study room." });
+      }
+    });
+
+    app.get("/api/study-rooms/:roomId", async (req, res) => {
+      try {
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        res.json({ success: true, room: await hydrateStudyRoom(room) });
+      } catch (err) {
+        console.error("Error fetching study room:", err);
+        res.status(500).json({ error: "Failed to fetch study room." });
+      }
+    });
+
+    app.post("/api/study-rooms", async (req, res) => {
+      try {
+        const { userId, name, visibility = "public" } = req.body;
+        const cleanName = String(name || "").trim();
+        const cleanVisibility = visibility === "private" ? "private" : "public";
+
+        if (!userId || !cleanName) {
+          return res.status(400).json({ error: "userId and room name are required." });
+        }
+
+        const userDoc = await userCollection.findOne({ uid: userId, role: "student" });
+        if (!userDoc) return res.status(403).json({ error: "Only students can create study rooms." });
+
+        const creditResult = await spendStudentCredit(userId, STUDY_ROOM_CREATE_CREDIT);
+        if (!creditResult.ok) return res.status(creditResult.status).json({ error: creditResult.message });
+
+        const keyword = await getUniqueRoomKeyword();
+        const now = new Date();
+        const studentChat = await createStudyRoomChat({
+          name: `${cleanName} Students`,
+          type: "students",
+          participantIds: [userId],
+        });
+        const roomDoc = {
+          name: cleanName,
+          visibility: cleanVisibility,
+          keyword,
+          createdBy: userId,
+          memberIds: [userId],
+          memberStatuses: {
+            [userId]: {
+              joinedAt: now,
+              lastPaymentAt: now,
+              nextBillingAt: new Date(now.getTime() + STUDY_ROOM_MONTH_MS),
+              isActive: true,
+            },
+          },
+          maxStudents: STUDY_ROOM_MAX_STUDENTS,
+          studentChatId: studentChat.chatId,
+          chats: [studentChat],
+          teacherSessions: [],
+          createdAt: now,
+          updatedAt: Date.now(),
+        };
+
+        const result = await studyRooms.insertOne(roomDoc);
+        const room = await studyRooms.findOne({ _id: result.insertedId });
+        res.status(201).json({ success: true, room: await hydrateStudyRoom(room), remainingCredit: creditResult.credit });
+      } catch (err) {
+        console.error("Error creating study room:", err);
+        res.status(500).json({ error: "Failed to create study room." });
+      }
+    });
+
+    app.patch("/api/study-rooms/:roomId", async (req, res) => {
+      try {
+        const { userId, name, visibility } = req.body;
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        if (!userId || !(room.memberIds || []).includes(userId)) {
+          return res.status(403).json({ error: "Only room members can edit this room." });
+        }
+
+        const update = { updatedAt: Date.now() };
+        if (typeof name === "string" && name.trim()) update.name = name.trim();
+        if (visibility === "public" || visibility === "private") update.visibility = visibility;
+
+        await studyRooms.updateOne({ _id: room._id }, { $set: update });
+        const updatedRoom = await studyRooms.findOne({ _id: room._id });
+        res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      } catch (err) {
+        console.error("Error updating study room:", err);
+        res.status(500).json({ error: "Failed to update study room." });
+      }
+    });
+
+    app.post("/api/study-rooms/:roomId/join", async (req, res) => {
+      try {
+        const { userId } = req.body;
+        if (!userId) return res.status(400).json({ error: "userId is required." });
+
+        const userDoc = await userCollection.findOne({ uid: userId, role: "student" });
+        if (!userDoc) return res.status(403).json({ error: "Only students can join study rooms." });
+
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        if ((room.memberIds || []).includes(userId)) {
+          const membership = getRoomMembership(room, userId);
+          if (membership.isActive) {
+            return res.json({ success: true, room: await hydrateStudyRoom(room), alreadyJoined: true });
+          }
+
+          const renewalResult = await renewRoomMembership(room, userId);
+          if (!renewalResult.ok) return res.status(renewalResult.status).json({ error: renewalResult.message });
+
+          const renewedRoom = await studyRooms.findOne({ _id: room._id });
+          return res.json({
+            success: true,
+            room: await hydrateStudyRoom(renewedRoom),
+            renewed: true,
+            remainingCredit: renewalResult.credit,
+          });
+        }
+        if ((room.memberIds || []).length >= (room.maxStudents || STUDY_ROOM_MAX_STUDENTS)) {
+          return res.status(409).json({ error: "This room is full." });
+        }
+
+        const creditResult = await spendStudentCredit(userId, STUDY_ROOM_JOIN_CREDIT);
+        if (!creditResult.ok) return res.status(creditResult.status).json({ error: creditResult.message });
+
+        const now = new Date();
+        const nextMemberIds = [...(room.memberIds || []), userId];
+        const updatedChats = (room.chats || []).map((chat) => (
+          chat.type === "students"
+            ? { ...chat, participantIds: nextMemberIds }
+            : { ...chat, participantIds: [...new Set([...(chat.participantIds || []), userId])] }
+        ));
+
+        await studyRooms.updateOne(
+          { _id: room._id },
+          {
+            $set: {
+              memberIds: nextMemberIds,
+              chats: updatedChats,
+              [`memberStatuses.${userId}`]: {
+                joinedAt: now,
+                lastPaymentAt: now,
+                nextBillingAt: new Date(now.getTime() + STUDY_ROOM_MONTH_MS),
+                isActive: true,
+              },
+              updatedAt: Date.now(),
+            },
+          }
+        );
+
+        const chatDB = databaseinmongo.collection("chatDB");
+        await Promise.all(updatedChats.map((chat) => (
+          chat.chatId
+            ? chatDB.updateOne({ _id: new ObjectId(chat.chatId) }, { $set: { participantIds: chat.participantIds } })
+            : Promise.resolve()
+        )));
+
+        const updatedRoom = await studyRooms.findOne({ _id: room._id });
+        res.json({ success: true, room: await hydrateStudyRoom(updatedRoom), remainingCredit: creditResult.credit });
+      } catch (err) {
+        console.error("Error joining study room:", err);
+        res.status(500).json({ error: "Failed to join study room." });
+      }
+    });
+
+    app.post("/api/study-rooms/:roomId/renew", async (req, res) => {
+      try {
+        const { userId } = req.body;
+        if (!userId) return res.status(400).json({ error: "userId is required." });
+
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+        if (!room) return res.status(404).json({ error: "Room not found." });
+
+        const renewalResult = await renewRoomMembership(room, userId);
+        if (!renewalResult.ok) return res.status(renewalResult.status).json({ error: renewalResult.message });
+
+        const updatedRoom = await studyRooms.findOne({ _id: room._id });
+        res.json({
+          success: true,
+          room: await hydrateStudyRoom(updatedRoom),
+          remainingCredit: renewalResult.credit,
+        });
+      } catch (err) {
+        console.error("Error renewing study room:", err);
+        res.status(500).json({ error: "Failed to renew study room membership." });
+      }
+    });
+
+    app.post("/api/study-rooms/:roomId/teachers", async (req, res) => {
+      try {
+        const { userId, teacherId, subject } = req.body;
+        if (!userId || !teacherId) return res.status(400).json({ error: "userId and teacherId are required." });
+
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        if (!(room.memberIds || []).includes(userId)) {
+          return res.status(403).json({ error: "Join this room before adding a teacher." });
+        }
+
+        if (!getRoomMembership(room, userId).isActive) {
+          return res.status(402).json({ error: "Renew this room membership before adding a teacher." });
+        }
+
+        const teacher = await userCollection.findOne({ uid: teacherId, role: "teacher", approved: true, isActive: true });
+        if (!teacher) return res.status(404).json({ error: "Available teacher not found." });
+
+        const teacherSubjects = Array.isArray(teacher.subjects) ? teacher.subjects : [];
+        const selectedSubject = subject || teacherSubjects[0] || teacher.category || "General";
+        const teacherChat = await createStudyRoomChat({
+          name: `${teacher.displayName || "Teacher"} - ${selectedSubject}`,
+          type: "teacher",
+          participantIds: [...new Set([...(room.memberIds || []), teacherId])],
+          teacherId,
+          subject: selectedSubject,
+        });
+        const teacherSession = {
+          ...teacherChat,
+          addedBy: userId,
+          addedAt: new Date(),
+          expiresAt: new Date(Date.now() + STUDY_ROOM_TEACHER_SESSION_MS),
+        };
+
+        await studyRooms.updateOne(
+          { _id: room._id },
+          {
+            $push: { chats: teacherChat, teacherSessions: teacherSession },
+            $set: { updatedAt: Date.now() },
+          }
+        );
+
+        const updatedRoom = await studyRooms.findOne({ _id: room._id });
+        res.status(201).json({ success: true, room: await hydrateStudyRoom(updatedRoom), chat: teacherChat });
+      } catch (err) {
+        console.error("Error adding teacher to study room:", err);
+        res.status(500).json({ error: "Failed to add teacher." });
+      }
+    });
+
+
     //chat codes
     //check if a chat already exist
     app.get("/chatExist/:userId/:receiverId", async (req, res) => {
@@ -915,10 +1303,20 @@ app.post("/api/users/update-fcm", async (req, res) => {
       const chatDB = databaseinmongo.collection("chatDB");
 
       try {
-          const { chatId, senderId, text, imageUrl, audioUrl, fileUrl, fileName, fileType, fileSize, receiverId } = req.body;
+          const { chatId, senderId, text, imageUrl, audioUrl, fileUrl, fileName, fileType, fileSize, receiverId, receiverIds, roomId } = req.body;
+          const messageReceiverIds = Array.isArray(receiverIds) && receiverIds.length
+            ? receiverIds
+            : (receiverId ? [receiverId] : []);
 
-          if (!chatId || !senderId || !receiverId) {
+          if (!chatId || !senderId || messageReceiverIds.length === 0) {
               return res.status(400).json({ error: 'Missing required fields.' });
+          }
+
+          if (roomId) {
+              const room = await studyRooms.findOne({ _id: new ObjectId(roomId) });
+              if (!room || !(room.memberIds || []).includes(senderId) || !getRoomMembership(room, senderId).isActive) {
+                  return res.status(403).json({ error: 'Renew this room membership before sending messages.' });
+              }
           }
 
           if (fileUrl) {
@@ -959,7 +1357,7 @@ app.post("/api/users/update-fcm", async (req, res) => {
           }
   
           // Update last message details for both users in chatCollection
-          const userIds = [senderId, receiverId];
+          const userIds = [...new Set([senderId, ...messageReceiverIds])];
   
           await Promise.all(
               userIds.map(async (id) => {
@@ -1842,6 +2240,107 @@ app.get('/ipn', async (req, res) => {
 
 
 
+// ================================
+// ADMIN: ADD SUBSCRIPTION TO USER
+// ================================
+
+app.post('/admin-add-subscription', async (req, res) => {
+  const { email, durationHours, credit, amountReceived } = req.body;
+
+  if (!email || !durationHours || credit === undefined || amountReceived === undefined) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    const user = await userCollection.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const uid = user.uid || user._id?.toString();
+    const displayName = user.displayName || user.name || email;
+
+    const existingPackage = await activepackages.findOne({ uid });
+    const now = new Date();
+    let type;
+
+    if (existingPackage && existingPackage.expiryDate && new Date(existingPackage.expiryDate) > now) {
+      // Active package exists — extend it
+      const expiryDate = new Date(existingPackage.expiryDate);
+      expiryDate.setHours(expiryDate.getHours() + Number(durationHours));
+
+      const updatedCredit = Number(existingPackage.credit || 0) + Number(credit);
+      const updatedTotalCredit = Number(existingPackage.totalCredit || 0) + Number(credit);
+
+      await activepackages.updateOne(
+        { uid },
+        {
+          $set: {
+            expiryDate: expiryDate.toISOString(),
+            credit: updatedCredit,
+            totalCredit: updatedTotalCredit,
+            price: (existingPackage.price || 0) + Number(amountReceived),
+            updatedAt: new Date()
+          }
+        }
+      );
+
+      type = "admin-extension";
+    } else {
+      // No active package or expired — create new
+      const startDate = new Date();
+      const expiryDate = new Date(startDate);
+      expiryDate.setHours(expiryDate.getHours() + Number(durationHours));
+
+      await activepackages.updateOne(
+        { uid },
+        {
+          $set: {
+            uid,
+            packageName: "Admin Custom",
+            startDate: startDate.toISOString(),
+            expiryDate: expiryDate.toISOString(),
+            credit: Number(credit),
+            totalCredit: Number(credit),
+            isActive: true,
+            paymentStatus: "admin-added",
+            purchasedAt: new Date(),
+            category: "custom",
+            price: Number(amountReceived),
+            updatedAt: new Date()
+          }
+        },
+        { upsert: true }
+      );
+
+      type = "admin-new";
+    }
+
+    await subscriptions.insertOne({
+      uid,
+      name: displayName,
+      email,
+      packageName: "Admin Custom",
+      credit: Number(credit),
+      price: Number(amountReceived),
+      durationDays: Number(durationHours),
+      category: "custom",
+      type,
+      paymentStatus: "admin-added",
+      orderId: null,
+      internalReference: `ADMIN_${Date.now()}`,
+      createdAt: new Date()
+    });
+
+    return res.json({ success: true, type, uid, displayName });
+
+  } catch (error) {
+    console.error("admin-add-subscription error:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.get('/api/getUserRole/:userId', async (req, res) => {
   const userId = req.params.userId;
   
@@ -2344,10 +2843,6 @@ app.get('/point-value', async (req, res) => {
       }
     })
 
-
-
-    
-    
 
   } catch(err){
     console.log(err);
