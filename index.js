@@ -324,6 +324,7 @@ async function run() {
     const STUDY_ROOM_MAX_STUDENTS = 10;
     const STUDY_ROOM_JOIN_CREDIT = 20;
     const STUDY_ROOM_CREATE_CREDIT = 50;
+    const STUDY_ROOM_TEACHER_CREDIT_RATE = 0.7;
     const STUDY_ROOM_TEACHER_SESSION_MS = 60 * 60 * 1000;
     const STUDY_ROOM_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -480,6 +481,19 @@ async function run() {
           ...session,
           teacher: teachersById[session.teacherId] || null,
         })),
+      };
+    };
+
+    const hydrateTeacherRoomChat = async (room, session) => {
+      return {
+        ...session,
+        roomId: room._id.toString(),
+        roomName: room.name,
+        roomKeyword: room.keyword,
+        memberIds: room.memberIds || [],
+        memberCount: (room.memberIds || []).length,
+        maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
+        roomCreditRate: STUDY_ROOM_TEACHER_CREDIT_RATE,
       };
     };
 
@@ -1098,6 +1112,39 @@ app.post("/api/users/update-fcm", async (req, res) => {
       }
     });
 
+    app.get("/api/teacher-room-chats/:teacherId", async (req, res) => {
+      try {
+        const { teacherId } = req.params;
+        const teacher = await userCollection.findOne({ uid: teacherId, role: "teacher" });
+
+        if (!teacher) {
+          return res.status(403).json({ error: "Only teachers can view room chats." });
+        }
+
+        const rooms = await studyRooms
+          .find({ "teacherSessions.teacherId": teacherId })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .toArray();
+
+        const chats = rooms.flatMap((room) => (
+          (room.teacherSessions || [])
+            .filter((session) => session.teacherId === teacherId)
+            .map((session) => hydrateTeacherRoomChat(room, session))
+        ));
+
+        chats.sort((a, b) => new Date(b.addedAt || 0) - new Date(a.addedAt || 0));
+
+        res.json({
+          success: true,
+          chats,
+          roomCreditRate: STUDY_ROOM_TEACHER_CREDIT_RATE,
+        });
+      } catch (err) {
+        console.error("Error fetching teacher room chats:", err);
+        res.status(500).json({ error: "Failed to fetch teacher room chats." });
+      }
+    });
+
 
     //chat codes
     //check if a chat already exist
@@ -1170,10 +1217,11 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
 
     //call session and point update...
-    app.post("/start-call", async (req, res) => {
+app.post("/start-call", async (req, res) => {
   try {
-    const { sessionId, studentId, teacherId } = req.body;
+    const { sessionId, studentId, teacherId, roomId, creditRate } = req.body;
     const callSession = databaseinmongo.collection("callSession");
+    const normalizedCreditRate = Math.min(Math.max(Number(creditRate) || 1, 0.1), 1);
 
     const startTime = Date.now();
 
@@ -1183,7 +1231,9 @@ app.post("/api/users/update-fcm", async (req, res) => {
         $setOnInsert: {
           studentId,
           teacherId,
-          startTime
+          startTime,
+          roomId: roomId || null,
+          creditRate: normalizedCreditRate,
         }
       },
       { upsert: true }
@@ -1263,7 +1313,9 @@ app.post("/api/users/update-fcm", async (req, res) => {
       // ✅ Deduct student credits atomically (avoid going below 0)
       if (session.studentId) {
 
-        const creditToDeduct = Math.floor(seconds / 10); // 1 credit per 10 seconds
+        const creditRate = Math.min(Math.max(Number(session.creditRate) || 1, 0.1), 1);
+        const baseCreditToDeduct = Math.floor(seconds / 10); // 1 credit per 10 seconds
+        const creditToDeduct = Math.ceil(baseCreditToDeduct * creditRate);
       console.log("credit counted: ", creditToDeduct);
 
         if (creditToDeduct > 0) {
@@ -1314,7 +1366,12 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
           if (roomId) {
               const room = await studyRooms.findOne({ _id: new ObjectId(roomId) });
-              if (!room || !(room.memberIds || []).includes(senderId) || !getRoomMembership(room, senderId).isActive) {
+              const isActiveStudentMember = room && (room.memberIds || []).includes(senderId) && getRoomMembership(room, senderId).isActive;
+              const isAssignedRoomTeacher = room && (room.teacherSessions || []).some((session) => (
+                  session.teacherId === senderId && session.chatId === chatId
+              ));
+
+              if (!room || (!isActiveStudentMember && !isAssignedRoomTeacher)) {
                   return res.status(403).json({ error: 'Renew this room membership before sending messages.' });
               }
           }
@@ -2390,6 +2447,7 @@ app.get("/api/subscription/:userId", async (req, res) => {
 app.post("/api/messages/credit-point", async (req, res) => {
   try {
     const { userId, role, creditToDeduct, pointsToAdd } = req.body;
+    const normalizedCreditToDeduct = Math.ceil(Number(creditToDeduct) || 0);
 
     if (!userId || !role) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -2408,10 +2466,10 @@ app.post("/api/messages/credit-point", async (req, res) => {
       // Student loses credit
       
 
-      if (creditToDeduct > 0 && userId) {
+      if (normalizedCreditToDeduct > 0 && userId) {
         await activepackages.updateOne(
           { uid: userId },
-          { $inc: { credit: -creditToDeduct } }
+          { $inc: { credit: -normalizedCreditToDeduct } }
         );
       }
     }
