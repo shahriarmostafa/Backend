@@ -325,6 +325,7 @@ async function run() {
     const STUDY_ROOM_JOIN_CREDIT = 20;
     const STUDY_ROOM_CREATE_CREDIT = 50;
     const STUDY_ROOM_TEACHER_CREDIT_RATE = 0.7;
+    const STUDY_ROOM_TEACHER_POINT_RATE = 0.7;
     const STUDY_ROOM_TEACHER_SESSION_MS = 60 * 60 * 1000;
     const STUDY_ROOM_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -1148,6 +1149,119 @@ app.post("/api/users/update-fcm", async (req, res) => {
       }
     });
 
+    app.post("/api/study-rooms/:roomId/call-notification", async (req, res) => {
+      try {
+        const { callerId, callerName, chatName } = req.body;
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+
+        if (!room) {
+          return res.status(404).json({ error: "Room not found." });
+        }
+
+        const memberIds = (room.memberIds || []).filter((memberId) => memberId !== callerId);
+        if (!memberIds.length) {
+          return res.json({ success: true, sent: 0 });
+        }
+
+        const members = await userCollection
+          .find({ uid: { $in: memberIds }, FCMToken: { $exists: true, $ne: null } })
+          .project({ FCMToken: 1 })
+          .toArray();
+        const tokens = [...new Set(members.map((member) => member.FCMToken).filter(Boolean))];
+
+        if (!tokens.length) {
+          return res.json({ success: true, sent: 0 });
+        }
+
+        const payload = {
+          tokens,
+          notification: {
+            title: "Room class started",
+            body: `${callerName || "A student"} started ${chatName || room.name}.`,
+          },
+          android: {
+            priority: "high",
+            notification: {
+              sound: "default",
+              channelId: "high_importance_channel",
+              clickAction: "FLUTTER_NOTIFICATION_CLICK",
+            },
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: "default",
+                contentAvailable: true,
+              },
+            },
+          },
+          data: {
+            type: "room_class_invitation",
+            roomId: room._id.toString(),
+            roomName: room.name || "",
+            chatName: chatName || "",
+          },
+        };
+
+        const response = await admin.messaging().sendEachForMulticast(payload);
+        res.json({ success: true, sent: response.successCount, failed: response.failureCount });
+      } catch (err) {
+        console.error("Error sending room call notification:", err);
+        res.status(500).json({ error: "Failed to notify room members." });
+      }
+    });
+
+    app.get("/api/room-calls/:roomCallId/participants", async (req, res) => {
+      try {
+        const { roomCallId } = req.params;
+        const { teacherId, roomId } = req.query;
+
+        const filter = { roomCallId };
+        if (teacherId) filter.teacherId = teacherId;
+        if (roomId) filter.roomId = roomId;
+
+        const sessions = await databaseinmongo.collection("callSession")
+          .find(filter)
+          .project({ studentId: 1, participantName: 1, participantPhotoURL: 1, startTime: 1, endTime: 1 })
+          .toArray();
+
+        res.json({
+          success: true,
+          participants: sessions.map((item) => ({
+            uid: item.studentId,
+            displayName: item.participantName,
+            photoURL: item.participantPhotoURL,
+            joinedAt: item.startTime,
+            leftAt: item.endTime || null,
+            isActive: !item.endTime,
+          })),
+        });
+      } catch (err) {
+        console.error("Error fetching room call participants:", err);
+        res.status(500).json({ error: "Failed to fetch participants." });
+      }
+    });
+
+    app.post("/api/call-session/heartbeat", async (req, res) => {
+      try {
+        const { sessionId } = req.body;
+
+        if (!sessionId) {
+          return res.status(400).json({ error: "sessionId is required." });
+        }
+
+        await databaseinmongo.collection("callSession").updateOne(
+          { sessionId, endTime: { $exists: false } },
+          { $set: { lastHeartbeatAt: Date.now() } }
+        );
+
+        res.json({ success: true });
+      } catch (err) {
+        console.error("Error updating call heartbeat:", err);
+        res.status(500).json({ error: "Failed to update heartbeat." });
+      }
+    });
+
 
     //chat codes
     //check if a chat already exist
@@ -1222,9 +1336,11 @@ app.post("/api/users/update-fcm", async (req, res) => {
     //call session and point update...
 app.post("/start-call", async (req, res) => {
   try {
-    const { sessionId, studentId, teacherId, roomId, creditRate } = req.body;
+    const { sessionId, studentId, teacherId, roomId, creditRate, roomCallId, parentSessionId, participantName, participantPhotoURL } = req.body;
     const callSession = databaseinmongo.collection("callSession");
     const normalizedCreditRate = Math.min(Math.max(Number(creditRate) || 1, 0.1), 1);
+    const sharedRoomCallId = roomId ? (roomCallId || parentSessionId || sessionId) : null;
+    const studentProfile = studentId ? await userCollection.findOne({ uid: studentId }) : null;
 
     const startTime = Date.now();
 
@@ -1236,7 +1352,11 @@ app.post("/start-call", async (req, res) => {
           teacherId,
           startTime,
           roomId: roomId || null,
+          roomCallId: sharedRoomCallId,
           creditRate: normalizedCreditRate,
+          participantName: participantName || studentProfile?.displayName || null,
+          participantPhotoURL: participantPhotoURL || studentProfile?.photoURL || null,
+          lastHeartbeatAt: startTime,
         }
       },
       { upsert: true }
@@ -1253,8 +1373,386 @@ app.post("/start-call", async (req, res) => {
   }
 });
 
-
     app.post("/end-call", async (req, res) => {
+      const mongoSession = client.startSession();
+
+      try {
+        const { sessionId, endRoomCall = false } = req.body;
+        const endTime = Date.now();
+
+        if (!sessionId) {
+          return res.status(400).json({ success: false, message: "sessionId is required" });
+        }
+
+        const callSession = databaseinmongo.collection("callSession");
+        const callRoomAwards = databaseinmongo.collection("callRoomAwards");
+        let responsePayload = null;
+
+        await mongoSession.withTransaction(async () => {
+          let session = await callSession.findOne({ sessionId }, { session: mongoSession });
+
+          if (!session) {
+            responsePayload = { status: 404, body: { success: false, message: "Session not found" } };
+            return;
+          }
+
+          const getGeneralCallPoints = (totalSeconds) => {
+            if (totalSeconds >= 40 && totalSeconds < 180) return 2;
+            if (totalSeconds >= 180 && totalSeconds < 300) return 3;
+            if (totalSeconds >= 300 && totalSeconds < 600) return 5;
+            if (totalSeconds >= 600 && totalSeconds < 900) return 8;
+            if (totalSeconds >= 900 && totalSeconds < 1200) return 12;
+            if (totalSeconds >= 1200 && totalSeconds < 1500) return 15;
+            if (totalSeconds >= 1500) return 18;
+            return 0;
+          };
+
+          if (endRoomCall && session.roomId && session.roomCallId && session.teacherId) {
+            const groupSessions = await callSession
+              .find(
+                {
+                  roomId: session.roomId,
+                  roomCallId: session.roomCallId,
+                  teacherId: session.teacherId,
+                  studentId: { $exists: true, $ne: null },
+                },
+                { session: mongoSession }
+              )
+              .toArray();
+
+            let totalCreditDeducted = 0;
+            const finalizedSessions = [];
+            const roomCallStudentCount = new Set(groupSessions.map((item) => item.studentId).filter(Boolean)).size;
+            const roomCreditRate = roomCallStudentCount > 1 ? STUDY_ROOM_TEACHER_CREDIT_RATE : 1;
+
+            for (const item of groupSessions) {
+              const itemSeconds = item.endTime
+                ? Number(item.seconds) || 0
+                : Math.floor((endTime - item.startTime) / 1000);
+              const itemGeneralPoints = Number(item.callPoints) || getGeneralCallPoints(itemSeconds);
+
+              if (!item.endTime) {
+                await callSession.updateOne(
+                  { sessionId: item.sessionId, endTime: { $exists: false } },
+                  {
+                    $set: {
+                      endTime,
+                      seconds: itemSeconds,
+                      callPoints: itemGeneralPoints,
+                      endedAt: new Date(endTime),
+                      endedByTeacher: true,
+                    },
+                  },
+                  { session: mongoSession }
+                );
+              }
+
+              let itemCreditDeducted = Number(item.creditDeducted) || 0;
+              if (!item.creditFinalized) {
+                const baseCreditToDeduct = Math.floor(itemSeconds / 10);
+                itemCreditDeducted = Math.ceil(baseCreditToDeduct * roomCreditRate);
+
+                if (itemCreditDeducted > 0) {
+                  await activepackages.updateOne(
+                    { uid: item.studentId },
+                    [
+                      {
+                        $set: {
+                          credit: {
+                            $max: [
+                              { $subtract: [{ $ifNull: ["$credit", 0] }, itemCreditDeducted] },
+                              0,
+                            ],
+                          },
+                        },
+                      },
+                    ],
+                    { session: mongoSession }
+                  );
+                }
+
+                await callSession.updateOne(
+                  { sessionId: item.sessionId },
+                  {
+                    $set: {
+                      creditDeducted: itemCreditDeducted,
+                      creditFinalized: true,
+                      creditFinalizedAt: new Date(),
+                    },
+                  },
+                  { session: mongoSession }
+                );
+              }
+
+              totalCreditDeducted += itemCreditDeducted;
+              finalizedSessions.push({
+                ...item,
+                seconds: itemSeconds,
+                callPoints: itemGeneralPoints,
+              });
+            }
+
+            const totalStudentSeconds = finalizedSessions.reduce((total, item) => total + (Number(item.seconds) || 0), 0);
+            const groupGeneralPoints = getGeneralCallPoints(totalStudentSeconds);
+            const targetTeacherPoints = roomCallStudentCount > 1
+              ? Math.ceil(STUDY_ROOM_TEACHER_POINT_RATE * groupGeneralPoints)
+              : groupGeneralPoints;
+            const awardId = `${session.roomId}:${session.roomCallId}:${session.teacherId}`;
+            const awardResult = await callRoomAwards.findOneAndUpdate(
+              { _id: awardId },
+              [
+                {
+                  $set: {
+                    previousAwardedPoints: { $ifNull: ["$awardedPoints", 0] },
+                    updatedAt: new Date(),
+                  },
+                },
+                {
+                  $set: {
+                    awardedPoints: {
+                      $max: [{ $ifNull: ["$awardedPoints", 0] }, targetTeacherPoints],
+                    },
+                  },
+                },
+                {
+                  $set: {
+                    lastDelta: {
+                      $subtract: ["$awardedPoints", "$previousAwardedPoints"],
+                    },
+                    roomId: session.roomId,
+                    roomCallId: session.roomCallId,
+                    teacherId: session.teacherId,
+                  },
+                },
+              ],
+              { upsert: true, returnDocument: "after", session: mongoSession }
+            );
+            const teacherPointsToAdd = Math.max(Number(awardResult?.lastDelta) || 0, 0);
+
+            if (teacherPointsToAdd > 0) {
+              await userCollection.updateOne(
+                { _id: session.teacherId },
+                { $inc: { points: teacherPointsToAdd } },
+                { session: mongoSession }
+              );
+            }
+
+            await callSession.updateMany(
+              {
+                roomId: session.roomId,
+                roomCallId: session.roomCallId,
+                teacherId: session.teacherId,
+              },
+              {
+                $set: {
+                  roomCallFinalized: true,
+                  roomCallFinalizedAt: new Date(),
+                  teacherPointsFinalized: true,
+                },
+              },
+              { session: mongoSession }
+            );
+
+            responsePayload = {
+              status: 200,
+              body: {
+                success: true,
+                roomCallEnded: true,
+                studentsFinalized: roomCallStudentCount,
+                pointsGiven: teacherPointsToAdd,
+                generalCallPoints: groupGeneralPoints,
+                totalStudentSeconds,
+                creditDeducted: totalCreditDeducted,
+              },
+            };
+            return;
+          }
+
+          const seconds = session.endTime
+            ? Number(session.seconds) || 0
+            : Math.floor((endTime - session.startTime) / 1000);
+
+          let generalCallPoints = Number(session.callPoints) || 0;
+          if (!session.endTime) {
+            generalCallPoints = getGeneralCallPoints(seconds);
+
+            await callSession.updateOne(
+              { sessionId, endTime: { $exists: false } },
+              {
+                $set: {
+                  endTime,
+                  seconds,
+                  callPoints: generalCallPoints,
+                  endedAt: new Date(endTime),
+                },
+              },
+              { session: mongoSession }
+            );
+
+            session = {
+              ...session,
+              endTime,
+              seconds,
+              callPoints: generalCallPoints,
+            };
+          }
+
+          let teacherPointsToAdd = Number(session.teacherPointsAdded) || 0;
+          if (!session.teacherPointsFinalized && session.teacherId && !session.roomId) {
+            teacherPointsToAdd = generalCallPoints;
+
+            if (session.roomId && session.roomCallId) {
+              const groupSessions = await callSession
+                .find(
+                  {
+                    roomId: session.roomId,
+                    roomCallId: session.roomCallId,
+                    teacherId: session.teacherId,
+                    endTime: { $exists: true },
+                  },
+                  { session: mongoSession }
+                )
+                .toArray();
+
+              const studentCount = new Set(groupSessions.map((item) => item.studentId).filter(Boolean)).size;
+              const groupGeneralPoints = Math.max(
+                ...groupSessions.map((item) => Number(item.callPoints) || 0),
+                generalCallPoints
+              );
+              const targetTeacherPoints = studentCount > 1
+                ? Math.ceil(STUDY_ROOM_TEACHER_POINT_RATE * studentCount * groupGeneralPoints)
+                : groupGeneralPoints;
+              const awardId = `${session.roomId}:${session.roomCallId}:${session.teacherId}`;
+              const awardResult = await callRoomAwards.findOneAndUpdate(
+                { _id: awardId },
+                [
+                  {
+                    $set: {
+                      previousAwardedPoints: { $ifNull: ["$awardedPoints", 0] },
+                      updatedAt: new Date(),
+                    },
+                  },
+                  {
+                    $set: {
+                      awardedPoints: {
+                        $max: [{ $ifNull: ["$awardedPoints", 0] }, targetTeacherPoints],
+                      },
+                    },
+                  },
+                  {
+                    $set: {
+                      lastDelta: {
+                        $subtract: ["$awardedPoints", "$previousAwardedPoints"],
+                      },
+                      roomId: session.roomId,
+                      roomCallId: session.roomCallId,
+                      teacherId: session.teacherId,
+                    },
+                  },
+                ],
+                { upsert: true, returnDocument: "after", session: mongoSession }
+              );
+
+              teacherPointsToAdd = Math.max(Number(awardResult?.lastDelta) || 0, 0);
+            }
+
+            if (teacherPointsToAdd > 0) {
+              await userCollection.updateOne(
+                { _id: session.teacherId },
+                { $inc: { points: teacherPointsToAdd } },
+                { session: mongoSession }
+              );
+            }
+
+            await callSession.updateOne(
+              { sessionId },
+              {
+                $set: {
+                  teacherPointsAdded: teacherPointsToAdd,
+                  teacherPointsFinalized: true,
+                  teacherPointsFinalizedAt: new Date(),
+                },
+              },
+              { session: mongoSession }
+            );
+          }
+
+          let creditToDeduct = Number(session.creditDeducted) || 0;
+          if (!session.creditFinalized && session.studentId && !session.roomId) {
+            let creditRate = Math.min(Math.max(Number(session.creditRate) || 1, 0.1), 1);
+            if (session.roomId && session.roomCallId && session.teacherId) {
+              const roomCallStudentSessions = await callSession
+                .find(
+                  {
+                    roomId: session.roomId,
+                    roomCallId: session.roomCallId,
+                    teacherId: session.teacherId,
+                    studentId: { $exists: true, $ne: null },
+                  },
+                  { session: mongoSession, projection: { studentId: 1 } }
+                )
+                .toArray();
+              const roomCallStudentCount = new Set(roomCallStudentSessions.map((item) => item.studentId)).size;
+              creditRate = roomCallStudentCount > 1 ? STUDY_ROOM_TEACHER_CREDIT_RATE : 1;
+            }
+            const baseCreditToDeduct = Math.floor(seconds / 10);
+            creditToDeduct = Math.ceil(baseCreditToDeduct * creditRate);
+
+            if (creditToDeduct > 0) {
+              await activepackages.updateOne(
+                { uid: session.studentId },
+                [
+                  {
+                    $set: {
+                      credit: {
+                        $max: [
+                          { $subtract: [{ $ifNull: ["$credit", 0] }, creditToDeduct] },
+                          0,
+                        ],
+                      },
+                    },
+                  },
+                ],
+                { session: mongoSession }
+              );
+            }
+
+            await callSession.updateOne(
+              { sessionId },
+              {
+                $set: {
+                  creditDeducted: creditToDeduct,
+                  creditFinalized: true,
+                  creditFinalizedAt: new Date(),
+                },
+              },
+              { session: mongoSession }
+            );
+          }
+
+          responsePayload = {
+            status: 200,
+            body: {
+              success: true,
+              pointsGiven: teacherPointsToAdd,
+              generalCallPoints,
+              creditDeducted: creditToDeduct,
+            },
+          };
+        });
+
+        return res.status(responsePayload.status).json(responsePayload.body);
+      } catch (err) {
+        console.error("Error in /end-call:", err);
+        return res.status(500).json({ success: false, message: "Internal server error" });
+      } finally {
+        await mongoSession.endSession();
+      }
+    });
+
+
+    app.post("/end-call-old-disabled", async (req, res) => {
+      return res.status(410).json({ success: false, message: "This endpoint is disabled." });
   try {
     const { sessionId } = req.body;
     const endTime = Date.now();
@@ -1273,7 +1771,7 @@ app.post("/start-call", async (req, res) => {
       return res.status(200).json({ 
         success: true, 
         message: "Call already ended", 
-        pointsGiven: session.callPoints || 0 
+        pointsGiven: session.teacherPointsAdded || session.callPoints || 0 
       });
     }
 
@@ -1289,10 +1787,11 @@ app.post("/start-call", async (req, res) => {
     else if (seconds >= 900 && seconds < 1200) callPoints = 12;
     else if (seconds >= 1200 && seconds < 1500) callPoints = 15;
     else if (seconds >= 1500) callPoints = 18;
+    const generalCallPoints = callPoints;
 
-    // Update session with end data
-    await callSession.updateOne(
-      { sessionId },
+    // Update session with end data once. If two clients end together, only one should process credits/points.
+    const endSessionResult = await callSession.updateOne(
+      { sessionId, endTime: { $exists: false } },
       {
         $set: {
           endTime,
@@ -1303,12 +1802,77 @@ app.post("/start-call", async (req, res) => {
       }
     );
 
+    if (endSessionResult.modifiedCount === 0) {
+      const endedSession = await callSession.findOne({ sessionId });
+      return res.status(200).json({
+        success: true,
+        message: "Call already ended",
+        pointsGiven: endedSession?.teacherPointsAdded || endedSession?.callPoints || 0,
+      });
+    }
+
         // Update teacher points in MongoDB
     // ✅ Update teacher points atomically
-      if (callPoints > 0 && session.teacherId) {
+      let teacherPointsToAdd = generalCallPoints;
+
+      if (session.roomId && session.roomCallId && session.teacherId) {
+        const callRoomAwards = databaseinmongo.collection("callRoomAwards");
+        const groupSessions = await callSession
+          .find({
+            roomId: session.roomId,
+            roomCallId: session.roomCallId,
+            teacherId: session.teacherId,
+            endTime: { $exists: true },
+          })
+          .toArray();
+        const studentCount = new Set(groupSessions.map((item) => item.studentId).filter(Boolean)).size;
+        const groupGeneralPoints = Math.max(...groupSessions.map((item) => Number(item.callPoints) || 0), generalCallPoints);
+        const targetTeacherPoints = studentCount > 1
+          ? Math.ceil(STUDY_ROOM_TEACHER_POINT_RATE * studentCount * groupGeneralPoints)
+          : groupGeneralPoints;
+        const awardId = `${session.roomId}:${session.roomCallId}:${session.teacherId}`;
+        const awardResult = await callRoomAwards.findOneAndUpdate(
+          { _id: awardId },
+          [
+            {
+              $set: {
+                previousAwardedPoints: { $ifNull: ["$awardedPoints", 0] },
+                updatedAt: new Date(),
+              },
+            },
+            {
+              $set: {
+                awardedPoints: {
+                  $max: [{ $ifNull: ["$awardedPoints", 0] }, targetTeacherPoints],
+                },
+              },
+            },
+            {
+              $set: {
+                lastDelta: {
+                  $subtract: ["$awardedPoints", "$previousAwardedPoints"],
+                },
+                roomId: session.roomId,
+                roomCallId: session.roomCallId,
+                teacherId: session.teacherId,
+              },
+            },
+          ],
+          { upsert: true, returnDocument: "after" }
+        );
+
+        teacherPointsToAdd = Math.max(Number(awardResult?.lastDelta) || 0, 0);
+      }
+
+      if (teacherPointsToAdd > 0 && session.teacherId) {
         await userCollection.updateOne(
           { _id: session.teacherId },
-          { $inc: { points: callPoints } }
+          { $inc: { points: teacherPointsToAdd } }
+        );
+
+        await callSession.updateOne(
+          { sessionId },
+          { $set: { teacherPointsAdded: teacherPointsToAdd } }
         );
       }
       console.log("student id found!", session.studentId);
@@ -1333,13 +1897,24 @@ app.post("/start-call", async (req, res) => {
 
             await activepackages.updateOne(
               { uid: session.studentId },
-              { $set: { credit: newCredit } }
+              [
+                {
+                  $set: {
+                    credit: {
+                      $max: [
+                        { $subtract: [{ $ifNull: ["$credit", 0] }, creditToDeduct] },
+                        0,
+                      ],
+                    },
+                  },
+                },
+              ]
             );
           }
         }
       }
 
-    return res.status(200).json({ success: true, pointsGiven: callPoints });
+    return res.status(200).json({ success: true, pointsGiven: teacherPointsToAdd, generalCallPoints });
   } catch (err) {
     console.error("Error in /end-call:", err);
     return res.status(500).json({ success: false, message: "Internal server error" });
