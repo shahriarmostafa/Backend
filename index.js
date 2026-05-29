@@ -627,7 +627,7 @@ async function run() {
 // ========== 3. Active Teacher List ==========
 app.get("/ActiveTeacherList", async (req, res) => {
   try {
-    const { category, subject } = req.query;
+    const { category, subject, type } = req.query;
 
     // Base filter for active + approved teachers
     let filter = { role: "teacher", approved: true, isActive: true };
@@ -638,6 +638,10 @@ app.get("/ActiveTeacherList", async (req, res) => {
 
     if (subject) {
       filter.subjects = subject; // matches if subject is inside the array
+    }
+
+    if (type) {
+      filter.type = type;
     }
 
     const result = await userCollection.find(filter).toArray();
@@ -2279,7 +2283,9 @@ app.post('/pay-poperl', async (req, res) => {
     currency,
     customer_address,
     credit,
-    category
+    category,
+    type,
+    isUnlimited
   } = req.body;
 
   if (amount < 10) {
@@ -2307,6 +2313,8 @@ app.post('/pay-poperl', async (req, res) => {
         paymentStatus: "approved",
         purchasedAt: new Date(),
         category,
+        type,
+        isUnlimited: Boolean(isUnlimited),
         price: Number(price),
       },
     },
@@ -2331,7 +2339,9 @@ app.post('/pay-poperl', async (req, res) => {
   price,
   durationDays,
   credit,
-  category
+  category,
+  type,
+  isUnlimited: Boolean(isUnlimited)
 };
 
   shurjopay.makePayment({
@@ -2392,7 +2402,9 @@ app.post('/extend-package', async (req, res) => {
     currency,
     customer_address,
     credit,
-    category
+    category,
+    type,
+    isUnlimited
   } = req.body;
 
   //
@@ -2457,6 +2469,7 @@ app.post('/extend-package', async (req, res) => {
             credit: updatedCredit,
             totalCredit: updatedTotalCredit,
             price: (existingPackage.price || 0) + Number(price),
+            isUnlimited: Boolean(isUnlimited) || Boolean(existingPackage.isUnlimited),
             updatedAt: new Date()
           }
         }
@@ -2515,7 +2528,9 @@ app.post('/extend-package', async (req, res) => {
     price,
     durationDays,
     credit,
-    category
+    category,
+    type,
+    isUnlimited: Boolean(isUnlimited)
   };
 
   shurjopay.makePayment({
@@ -2615,7 +2630,9 @@ app.get('/ipn', async (req, res) => {
             price,
             credit,
             durationDays,
-            category
+            category,
+            type,
+            isUnlimited
           } = metadata;
 
           //
@@ -2680,6 +2697,10 @@ app.get('/ipn', async (req, res) => {
                   purchasedAt: new Date(),
 
                   category,
+
+                  type,
+
+                  isUnlimited: Boolean(isUnlimited),
 
                   price: Number(price)
 
@@ -2770,6 +2791,8 @@ app.get('/ipn', async (req, res) => {
                     updatedTotalCredit,
 
                   price: (existingPackage.price || 0) + Number(price),
+
+                  isUnlimited: Boolean(isUnlimited) || Boolean(existingPackage.isUnlimited),
 
                   updatedAt: new Date()
 
@@ -3448,6 +3471,33 @@ app.get('/point-value', async (req, res) => {
       }
     })
 
+    app.post("/credit-price", async (req, res) => {
+      try{
+        const { category, type, pricePerCredit } = req.body;
+        const creditPrices = databaseinmongo.collection("creditPrices");
+        await creditPrices.updateOne(
+          { category, type },
+          { $set: { category, type, pricePerCredit: Number(pricePerCredit), updatedAt: new Date() } },
+          { upsert: true }
+        );
+        res.status(200).json({ success: true });
+      } catch(err){
+        console.log(err);
+        res.status(500).json({ success: false });
+      }
+    })
+
+    app.get("/credit-prices", async (req, res) => {
+      try{
+        const creditPrices = databaseinmongo.collection("creditPrices");
+        const result = await creditPrices.find().toArray();
+        res.status(200).json({ success: true, data: result });
+      } catch(err){
+        console.log(err);
+        res.status(500).json({ success: false, data: [] });
+      }
+    })
+
     app.delete("/pack/:id", async (req, res) => {
       try{
         const _id = req.params.id;
@@ -3469,7 +3519,8 @@ app.get('/point-value', async (req, res) => {
             $set: {
               price: req.body.price,
               credit: req.body.credit,
-              name: req.body.name
+              name: req.body.name,
+              type: req.body.type
             }
           }
         );
