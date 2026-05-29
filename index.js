@@ -317,6 +317,7 @@ async function run() {
 
     const databaseinmongo = client.db("PoperL");
     const subscriptions = databaseinmongo.collection("subscriptions");
+    const referrals = databaseinmongo.collection("referrals");
     const withdrawals = databaseinmongo.collection("withdrawals");
     const activepackages = databaseinmongo.collection("activePackages");
     const userCollection = databaseinmongo.collection("userCollection");
@@ -328,6 +329,127 @@ async function run() {
     const STUDY_ROOM_TEACHER_POINT_RATE = 0.7;
     const STUDY_ROOM_TEACHER_SESSION_MS = 60 * 60 * 1000;
     const STUDY_ROOM_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+    const REFERRAL_REWARD_CREDIT = 50;
+    const REFERRAL_REWARD_DURATION_HOURS = 1;
+
+    const awardReferralCredit = async (referredUid, qualifyingOrderId = null) => {
+      if (!referredUid) return { awarded: false, reason: "missing-referred-uid" };
+
+      const referredUser = await userCollection.findOne({ uid: referredUid });
+      const referrerUid = referredUser?.referredByUid;
+
+      if (!referrerUid || referrerUid === referredUid) {
+        return { awarded: false, reason: "no-valid-referrer" };
+      }
+
+      const alreadyAwarded = await referrals.findOne({
+        referredUid,
+        rewardStatus: "awarded",
+      });
+
+      if (alreadyAwarded) {
+        return { awarded: false, reason: "already-awarded" };
+      }
+
+      const referrerUser = await userCollection.findOne({ uid: referrerUid });
+      if (!referrerUser) return { awarded: false, reason: "referrer-not-found" };
+
+      const now = new Date();
+      const existingPackage = await activepackages.findOne({ uid: referrerUid });
+      const hasActiveDuration =
+        existingPackage?.isUnlimited ||
+        (existingPackage?.expiryDate && new Date(existingPackage.expiryDate) > now);
+
+      if (existingPackage && hasActiveDuration) {
+        const expiryDate = existingPackage.isUnlimited
+          ? existingPackage.expiryDate
+          : new Date(existingPackage.expiryDate);
+
+        if (!existingPackage.isUnlimited) {
+          expiryDate.setHours(expiryDate.getHours() + REFERRAL_REWARD_DURATION_HOURS);
+        }
+
+        await activepackages.updateOne(
+          { uid: referrerUid },
+          {
+            $set: {
+              ...(existingPackage.isUnlimited ? {} : { expiryDate: expiryDate.toISOString() }),
+              credit: Number(existingPackage.credit || 0) + REFERRAL_REWARD_CREDIT,
+              totalCredit: Number(existingPackage.totalCredit || 0) + REFERRAL_REWARD_CREDIT,
+              updatedAt: now,
+            },
+          }
+        );
+      } else {
+        const startDate = now;
+        const expiryDate = new Date(startDate);
+        expiryDate.setHours(expiryDate.getHours() + REFERRAL_REWARD_DURATION_HOURS);
+
+        await activepackages.updateOne(
+          { uid: referrerUid },
+          {
+            $set: {
+              uid: referrerUid,
+              packageName: "Referral Reward",
+              startDate: startDate.toISOString(),
+              expiryDate: expiryDate.toISOString(),
+              credit: REFERRAL_REWARD_CREDIT,
+              totalCredit: REFERRAL_REWARD_CREDIT,
+              isActive: true,
+              paymentStatus: "approved",
+              purchasedAt: now,
+              category: existingPackage?.category || "referral",
+              type: existingPackage?.type || "referral",
+              isUnlimited: false,
+              price: 0,
+              updatedAt: now,
+            },
+          },
+          { upsert: true }
+        );
+      }
+
+      await referrals.updateOne(
+        { referredUid },
+        {
+          $set: {
+            referrerUid,
+            referredUid,
+            qualifyingOrderId,
+            rewardCredit: REFERRAL_REWARD_CREDIT,
+            rewardDurationHours: REFERRAL_REWARD_DURATION_HOURS,
+            rewardStatus: "awarded",
+            awardedAt: now,
+          },
+          $setOnInsert: {
+            createdAt: now,
+          },
+        },
+        { upsert: true }
+      );
+
+      await userCollection.updateOne(
+        { uid: referredUid },
+        { $set: { referralRewardedAt: now } }
+      );
+
+      await subscriptions.insertOne({
+        uid: referrerUid,
+        name: referrerUser.displayName,
+        packageName: "Referral Reward",
+        credit: REFERRAL_REWARD_CREDIT,
+        price: 0,
+        durationDays: REFERRAL_REWARD_DURATION_HOURS,
+        category: existingPackage?.category || "referral",
+        orderId: qualifyingOrderId,
+        type: "referral-reward",
+        paymentStatus: "approved",
+        referredUid,
+        createdAt: now,
+      });
+
+      return { awarded: true, referrerUid };
+    };
 
     const makeRoomKeyword = () => {
       const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -458,6 +580,43 @@ async function run() {
       };
     };
 
+    const hydrateRoomProgress = (room) => {
+      const memberCount = (room.memberIds || []).length;
+      const goals = (room.progress?.goals || []).map((goal) => {
+        const votes = goal.votes || {};
+        const yesCount = Object.values(votes).filter(Boolean).length;
+        const noCount = Object.values(votes).filter((value) => value === false).length;
+        const voteCount = Object.keys(votes).length;
+        const completionPercent = memberCount > 0 ? Math.round((yesCount / memberCount) * 100) : 0;
+
+        return {
+          ...goal,
+          yesCount,
+          noCount,
+          voteCount,
+          memberCount,
+          completionPercent,
+          status: memberCount > 0 && yesCount >= memberCount ? "completed" : "active",
+        };
+      }).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+      const activeGoals = goals.filter((goal) => goal.status !== "completed");
+      const completedGoals = goals.filter((goal) => goal.status === "completed");
+      const averageCompletion = goals.length
+        ? Math.round(goals.reduce((sum, goal) => sum + goal.completionPercent, 0) / goals.length)
+        : 0;
+
+      return {
+        goals,
+        summary: {
+          totalGoals: goals.length,
+          activeGoals: activeGoals.length,
+          completedGoals: completedGoals.length,
+          averageCompletion,
+        },
+      };
+    };
+
     const hydrateStudyRoom = async (room) => {
       if (!room) return null;
 
@@ -478,6 +637,7 @@ async function run() {
         memberStatuses: buildMemberStatuses(room),
         maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
         members,
+        progress: hydrateRoomProgress(room),
         teacherSessions: (room.teacherSessions || []).map((session) => ({
           ...session,
           teacher: teachersById[session.teacherId] || null,
@@ -577,6 +737,17 @@ async function run() {
   app.post("/newStudent", async (req, res) => {
   try {
     const user = req.body;
+    const referredByUid =
+      typeof user.referredByUid === "string" && user.referredByUid.trim()
+        ? user.referredByUid.trim()
+        : null;
+
+    if (referredByUid && referredByUid !== user.uid) {
+      user.referredByUid = referredByUid;
+      user.referredAt = new Date();
+    } else {
+      delete user.referredByUid;
+    }
 
     // Check if user already exists (by email)
     const existingUser = await userCollection.findOne({ email: user.email });
@@ -608,6 +779,23 @@ async function run() {
       { upsert: true }
     );
 
+    if (user.referredByUid) {
+      await referrals.updateOne(
+        { referredUid: user.uid },
+        {
+          $setOnInsert: {
+            referrerUid: user.referredByUid,
+            referredUid: user.uid,
+            rewardCredit: REFERRAL_REWARD_CREDIT,
+            rewardDurationHours: REFERRAL_REWARD_DURATION_HOURS,
+            rewardStatus: "pending",
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+    }
+
     res.status(200).json({
       success: true,
       message: "Student added successfully."
@@ -620,6 +808,48 @@ async function run() {
     });
   }
 });
+
+  app.get("/api/referrals/stats/:uid", async (req, res) => {
+    try {
+      const { uid } = req.params;
+
+      if (!uid) {
+        return res.status(400).json({
+          success: false,
+          error: "uid is required",
+        });
+      }
+
+      const referralDocs = await referrals.find({ referrerUid: uid }).toArray();
+      const totalReferrals = referralDocs.length;
+      const qualifiedReferrals = referralDocs.filter(
+        (referral) => referral.rewardStatus === "awarded"
+      ).length;
+      const pendingReferrals = Math.max(0, totalReferrals - qualifiedReferrals);
+      const totalRewardCredit = referralDocs.reduce(
+        (sum, referral) => referral.rewardStatus === "awarded"
+          ? sum + Number(referral.rewardCredit || 0)
+          : sum,
+        0
+      );
+
+      res.status(200).json({
+        success: true,
+        data: {
+          totalReferrals,
+          qualifiedReferrals,
+          pendingReferrals,
+          totalRewardCredit,
+        },
+      });
+    } catch (error) {
+      console.error("referral stats error:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to load referral stats",
+      });
+    }
+  });
 
 
 // For teachers
@@ -856,8 +1086,18 @@ app.post("/api/users/update-fcm", async (req, res) => {
     //study room codes
     app.get("/api/study-rooms", async (req, res) => {
       try {
+        const { category, type, userId, memberOnly } = req.query;
+        const filter = userId && memberOnly === "true"
+          ? { memberIds: userId }
+          : userId
+          ? { $or: [{ visibility: "public" }, { memberIds: userId }] }
+          : { visibility: "public" };
+
+        if (category) filter.category = category;
+        if (type) filter.type = type;
+
         const rooms = await studyRooms
-          .find({ visibility: "public" })
+          .find(filter)
           .sort({ updatedAt: -1, createdAt: -1 })
           .limit(50)
           .toArray();
@@ -899,9 +1139,11 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
     app.post("/api/study-rooms", async (req, res) => {
       try {
-        const { userId, name, visibility = "public" } = req.body;
+        const { userId, name, visibility = "public", category = "school", type = "bangla_medium" } = req.body;
         const cleanName = String(name || "").trim();
         const cleanVisibility = visibility === "private" ? "private" : "public";
+        const cleanCategory = ["school", "college", "university"].includes(category) ? category : "school";
+        const cleanType = ["english_medium", "bangla_medium"].includes(type) ? type : "bangla_medium";
 
         if (!userId || !cleanName) {
           return res.status(400).json({ error: "userId and room name are required." });
@@ -923,6 +1165,8 @@ app.post("/api/users/update-fcm", async (req, res) => {
         const roomDoc = {
           name: cleanName,
           visibility: cleanVisibility,
+          category: cleanCategory,
+          type: cleanType,
           keyword,
           createdBy: userId,
           memberIds: [userId],
@@ -953,7 +1197,7 @@ app.post("/api/users/update-fcm", async (req, res) => {
 
     app.patch("/api/study-rooms/:roomId", async (req, res) => {
       try {
-        const { userId, name, visibility } = req.body;
+        const { userId, name, visibility, category, type } = req.body;
         const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
         if (!room) return res.status(404).json({ error: "Room not found." });
         if (!userId || !(room.memberIds || []).includes(userId)) {
@@ -963,6 +1207,8 @@ app.post("/api/users/update-fcm", async (req, res) => {
         const update = { updatedAt: Date.now() };
         if (typeof name === "string" && name.trim()) update.name = name.trim();
         if (visibility === "public" || visibility === "private") update.visibility = visibility;
+        if (["school", "college", "university"].includes(category)) update.category = category;
+        if (["english_medium", "bangla_medium"].includes(type)) update.type = type;
 
         await studyRooms.updateOne({ _id: room._id }, { $set: update });
         const updatedRoom = await studyRooms.findOne({ _id: room._id });
@@ -970,6 +1216,110 @@ app.post("/api/users/update-fcm", async (req, res) => {
       } catch (err) {
         console.error("Error updating study room:", err);
         res.status(500).json({ error: "Failed to update study room." });
+      }
+    });
+
+    app.post("/api/study-rooms/:roomId/progress/goals", async (req, res) => {
+      try {
+        const { userId, title, note = "", dueDate = null } = req.body;
+        const cleanTitle = String(title || "").trim();
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        if (!userId || !(room.memberIds || []).includes(userId) || !getRoomMembership(room, userId).isActive) {
+          return res.status(403).json({ error: "Only active room students can add goals." });
+        }
+        if (!cleanTitle) return res.status(400).json({ error: "Goal title is required." });
+
+        const now = new Date();
+        const goal = {
+          id: new ObjectId().toString(),
+          title: cleanTitle.slice(0, 120),
+          note: String(note || "").trim().slice(0, 400),
+          dueDate: dueDate ? new Date(dueDate) : null,
+          createdBy: userId,
+          createdAt: now,
+          votes: {
+            [userId]: false,
+          },
+        };
+
+        await studyRooms.updateOne(
+          { _id: room._id },
+          {
+            $push: { "progress.goals": goal },
+            $set: { updatedAt: Date.now() },
+          }
+        );
+
+        const updatedRoom = await studyRooms.findOne({ _id: room._id });
+        res.status(201).json({ success: true, room: await hydrateStudyRoom(updatedRoom), goal });
+      } catch (err) {
+        console.error("Error adding study room goal:", err);
+        res.status(500).json({ error: "Failed to add room goal." });
+      }
+    });
+
+    app.patch("/api/study-rooms/:roomId/progress/goals/:goalId/vote", async (req, res) => {
+      try {
+        const { userId, completed } = req.body;
+        const { goalId } = req.params;
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        if (!userId || !(room.memberIds || []).includes(userId) || !getRoomMembership(room, userId).isActive) {
+          return res.status(403).json({ error: "Only active room students can update progress." });
+        }
+        if (!(room.progress?.goals || []).some((goal) => goal.id === goalId)) {
+          return res.status(404).json({ error: "Goal not found." });
+        }
+
+        await studyRooms.updateOne(
+          { _id: room._id, "progress.goals.id": goalId },
+          {
+            $set: {
+              [`progress.goals.$.votes.${userId}`]: Boolean(completed),
+              "progress.goals.$.updatedAt": new Date(),
+              updatedAt: Date.now(),
+            },
+          }
+        );
+
+        const updatedRoom = await studyRooms.findOne({ _id: room._id });
+        res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      } catch (err) {
+        console.error("Error voting on study room goal:", err);
+        res.status(500).json({ error: "Failed to update room progress." });
+      }
+    });
+
+    app.delete("/api/study-rooms/:roomId/progress/goals/:goalId", async (req, res) => {
+      try {
+        const { userId } = req.body;
+        const { goalId } = req.params;
+        const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
+
+        if (!room) return res.status(404).json({ error: "Room not found." });
+        if (!userId || !(room.memberIds || []).includes(userId) || !getRoomMembership(room, userId).isActive) {
+          return res.status(403).json({ error: "Only active room students can delete goals." });
+        }
+
+        const goalExists = (room.progress?.goals || []).some((goal) => goal.id === goalId);
+        if (!goalExists) return res.status(404).json({ error: "Goal not found." });
+
+        await studyRooms.updateOne(
+          { _id: room._id },
+          {
+            $pull: { "progress.goals": { id: goalId } },
+            $set: { updatedAt: Date.now() },
+          }
+        );
+
+        const updatedRoom = await studyRooms.findOne({ _id: room._id });
+        res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      } catch (err) {
+        console.error("Error deleting study room goal:", err);
+        res.status(500).json({ error: "Failed to delete room goal." });
       }
     });
 
@@ -2835,6 +3185,20 @@ app.get('/ipn', async (req, res) => {
             createdAt: new Date()
 
           });
+
+          if (
+            paymentType === "new-package" &&
+            Number(price) > 0
+          ) {
+            try {
+              const referralResult = await awardReferralCredit(uid, order_id);
+              if (referralResult.awarded) {
+                console.log(`Referral reward awarded to UID: ${referralResult.referrerUid}`);
+              }
+            } catch (referralError) {
+              console.error("Referral reward failed:", referralError);
+            }
+          }
 
           console.log(
             `✅ ${paymentType} completed for UID: ${uid}`
