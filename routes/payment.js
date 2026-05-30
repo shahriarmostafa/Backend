@@ -354,7 +354,14 @@ module.exports = ({
   });
 
   router.post("/admin-add-subscription", async (req, res) => {
-    const { email, durationHours, credit, amountReceived } = req.body;
+    const {
+      email,
+      durationHours,
+      credit,
+      amountReceived,
+      category = "custom",
+      type: packageType = "custom",
+    } = req.body;
 
     if (!email || !durationHours || credit === undefined || amountReceived === undefined)
       return res.status(400).json({ error: "Missing required fields" });
@@ -367,7 +374,9 @@ module.exports = ({
       const displayName = user.displayName || user.name || email;
       const existingPackage = await activepackages.findOne({ uid });
       const now = new Date();
-      let type;
+      let subscriptionType;
+      const packageCategory = category || existingPackage?.category || "custom";
+      const selectedPackageType = packageType || existingPackage?.type || "custom";
 
       if (existingPackage?.expiryDate && new Date(existingPackage.expiryDate) > now) {
         const expiryDate = new Date(existingPackage.expiryDate);
@@ -384,11 +393,13 @@ module.exports = ({
               credit: updatedCredit,
               totalCredit: updatedTotalCredit,
               price: (existingPackage.price || 0) + Number(amountReceived),
+              category: packageCategory,
+              type: selectedPackageType,
               updatedAt: new Date(),
             },
           }
         );
-        type = "admin-extension";
+        subscriptionType = "admin-extension";
       } else {
         const startDate = new Date();
         const expiryDate = new Date(startDate);
@@ -407,14 +418,15 @@ module.exports = ({
               isActive: true,
               paymentStatus: "admin-added",
               purchasedAt: new Date(),
-              category: "custom",
+              category: packageCategory,
+              type: selectedPackageType,
               price: Number(amountReceived),
               updatedAt: new Date(),
             },
           },
           { upsert: true }
         );
-        type = "admin-new";
+        subscriptionType = "admin-new";
       }
 
       await subscriptions.insertOne({
@@ -425,15 +437,16 @@ module.exports = ({
         credit: Number(credit),
         price: Number(amountReceived),
         durationDays: Number(durationHours),
-        category: "custom",
-        type,
+        category: packageCategory,
+        packageType: selectedPackageType,
+        type: subscriptionType,
         paymentStatus: "admin-added",
         orderId: null,
         internalReference: `ADMIN_${Date.now()}`,
         createdAt: new Date(),
       });
 
-      return res.json({ success: true, type, uid, displayName });
+      return res.json({ success: true, type: subscriptionType, uid, displayName });
     } catch (error) {
       console.error("admin-add-subscription error:", error);
       return res.status(500).json({ error: "Internal server error" });

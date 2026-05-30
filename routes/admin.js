@@ -14,6 +14,84 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     return result[0]?.totalPoints || 0;
   };
 
+  const calculateMonthlyData = async () => {
+    const now = new Date();
+    const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+
+    // This month revenue
+    const thisMonthRevenueAgg = await subscriptions
+      .aggregate([
+        { $match: { createdAt: { $gte: startOfThisMonth }, paymentStatus: "approved" } },
+        { $group: { _id: null, total: { $sum: "$price" } } }
+      ])
+      .toArray();
+    const thisMonthRevenue = thisMonthRevenueAgg[0]?.total || 0;
+
+    // Last month revenue
+    const lastMonthRevenueAgg = await subscriptions
+      .aggregate([
+        { $match: { createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth }, paymentStatus: "approved" } },
+        { $group: { _id: null, total: { $sum: "$price" } } }
+      ])
+      .toArray();
+    const lastMonthRevenue = lastMonthRevenueAgg[0]?.total || 0;
+
+    // This month enrollments
+    const thisMonthEnrollmentsAgg = await subscriptions
+      .aggregate([
+        { $match: { createdAt: { $gte: startOfThisMonth }, paymentStatus: "approved" } },
+        { $count: "total" }
+      ])
+      .toArray();
+    const thisMonthEnrollments = thisMonthEnrollmentsAgg[0]?.total || 0;
+
+    // Last month enrollments
+    const lastMonthEnrollmentsAgg = await subscriptions
+      .aggregate([
+        { $match: { createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth }, paymentStatus: "approved" } },
+        { $count: "total" }
+      ])
+      .toArray();
+    const lastMonthEnrollments = lastMonthEnrollmentsAgg[0]?.total || 0;
+
+    const revenueChange = thisMonthRevenue - lastMonthRevenue;
+    const enrollmentChange = thisMonthEnrollments - lastMonthEnrollments;
+
+    // Store in history collection
+    const historyCollection = databaseinmongo.collection("history");
+    const monthYear = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    
+    await historyCollection.updateOne(
+      { monthYear },
+      {
+        $set: {
+          monthYear,
+          month: now.getMonth() + 1,
+          year: now.getFullYear(),
+          thisMonthRevenue,
+          lastMonthRevenue,
+          revenueChange,
+          thisMonthEnrollments,
+          lastMonthEnrollments,
+          enrollmentChange,
+          updatedAt: new Date()
+        }
+      },
+      { upsert: true }
+    );
+
+    return {
+      thisMonthRevenue,
+      lastMonthRevenue,
+      revenueChange,
+      thisMonthEnrollments,
+      lastMonthEnrollments,
+      enrollmentChange
+    };
+  };
+
   const calculatePlatformMoney = async () => {
     const totalMoneyAgg = await subscriptions
       .aggregate([{ $group: { _id: null, totalMoney: { $sum: "$price" } } }])
@@ -46,6 +124,9 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     const moneyInPlatform = totalMoney - totalAvailableCreditWorth - totalWithdrawals;
     const totalTeacherPoints = await calculateTotalTeacherPoints();
 
+    // Calculate monthly data
+    const monthlyData = await calculateMonthlyData();
+
     const summaryCollection = databaseinmongo.collection("platform_money_summary");
     const summaryId = "current_platform_money";
     await summaryCollection.updateOne(
@@ -58,13 +139,14 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
           totalWithdrawals,
           moneyInPlatform,
           totalTeacherPoints,
+          ...monthlyData,
           updatedAt: new Date(),
         },
       },
       { upsert: true }
     );
 
-    return { totalMoney, totalAvailableCreditWorth, totalWithdrawals, moneyInPlatform, totalTeacherPoints };
+    return { totalMoney, totalAvailableCreditWorth, totalWithdrawals, moneyInPlatform, totalTeacherPoints, ...monthlyData };
   };
 
   router.get("/download-link", (req, res) => {
@@ -73,59 +155,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     });
   });
 
-  router.post("/closeCalculation", async (req, res) => {
-    try {
-      const teachersSnapshot = await userCollection.where("role", "==", "teacher").get();
-      if (teachersSnapshot.empty)
-        return res.status(404).json({ success: false, message: "No teachers found." });
 
-      const totalRevenueResult = await subscriptions
-        .aggregate([{ $group: { _id: null, totalRevenue: { $sum: "$price" } } }])
-        .toArray();
-      const totalRevenue = totalRevenueResult[0]?.totalRevenue || 0;
-
-      let totalPoints = 0;
-      const teacherEarnings = [];
-
-      teachersSnapshot.forEach((doc) => {
-        totalPoints += doc.data().points || 0;
-      });
-
-      teachersSnapshot.forEach((doc) => {
-        const teacher = doc.data();
-        const points = teacher.points || 0;
-        const revenuePercent = teacher.revenuePercent || 0;
-        const income = totalPoints > 0 ? (points / totalPoints) * totalRevenue * revenuePercent : 0;
-        teacherEarnings.push({
-          uid: teacher.uid,
-          name: teacher.displayName,
-          whatsapp: teacher.whatsapp,
-          points,
-          income: Math.floor(income),
-          paid: false,
-        });
-      });
-
-      await databaseinmongo.collection("revenueHistory").insertOne({
-        totalPoints,
-        totalRevenue,
-        createdAt: new Date(),
-        enrols: await databaseinmongo.collection("subscriptions").countDocuments(),
-      });
-      await databaseinmongo.collection("salaryHistory").insertMany(teacherEarnings);
-
-      res.json({
-        success: true,
-        message: "Calculation completed and salary data stored successfully.",
-        totalRevenue,
-        totalPoints,
-        teachersProcessed: teacherEarnings.length,
-      });
-    } catch (err) {
-      console.error("Error in /closeCalculation:", err);
-      res.status(500).json({ success: false, message: "Server error during calculation process." });
-    }
-  });
 
   router.get("/point-value", async (req, res) => {
     const summaryId = "current_platform_money";
@@ -156,25 +186,9 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     }
   });
 
-  router.get("/salaryData", async (req, res) => {
-    try {
-      const salaryCollection = databaseinmongo.collection("salaryHistory");
-      const result = await salaryCollection.find().toArray();
-      res.status(200).json({ success: true, data: result });
-    } catch (err) {
-      console.log(err);
-    }
-  });
+  
 
-  router.get("/historyData", async (req, res) => {
-    try {
-      const revenueHistory = databaseinmongo.collection("revenueHistory");
-      const result = await revenueHistory.find().toArray();
-      res.status(200).json({ success: true, data: result });
-    } catch (error) {
-      console.log(error);
-    }
-  });
+  
 
   router.patch("/paySalary/:id", async (req, res) => {
     try {
@@ -312,6 +326,105 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       res.status(200).json({ success: true });
     } catch (err) {
       console.log(err);
+    }
+  });
+
+  router.get("/dashboard-stats", async (req, res) => {
+    try {
+      // Count total teachers
+      const teacherCountAgg = await userCollection
+        .aggregate([
+          { $match: { role: "teacher" } },
+          { $count: "totalTeachers" }
+        ])
+        .toArray();
+      const totalTeachers = teacherCountAgg[0]?.totalTeachers || 0;
+
+      // Count total students
+      const studentCountAgg = await userCollection
+        .aggregate([
+          { $match: { role: "student" } },
+          { $count: "totalStudents" }
+        ])
+        .toArray();
+      const totalStudents = studentCountAgg[0]?.totalStudents || 0;
+
+      // Get platform money summary directly without recalculating
+      const summaryCollection = databaseinmongo.collection("platform_money_summary");
+      const platformMoneySummary = await summaryCollection.findOne({ _id: "current_platform_money" });
+
+      res.status(200).json({
+        success: true,
+        data: {
+          totalTeachers,
+          totalStudents,
+          platformMoneySummary: platformMoneySummary || {
+            totalMoney: 0,
+            totalAvailableCreditWorth: 0,
+            totalWithdrawals: 0,
+            moneyInPlatform: 0,
+            totalTeacherPoints: 0,
+            thisMonthRevenue: 0,
+            lastMonthRevenue: 0,
+            revenueChange: 0,
+            thisMonthEnrollments: 0,
+            lastMonthEnrollments: 0,
+            enrollmentChange: 0,
+            updatedAt: new Date()
+          }
+        }
+      });
+    } catch (error) {
+      console.error("Error fetching dashboard stats:", error);
+      res.status(500).json({ success: false, error: "Failed to fetch dashboard statistics" });
+    }
+  });
+
+  router.post("/generate-monthly-history", async (req, res) => {
+    try {
+      const monthlyData = await calculateMonthlyData();
+      res.status(200).json({
+        success: true,
+        message: "Monthly history generated successfully",
+        data: monthlyData
+      });
+    } catch (error) {
+      console.error("Error generating monthly history:", error);
+      res.status(500).json({ success: false, error: "Failed to generate monthly history" });
+    }
+  });
+
+  router.get("/monthly-history", async (req, res) => {
+    try {
+      const historyCollection = databaseinmongo.collection("history");
+      const result = await historyCollection
+        .find()
+        .sort({ year: -1, month: -1 })
+        .toArray();
+      res.status(200).json({ success: true, data: result });
+    } catch (error) {
+      console.error("Error fetching monthly history:", error);
+      res.status(500).json({ success: false, error: "Failed to fetch monthly history" });
+    }
+  });
+
+  router.get("/salaryData", async (req, res) => {
+    try {
+      const salaryCollection = databaseinmongo.collection("salaryHistory");
+      const result = await salaryCollection.find().toArray();
+      res.status(200).json({ success: true, data: result });
+    } catch (err) {
+      console.log(err);
+    }
+  });
+
+  router.get("/historyData", async (req, res) => {
+    try {
+      const historyCollection = databaseinmongo.collection("history");
+      const result = await historyCollection.find().sort({ year: -1, month: -1 }).toArray();
+      res.status(200).json({ success: true, data: result });
+    } catch (error) {
+      console.log(error);
     }
   });
 

@@ -203,8 +203,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, activepackages, dat
           return;
         }
         const status = getQuizStatus(quiz);
-        if (status !== "open") {
-          responsePayload = { status: 409, body: { error: "This quiz is not open right now." } };
+        if (!["scheduled", "open"].includes(status)) {
+          responsePayload = { status: 409, body: { error: "This quiz is not available to join right now." } };
           return;
         }
         if (getAttempt(quiz, userId)) {
@@ -373,6 +373,32 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, activepackages, dat
       res.status(500).json({ error: "Failed to rate quiz." });
     } finally {
       await mongoSession.endSession();
+    }
+  });
+
+  router.delete("/api/study-rooms/:roomId/quizzes/:quizId", async (req, res) => {
+    try {
+      const { userId } = req.body;
+      const room = await getRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ error: "Room not found." });
+
+      const quiz = await roomQuizzes.findOne({
+        _id: new ObjectId(req.params.quizId),
+        roomId: req.params.roomId,
+      });
+      if (!quiz) return res.status(404).json({ error: "Quiz not found." });
+      if (getQuizStatus(quiz) !== "completed")
+        return res.status(409).json({ error: "Only published/completed quiz results can be deleted." });
+
+      const canDelete = quiz.teacherId === userId || room.createdBy === userId;
+      if (!canDelete)
+        return res.status(403).json({ error: "Only the quiz teacher or room creator can delete this quiz." });
+
+      await roomQuizzes.deleteOne({ _id: quiz._id });
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error deleting room quiz:", err);
+      res.status(500).json({ error: "Failed to delete quiz." });
     }
   });
 

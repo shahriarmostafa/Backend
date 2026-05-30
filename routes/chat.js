@@ -12,6 +12,42 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     activepackages,
   });
 
+  const hydrateChatListForUser = async (userId, chatCollection) => {
+    const userChatDoc = await chatCollection.findOne({ _id: userId });
+    if (!userChatDoc) return { chatList: [], unseenCount: 0 };
+
+    const chatInfos = userChatDoc.chats || [];
+    const receiverIds = [
+      ...new Set(
+        chatInfos
+          .filter((item) => !item.roomChat && item.receiverId)
+          .map((item) => item.receiverId)
+      ),
+    ];
+    const users = receiverIds.length
+      ? await userCollection.find({ uid: { $in: receiverIds } }).toArray()
+      : [];
+    const usersById = users.reduce((acc, item) => {
+      acc[item.uid] = item;
+      return acc;
+    }, {});
+
+    const chatList = chatInfos
+      .map((item) => ({
+        ...item,
+        receiverRole: item.receiverRole || item.yourRole || null,
+        userss: item.roomChat
+          ? { uid: item.roomId || item.receiverId, displayName: item.chatName || "Room chat" }
+          : usersById[item.receiverId] || {},
+      }))
+      .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+
+    return {
+      chatList,
+      unseenCount: chatList.filter((chat) => chat.isSeen === false).length,
+    };
+  };
+
   router.get("/chatExist/:userId/:receiverId", async (req, res) => {
     const { userId, receiverId } = req.params;
     const userChatCollection = databaseinmongo.collection("chatCollection");
@@ -38,6 +74,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       {
         $push: {
           chats: {
+            receiverRole: "student",
             yourRole: "student",
             chatId,
             lastMessage: "",
@@ -54,6 +91,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       {
         $push: {
           chats: {
+            receiverRole: "teacher",
             yourRole: "teacher",
             chatId,
             lastMessage: "",
@@ -176,22 +214,11 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       io.to(chatId).emit("chatUpdate", updatedChat);
 
       const updatedChatLists = await Promise.all(
-        userIds.map(async (id) => {
-          const userChatDoc = await chatCollection.findOne({ _id: id });
-          if (!userChatDoc) return [];
-          const chatInfos = userChatDoc.chats || [];
-          return Promise.all(
-            chatInfos.map(async (item) => {
-              const userDoc = await userCollection.findOne({ uid: item.receiverId });
-              return { ...item, userss: userDoc || {} };
-            })
-          );
-        })
+        userIds.map((id) => hydrateChatListForUser(id, chatCollection))
       );
 
       userIds.forEach((id, index) => {
-        const chatList = updatedChatLists[index];
-        const unseenCount = chatList.filter((chat) => !chat.isSeen).length;
+        const { chatList, unseenCount } = updatedChatLists[index];
         io.to(id).emit("chatListUpdate", { chatList, unseenCount });
       });
 
@@ -222,6 +249,8 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         { _id: userId },
         { $set: { chats: userChatDoc.chats } }
       );
+      const { chatList, unseenCount } = await hydrateChatListForUser(userId, chatCollection);
+      io.to(userId).emit("chatListUpdate", { chatList, unseenCount });
       return res.status(200).json({ message: "Chat marked as seen successfully" });
     } catch (err) {
       console.error("Error marking chat as seen:", err);
@@ -231,7 +260,6 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
 
   router.put("/update-feedback", async (req, res) => {
     const { teacherId, chatId, index, isLike } = req.body;
-    if (!index || !chatId) return;
 
     try {
       if (!teacherId) return res.status(400).json({ error: "teacherId required" });
@@ -240,7 +268,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       if (!teacher) return res.status(404).json({ error: "Teacher not found" });
 
       const { points = 0, rating = 0 } = teacher;
-      const newPoints = isLike && chatId ? points + 2 : points - 2;
+      const newPoints = isLike && chatId ? points + 3 : points - 3;
       const newRating = isLike ? (5 - rating) / 10 : -((5 - rating) / 10);
 
       await userCollection.updateOne(
@@ -310,24 +338,18 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo }) => {
       }
     });
 
+    socket.on("leaveChatRoom", (chatId) => {
+      if (!chatId) return;
+      socket.leave(chatId);
+    });
+
     socket.on("joinRoom", async (userId) => {
       socket.join(userId);
       console.log(`User ${userId} joined the room.`);
       try {
         const chatCollection = databaseinmongo.collection("chatCollection");
-        const userChatDoc = await chatCollection.findOne({ _id: userId });
-        if (userChatDoc) {
-          const chatInfos = userChatDoc.chats || [];
-          let totalUnseen = 0;
-          const promises = chatInfos.map(async (item) => {
-            const userDoc = await userCollection.findOne({ uid: item.receiverId });
-            if (item.isSeen === false) totalUnseen++;
-            return { ...item, userss: userDoc || {} };
-          });
-          const chatData = await Promise.all(promises);
-          const sortedChatData = chatData.sort((a, b) => b.updatedAt - a.updatedAt);
-          socket.emit("chatListUpdate", { chatList: sortedChatData, unseenCount: totalUnseen });
-        }
+        const { chatList, unseenCount } = await hydrateChatListForUser(userId, chatCollection);
+        socket.emit("chatListUpdate", { chatList, unseenCount });
       } catch (err) {
         console.error("Error fetching chat list:", err);
         socket.emit("chatListError", { message: "Failed to fetch chat list" });

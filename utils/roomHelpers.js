@@ -6,7 +6,7 @@ const {
   STUDY_ROOM_TEACHER_CREDIT_RATE,
 } = require("./constants");
 
-const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepackages }) => {
+const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes = null }) => {
   const getRoomMembership = (room, userId) => {
     const rawStatus = room?.memberStatuses?.[userId];
     const joinedAt = rawStatus?.joinedAt
@@ -77,6 +77,28 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
         .find({ uid: { $in: (room.teacherSessions || []).map((s) => s.teacherId) } })
         .toArray(),
     ]);
+    const quizSummary = roomQuizzes
+      ? await roomQuizzes
+          .aggregate([
+            { $match: { roomId: room._id.toString(), status: "completed" } },
+            { $unwind: "$attempts" },
+            { $match: { "attempts.submittedAt": { $exists: true } } },
+            {
+              $group: {
+                _id: null,
+                quizzesTaken: { $sum: 1 },
+                totalScore: { $sum: { $ifNull: ["$attempts.score", 0] } },
+                totalMaxScore: { $sum: { $ifNull: ["$attempts.maxScore", 0] } },
+              },
+            },
+          ])
+          .toArray()
+      : [];
+    const progress = hydrateRoomProgress(room);
+    progress.summary.quizzesTaken = quizSummary[0]?.quizzesTaken || 0;
+    progress.summary.quizAverage = quizSummary[0]?.totalMaxScore
+      ? Math.round((quizSummary[0].totalScore / quizSummary[0].totalMaxScore) * 100)
+      : 0;
     const teachersById = teachers.reduce((acc, t) => {
       acc[t.uid] = t;
       return acc;
@@ -88,7 +110,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       memberStatuses: buildMemberStatuses(room),
       maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
       members,
-      progress: hydrateRoomProgress(room),
+      progress,
       teacherSessions: (room.teacherSessions || []).map((session) => ({
         ...session,
         teacher: teachersById[session.teacherId] || null,
@@ -119,12 +141,14 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     participantIds,
     teacherId = null,
     subject = null,
+    roomId = null,
   }) => {
     const chatDB = databaseinmongo.collection("chatDB");
     const newChat = await chatDB.insertOne({
       createdAt: new Date(),
       messages: [],
       roomChat: true,
+      roomId,
       name,
       type,
       participantIds,
@@ -138,8 +162,53 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       participantIds,
       teacherId,
       subject,
+      roomId,
       createdAt: new Date(),
     };
+  };
+
+  const ensureRoomChatSubscriptions = async ({ chat, participantIds, roomId }) => {
+    if (!chat?.chatId || !Array.isArray(participantIds)) return;
+    const chatCollection = databaseinmongo.collection("chatCollection");
+    const uniqueParticipantIds = [...new Set(participantIds.filter(Boolean))];
+    await Promise.all(
+      uniqueParticipantIds.map((participantId) => {
+        const receiverId =
+          chat.type === "teacher" && participantId !== chat.teacherId
+            ? chat.teacherId
+            : roomId || chat.roomId || chat.chatId;
+        const receiverRole =
+          chat.type === "teacher"
+            ? participantId === chat.teacherId
+              ? "room-teacher"
+              : "teacher"
+            : "room";
+        return chatCollection.updateOne(
+          { _id: participantId, "chats.chatId": { $ne: chat.chatId } },
+          {
+            $push: {
+              chats: {
+                receiverRole,
+                yourRole: receiverRole,
+                chatId: chat.chatId,
+                lastMessage: "",
+                receiverId,
+                roomChat: true,
+                roomId: roomId || chat.roomId || null,
+                chatName: chat.name,
+                chatType: chat.type,
+                teacherId: chat.teacherId || null,
+                subject: chat.subject || null,
+                participantIds: uniqueParticipantIds,
+                isSeen: true,
+                updatedAt: Date.now(),
+              },
+            },
+          },
+          { upsert: true }
+        );
+      })
+    );
   };
 
   const makeRoomKeyword = () => {
@@ -213,6 +282,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     hydrateStudyRoom,
     hydrateTeacherRoomChat,
     createStudyRoomChat,
+    ensureRoomChatSubscriptions,
     makeRoomKeyword,
     getUniqueRoomKeyword,
     getStudentCreditPackage,

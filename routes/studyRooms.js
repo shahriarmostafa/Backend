@@ -28,7 +28,8 @@ module.exports = ({
     getUniqueRoomKeyword,
     spendStudentCredit,
     renewRoomMembership,
-  } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages });
+    ensureRoomChatSubscriptions,
+  } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes });
 
   router.get("/api/study-rooms", async (req, res) => {
     try {
@@ -77,6 +78,15 @@ module.exports = ({
     try {
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
       if (!room) return res.status(404).json({ error: "Room not found." });
+      await Promise.all(
+        (room.chats || []).map((chat) =>
+          ensureRoomChatSubscriptions({
+            chat: { ...chat, roomId: room._id.toString() },
+            participantIds: chat.participantIds || room.memberIds || [],
+            roomId: room._id.toString(),
+          })
+        )
+      );
       res.json({ success: true, room: await hydrateStudyRoom(room) });
     } catch (err) {
       console.error("Error fetching study room:", err);
@@ -146,6 +156,11 @@ module.exports = ({
       };
 
       const result = await studyRooms.insertOne(roomDoc);
+      await ensureRoomChatSubscriptions({
+        chat: { ...studentChat, roomId: result.insertedId.toString() },
+        participantIds: [userId],
+        roomId: result.insertedId.toString(),
+      });
       const room = await studyRooms.findOne({ _id: result.insertedId });
       res.status(201).json({
         success: true,
@@ -358,6 +373,15 @@ module.exports = ({
             : Promise.resolve()
         )
       );
+      await Promise.all(
+        updatedChats.map((chat) =>
+          ensureRoomChatSubscriptions({
+            chat: { ...chat, roomId: room._id.toString() },
+            participantIds: chat.participantIds,
+            roomId: room._id.toString(),
+          })
+        )
+      );
 
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
       res.json({
@@ -441,6 +465,11 @@ module.exports = ({
           $set: { updatedAt: Date.now() },
         }
       );
+      await ensureRoomChatSubscriptions({
+        chat: { ...teacherChat, roomId: room._id.toString() },
+        participantIds: teacherChat.participantIds,
+        roomId: room._id.toString(),
+      });
 
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
       res.status(201).json({
@@ -465,6 +494,17 @@ module.exports = ({
         .find({ "teacherSessions.teacherId": teacherId })
         .sort({ updatedAt: -1, createdAt: -1 })
         .toArray();
+      await Promise.all(
+        rooms.flatMap((room) =>
+          (room.chats || []).map((chat) =>
+            ensureRoomChatSubscriptions({
+              chat: { ...chat, roomId: room._id.toString() },
+              participantIds: chat.participantIds || room.memberIds || [],
+              roomId: room._id.toString(),
+            })
+          )
+        )
+      );
 
       const roomIds = rooms.map((room) => room._id.toString());
       const quizRequests = roomQuizzes
