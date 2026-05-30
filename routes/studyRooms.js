@@ -13,6 +13,7 @@ const {
 module.exports = ({
   userCollection,
   studyRooms,
+  roomQuizzes,
   activepackages,
   databaseinmongo,
   admin,
@@ -465,10 +466,30 @@ module.exports = ({
         .sort({ updatedAt: -1, createdAt: -1 })
         .toArray();
 
+      const roomIds = rooms.map((room) => room._id.toString());
+      const quizRequests = roomQuizzes
+        ? await roomQuizzes
+            .find({ roomId: { $in: roomIds }, teacherId, status: "requested" })
+            .project({ roomId: 1, teacherId: 1, subject: 1 })
+            .toArray()
+        : [];
+      const requestCountByRoomSubject = quizRequests.reduce((acc, request) => {
+        const key = `${request.roomId}:${String(request.subject || "General").toLowerCase()}`;
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+
       const chats = rooms.flatMap((room) =>
         (room.teacherSessions || [])
           .filter((session) => session.teacherId === teacherId)
-          .map((session) => hydrateTeacherRoomChat(room, session))
+          .map((session) => {
+            const chat = hydrateTeacherRoomChat(room, session);
+            const key = `${room._id.toString()}:${String(session.subject || "General").toLowerCase()}`;
+            return {
+              ...chat,
+              quizRequestCount: requestCountByRoomSubject[key] || 0,
+            };
+          })
       );
       chats.sort((a, b) => new Date(b.addedAt || 0) - new Date(a.addedAt || 0));
 
