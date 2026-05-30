@@ -56,6 +56,7 @@ async function run() {
       activepackages: db.collection("activePackages"),
       userCollection: db.collection("userCollection"),
       studyRooms: db.collection("studyRooms"),
+      roomQuizzes: db.collection("roomQuizzes"),
       databaseinmongo: db,
       client,
     };
@@ -63,6 +64,7 @@ async function run() {
     app.use(require("./routes/users")({ ...collections, admin }));
     app.use(require("./routes/teachers")(collections));
     app.use(require("./routes/studyRooms")({ ...collections, admin }));
+    app.use(require("./routes/quizzes")(collections));
     app.use(require("./routes/calls")(collections));
     app.use(require("./routes/chat")({ ...collections, io }));
     app.use(require("./routes/payment")({ ...collections, shurjopay }));
