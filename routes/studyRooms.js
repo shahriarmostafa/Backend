@@ -1,6 +1,7 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
+const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 const {
   STUDY_ROOM_JOIN_CREDIT,
   STUDY_ROOM_CREATE_CREDIT,
@@ -19,6 +20,11 @@ module.exports = ({
   admin,
 }) => {
   const router = Router();
+  const { createRoomNotification } = makeNotificationHelpers({
+    databaseinmongo,
+    userCollection,
+    studyRooms,
+  });
 
   const {
     getRoomMembership,
@@ -226,6 +232,16 @@ module.exports = ({
         { _id: room._id },
         { $push: { "progress.goals": goal }, $set: { updatedAt: Date.now() } }
       );
+
+      await createRoomNotification({
+        room,
+        type: "room_goal_created",
+        title: "New task added",
+        message: cleanTitle,
+        actorId: userId,
+        actorRole: "student",
+        metadata: { goalId: goal.id },
+      });
 
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
       res.status(201).json({ success: true, room: await hydrateStudyRoom(updatedRoom), goal });
@@ -469,6 +485,19 @@ module.exports = ({
         chat: { ...teacherChat, roomId: room._id.toString() },
         participantIds: teacherChat.participantIds,
         roomId: room._id.toString(),
+      });
+
+      await createRoomNotification({
+        room: {
+          ...room,
+          teacherSessions: [...(room.teacherSessions || []), teacherSession],
+        },
+        type: "room_teacher_added",
+        title: "Teacher added",
+        message: `${teacher.displayName || "Teacher"} joined ${selectedSubject}.`,
+        actorId: userId,
+        actorRole: "student",
+        metadata: { chatId: teacherChat.chatId, teacherId, subject: selectedSubject },
       });
 
       const updatedRoom = await studyRooms.findOne({ _id: room._id });

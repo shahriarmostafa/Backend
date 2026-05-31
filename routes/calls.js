@@ -3,9 +3,15 @@ const {
   STUDY_ROOM_TEACHER_CREDIT_RATE,
   STUDY_ROOM_TEACHER_POINT_RATE,
 } = require("../utils/constants");
+const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 
-module.exports = ({ userCollection, activepackages, databaseinmongo, client }) => {
+module.exports = ({ userCollection, activepackages, databaseinmongo, client, studyRooms }) => {
   const router = Router();
+  const { createRoomNotification } = makeNotificationHelpers({
+    databaseinmongo,
+    userCollection,
+    studyRooms,
+  });
 
   const getGeneralCallPoints = (totalSeconds) => {
     // Ignore extremely short calls
@@ -69,6 +75,18 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client }) =
       );
 
       if (result.upsertedCount > 0) {
+        if (roomId && teacherId) {
+          await createRoomNotification({
+            roomId,
+            type: "room_class_started",
+            title: "Class started",
+            message: "A room class is going on now.",
+            actorId: teacherId,
+            actorRole: "teacher",
+            metadata: { roomCallId: sharedRoomCallId, sessionId },
+            dedupeKey: `room-class-started:${roomId}:${sharedRoomCallId || sessionId}`,
+          });
+        }
         return res.status(201).json({ success: true, message: "Call session created" });
       } else {
         return res.status(200).json({ success: false, message: "Call session already exists" });

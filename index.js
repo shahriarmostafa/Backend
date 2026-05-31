@@ -66,6 +66,8 @@ async function run() {
     app.use(require("./routes/teachers")(collections));
     app.use(require("./routes/studyRooms")({ ...collections, admin }));
     app.use(require("./routes/quizzes")(collections));
+    app.use(require("./routes/progress")(collections));
+    app.use(require("./routes/notificationFeed")(collections));
     app.use(require("./routes/calls")(collections));
     app.use(require("./routes/chat")({ ...collections, io }));
     app.use(require("./routes/payment")({ ...collections, shurjopay }));

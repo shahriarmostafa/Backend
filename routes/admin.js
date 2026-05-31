@@ -4,26 +4,40 @@ const { ObjectId } = require("mongodb");
 module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, publicQuizzes, databaseinmongo }) => {
   const router = Router();
 
-  const calculateTotalTeacherPoints = async () => {
+  const getScopedFilter = (category, type) => {
+    const filter = {};
+    if (category && category !== "general") filter.category = category;
+    if (type && type !== "general") filter.type = type;
+    return filter;
+  };
+
+  const getSummaryId = (category, type) =>
+    (category && category !== "general") || (type && type !== "general")
+      ? `${category || "all"}:${type || "all"}`
+      : "general";
+
+  const calculateTotalTeacherPoints = async (category, type) => {
+    const match = { role: "teacher", points: { $exists: true }, ...getScopedFilter(category, type) };
     const result = await userCollection
       .aggregate([
-        { $match: { role: "teacher", points: { $exists: true } } },
+        { $match: match },
         { $group: { _id: null, totalPoints: { $sum: "$points" } } },
       ])
       .toArray();
     return result[0]?.totalPoints || 0;
   };
 
-  const calculateMonthlyData = async () => {
+  const calculateMonthlyData = async (category, type) => {
     const now = new Date();
     const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+    const scopedFilter = getScopedFilter(category, type);
 
     // This month revenue
     const thisMonthRevenueAgg = await subscriptions
       .aggregate([
-        { $match: { createdAt: { $gte: startOfThisMonth }, paymentStatus: "approved" } },
+        { $match: { createdAt: { $gte: startOfThisMonth }, paymentStatus: "approved", ...scopedFilter } },
         { $group: { _id: null, total: { $sum: "$price" } } }
       ])
       .toArray();
@@ -32,7 +46,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     // Last month revenue
     const lastMonthRevenueAgg = await subscriptions
       .aggregate([
-        { $match: { createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth }, paymentStatus: "approved" } },
+        { $match: { createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth }, paymentStatus: "approved", ...scopedFilter } },
         { $group: { _id: null, total: { $sum: "$price" } } }
       ])
       .toArray();
@@ -41,7 +55,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     // This month enrollments
     const thisMonthEnrollmentsAgg = await subscriptions
       .aggregate([
-        { $match: { createdAt: { $gte: startOfThisMonth }, paymentStatus: "approved" } },
+        { $match: { createdAt: { $gte: startOfThisMonth }, paymentStatus: "approved", ...scopedFilter } },
         { $count: "total" }
       ])
       .toArray();
@@ -50,7 +64,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     // Last month enrollments
     const lastMonthEnrollmentsAgg = await subscriptions
       .aggregate([
-        { $match: { createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth }, paymentStatus: "approved" } },
+        { $match: { createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth }, paymentStatus: "approved", ...scopedFilter } },
         { $count: "total" }
       ])
       .toArray();
@@ -62,11 +76,15 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     // Store in history collection
     const historyCollection = databaseinmongo.collection("history");
     const monthYear = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const summaryId = getSummaryId(category, type);
     
     await historyCollection.updateOne(
-      { monthYear },
+      { monthYear, summaryId },
       {
         $set: {
+          summaryId,
+          category: category || "general",
+          type: type || "general",
           monthYear,
           month: now.getMonth() + 1,
           year: now.getFullYear(),
@@ -92,9 +110,13 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     };
   };
 
-  const calculatePlatformMoney = async () => {
+  const calculatePlatformMoney = async (category, type) => {
+    const scopedFilter = getScopedFilter(category, type);
     const totalMoneyAgg = await subscriptions
-      .aggregate([{ $group: { _id: null, totalMoney: { $sum: "$price" } } }])
+      .aggregate([
+        { $match: scopedFilter },
+        { $group: { _id: null, totalMoney: { $sum: "$price" } } },
+      ])
       .toArray();
     const totalMoney = totalMoneyAgg[0]?.totalMoney || 0;
 
@@ -102,7 +124,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     const availableCreditWorthAgg = await activepackages
       .aggregate([
         { $addFields: { expiryDateObj: { $toDate: "$expiryDate" } } },
-        { $match: { expiryDateObj: { $gt: now } } },
+        { $match: { expiryDateObj: { $gt: now }, ...scopedFilter } },
         {
           $project: {
             creditWorth: { $multiply: ["$credit", { $divide: ["$price", "$totalCredit"] }] },
@@ -115,25 +137,27 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
     const totalWithdrawalsAgg = await withdrawals
       .aggregate([
-        { $match: { paid: true } },
+        { $match: { paid: true, ...scopedFilter } },
         { $group: { _id: null, totalWithdrawals: { $sum: "$amount" } } },
       ])
       .toArray();
     const totalWithdrawals = totalWithdrawalsAgg[0]?.totalWithdrawals || 0;
 
     const moneyInPlatform = totalMoney - totalAvailableCreditWorth - totalWithdrawals;
-    const totalTeacherPoints = await calculateTotalTeacherPoints();
+    const totalTeacherPoints = await calculateTotalTeacherPoints(category, type);
 
     // Calculate monthly data
-    const monthlyData = await calculateMonthlyData();
+    const monthlyData = await calculateMonthlyData(category, type);
 
     const summaryCollection = databaseinmongo.collection("platform_money_summary");
-    const summaryId = "current_platform_money";
+    const summaryId = getSummaryId(category, type);
     await summaryCollection.updateOne(
       { _id: summaryId },
       {
         $set: {
           _id: summaryId,
+          category: category || "general",
+          type: type || "general",
           totalMoney,
           totalAvailableCreditWorth,
           totalWithdrawals,
@@ -146,7 +170,39 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       { upsert: true }
     );
 
-    return { totalMoney, totalAvailableCreditWorth, totalWithdrawals, moneyInPlatform, totalTeacherPoints, ...monthlyData };
+    return { _id: summaryId, category: category || "general", type: type || "general", totalMoney, totalAvailableCreditWorth, totalWithdrawals, moneyInPlatform, totalTeacherPoints, ...monthlyData };
+  };
+
+  const sumPlatformMoneySummaries = async () => {
+    const summaryCollection = databaseinmongo.collection("platform_money_summary");
+    const docs = await summaryCollection
+      .find({ _id: { $nin: ["general", "current_platform_money"] } })
+      .toArray();
+    let sourceDocs = docs;
+    if (!sourceDocs.length) {
+      const generalDoc = await summaryCollection.findOne({ _id: "general" });
+      sourceDocs = generalDoc
+        ? [generalDoc]
+        : await summaryCollection.find({ _id: "current_platform_money" }).toArray();
+    }
+    const fields = [
+      "totalMoney",
+      "totalAvailableCreditWorth",
+      "totalWithdrawals",
+      "moneyInPlatform",
+      "totalTeacherPoints",
+      "thisMonthRevenue",
+      "lastMonthRevenue",
+      "revenueChange",
+      "thisMonthEnrollments",
+      "lastMonthEnrollments",
+      "enrollmentChange",
+    ];
+    const summary = fields.reduce((acc, field) => {
+      acc[field] = sourceDocs.reduce((total, doc) => total + (Number(doc[field]) || 0), 0);
+      return acc;
+    }, {});
+    return { _id: "all", category: "all", type: "all", ...summary, updatedAt: new Date() };
   };
 
   router.get("/download-link", (req, res) => {
@@ -158,8 +214,9 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
 
   router.get("/point-value", async (req, res) => {
-    const summaryId = "current_platform_money";
-    await calculatePlatformMoney().then(console.log).catch(console.error);
+    const { category, type } = req.query;
+    const summaryId = getSummaryId(category, type);
+    await calculatePlatformMoney(category, type).catch(console.error);
 
     try {
       const summaryCollection = databaseinmongo.collection("platform_money_summary");
@@ -194,10 +251,84 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     try {
       const id = req.params.id;
       const salaryCollection = databaseinmongo.collection("salaryHistory");
-      await salaryCollection.updateOne({ uid: id }, { $set: { paid: true } });
+      await salaryCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { paid: true, paidAt: new Date() } }
+      );
       res.status(200).json({ success: true });
     } catch (err) {
       console.log(err);
+    }
+  });
+
+  router.get("/api/teachers/:uid/earnings", async (req, res) => {
+    try {
+      const { uid } = req.params;
+      const { category, type } = req.query;
+      const teacher = await userCollection.findOne({ uid, role: "teacher" });
+      if (!teacher) return res.status(404).json({ error: "Teacher not found" });
+
+      const scopedCategory = category || teacher.category || "general";
+      const scopedType = type || teacher.type || "general";
+      await calculatePlatformMoney(scopedCategory, scopedType);
+
+      const summaryCollection = databaseinmongo.collection("platform_money_summary");
+      const summary = await summaryCollection.findOne({ _id: getSummaryId(scopedCategory, scopedType) });
+
+      const points = Number(teacher.points) || 0;
+      const totalTeacherPoints = Number(summary?.totalTeacherPoints) || 0;
+      const moneyInPlatform = Number(summary?.moneyInPlatform) || 0;
+      const pointValue = totalTeacherPoints > 0 ? moneyInPlatform / totalTeacherPoints : 0;
+      const earnings = Math.round(points * pointValue * 100) / 100;
+
+      res.json({ success: true, points, totalPoints: teacher.totalPoints || 0, pointValue, earnings, moneyInPlatform, totalTeacherPoints, category: scopedCategory, type: scopedType });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Server error" });
+    }
+  });
+
+  router.post("/api/teachers/withdraw", async (req, res) => {
+    try {
+      const { uid, bkashNumber } = req.body;
+      if (!uid || !bkashNumber) return res.status(400).json({ error: "uid and bkashNumber are required" });
+
+      const teacher = await userCollection.findOne({ uid, role: "teacher" });
+      if (!teacher) return res.status(404).json({ error: "Teacher not found" });
+
+      const points = Number(teacher.points) || 0;
+      if (points < 100) return res.status(400).json({ error: "Minimum 100 points required to withdraw" });
+
+      const freshData = await calculatePlatformMoney(teacher.category, teacher.type);
+      const { moneyInPlatform, totalTeacherPoints } = freshData;
+
+      const pointValue = totalTeacherPoints > 0 ? moneyInPlatform / totalTeacherPoints : 0;
+      const amount = Math.round(points * pointValue * 100) / 100;
+
+      const salaryCollection = databaseinmongo.collection("salaryHistory");
+      await salaryCollection.insertOne({
+        uid,
+        name: teacher.displayName || "",
+        category: teacher.category || "general",
+        type: teacher.type || "general",
+        bkashNumber,
+        points,
+        amount,
+        pointValue,
+        paid: false,
+        requestedAt: new Date(),
+        paidAt: null,
+      });
+
+      await userCollection.updateOne(
+        { uid },
+        { $inc: { totalPoints: points }, $set: { points: 0 } }
+      );
+
+      res.json({ success: true, amount, points });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Server error" });
     }
   });
 
@@ -331,10 +462,12 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
   router.get("/dashboard-stats", async (req, res) => {
     try {
+      const { category, type } = req.query;
+      const scopedFilter = getScopedFilter(category, type);
       // Count total teachers
       const teacherCountAgg = await userCollection
         .aggregate([
-          { $match: { role: "teacher" } },
+          { $match: { role: "teacher", ...scopedFilter } },
           { $count: "totalTeachers" }
         ])
         .toArray();
@@ -343,7 +476,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       // Count total students
       const studentCountAgg = await userCollection
         .aggregate([
-          { $match: { role: "student" } },
+          { $match: { role: "student", ...scopedFilter } },
           { $count: "totalStudents" }
         ])
         .toArray();
@@ -351,7 +484,12 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
       // Get platform money summary directly without recalculating
       const summaryCollection = databaseinmongo.collection("platform_money_summary");
-      const platformMoneySummary = await summaryCollection.findOne({ _id: "current_platform_money" });
+      let platformMoneySummary;
+      if (category || type) {
+        platformMoneySummary = await calculatePlatformMoney(category, type);
+      } else {
+        platformMoneySummary = await sumPlatformMoneySummaries();
+      }
 
       res.status(200).json({
         success: true,
@@ -382,7 +520,8 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
   router.post("/generate-monthly-history", async (req, res) => {
     try {
-      const monthlyData = await calculateMonthlyData();
+      const { category, type } = req.body || {};
+      const monthlyData = await calculateMonthlyData(category, type);
       res.status(200).json({
         success: true,
         message: "Monthly history generated successfully",
@@ -411,7 +550,10 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
   router.get("/salaryData", async (req, res) => {
     try {
       const salaryCollection = databaseinmongo.collection("salaryHistory");
-      const result = await salaryCollection.find().toArray();
+      const result = await salaryCollection
+        .find()
+        .sort({ paid: 1, requestedAt: -1 })
+        .toArray();
       res.status(200).json({ success: true, data: result });
     } catch (err) {
       console.log(err);

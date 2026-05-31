@@ -71,6 +71,8 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
 
   const hydrateStudyRoom = async (room) => {
     if (!room) return null;
+    const roomId = room._id.toString();
+    const callSession = databaseinmongo.collection("callSession");
     const [members, teachers] = await Promise.all([
       userCollection.find({ uid: { $in: room.memberIds || [] } }).toArray(),
       userCollection
@@ -80,7 +82,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     const quizSummary = roomQuizzes
       ? await roomQuizzes
           .aggregate([
-            { $match: { roomId: room._id.toString(), status: "completed" } },
+            { $match: { roomId, status: "completed" } },
             { $unwind: "$attempts" },
             { $match: { "attempts.submittedAt": { $exists: true } } },
             {
@@ -94,11 +96,115 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
           ])
           .toArray()
       : [];
+    const attendanceSummary = await callSession
+      .aggregate([
+        {
+          $match: {
+            roomId,
+            roomCallFinalized: true,
+            studentId: { $in: room.memberIds || [] },
+            seconds: { $gt: 0 },
+          },
+        },
+        {
+          $group: {
+            _id: { roomCallId: "$roomCallId", studentId: "$studentId" },
+            seconds: { $max: { $ifNull: ["$seconds", 0] } },
+            attendedAt: { $max: "$endedAt" },
+          },
+        },
+        {
+          $facet: {
+            summary: [
+              {
+                $group: {
+                  _id: null,
+                  classAttendances: { $sum: 1 },
+                  totalStudentSeconds: { $sum: "$seconds" },
+                  groupClassIds: { $addToSet: "$_id.roomCallId" },
+                  studentsAttended: { $addToSet: "$_id.studentId" },
+                  lastClassAt: { $max: "$attendedAt" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  classAttendances: 1,
+                  totalStudentSeconds: 1,
+                  studentsAttended: { $size: "$studentsAttended" },
+                  groupClassesHeld: { $size: "$groupClassIds" },
+                  lastClassAt: 1,
+                },
+              },
+            ],
+            students: [
+              {
+                $group: {
+                  _id: "$_id.studentId",
+                  classesAttended: { $sum: 1 },
+                  totalSeconds: { $sum: "$seconds" },
+                  lastClassAt: { $max: "$attendedAt" },
+                },
+              },
+            ],
+          },
+        },
+      ])
+      .toArray();
     const progress = hydrateRoomProgress(room);
+    const attendance = attendanceSummary[0]?.summary?.[0] || {};
+    const groupClassesHeld = attendance.groupClassesHeld || 0;
+    const classAttendances = attendance.classAttendances || 0;
+    const possibleAttendances = groupClassesHeld * ((room.memberIds || []).length || 0);
+    const attendanceByStudent = (attendanceSummary[0]?.students || []).reduce((acc, item) => {
+      acc[item._id] = {
+        classesAttended: item.classesAttended || 0,
+        totalSeconds: item.totalSeconds || 0,
+        totalMinutes: Math.round((item.totalSeconds || 0) / 60),
+        lastClassAt: item.lastClassAt || null,
+        attendancePercent: groupClassesHeld
+          ? Math.round(((item.classesAttended || 0) / groupClassesHeld) * 100)
+          : 0,
+      };
+      return acc;
+    }, {});
     progress.summary.quizzesTaken = quizSummary[0]?.quizzesTaken || 0;
     progress.summary.quizAverage = quizSummary[0]?.totalMaxScore
       ? Math.round((quizSummary[0].totalScore / quizSummary[0].totalMaxScore) * 100)
       : 0;
+    progress.summary.groupClassesHeld = groupClassesHeld;
+    progress.summary.classAttendances = classAttendances;
+    progress.summary.classAttendanceRate = possibleAttendances
+      ? Math.round((classAttendances / possibleAttendances) * 100)
+      : 0;
+    progress.summary.averageClassMinutes = classAttendances
+      ? Math.round(((attendance.totalStudentSeconds || 0) / classAttendances) / 60)
+      : 0;
+    progress.summary.studentsAttendedClasses = attendance.studentsAttended || 0;
+    progress.summary.lastClassAt = attendance.lastClassAt || null;
+    progress.attendanceByStudent = attendanceByStudent;
+    progress.metrics = [
+      {
+        id: "goals",
+        label: "Room progress",
+        value: progress.summary.averageCompletion,
+        suffix: "%",
+        progress: progress.summary.averageCompletion,
+      },
+      {
+        id: "quizzes",
+        label: "Quizzes taken",
+        value: progress.summary.quizzesTaken,
+        progress: Math.min((progress.summary.quizzesTaken || 0) * 10, 100),
+      },
+      {
+        id: "attendance",
+        label: "Class attendance",
+        value: progress.summary.classAttendanceRate,
+        suffix: "%",
+        progress: progress.summary.classAttendanceRate,
+      },
+    ];
     const teachersById = teachers.reduce((acc, t) => {
       acc[t.uid] = t;
       return acc;

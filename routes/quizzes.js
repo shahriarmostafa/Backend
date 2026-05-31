@@ -2,6 +2,7 @@ const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeQuizHelpers, makePublicQuizHelpers } = require("../utils/quizHelpers");
+const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 const {
   ROOM_QUIZ_ATTEND_CREDIT,
   ROOM_QUIZ_MAX_QUESTIONS,
@@ -13,6 +14,11 @@ const {
 
 module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, activepackages, databaseinmongo, client }) => {
   const router = Router();
+  const { createRoomNotification } = makeNotificationHelpers({
+    databaseinmongo,
+    userCollection,
+    studyRooms,
+  });
   const { getRoomMembership } = makeRoomHelpers({
     userCollection,
     databaseinmongo,
@@ -117,6 +123,15 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         updatedAt: now,
       };
       const result = await roomQuizzes.insertOne(doc);
+      await createRoomNotification({
+        room,
+        type: "room_quiz_requested",
+        title: "Quiz requested",
+        message: `${doc.title} was requested for ${doc.subject}.`,
+        actorId: userId,
+        actorRole: "student",
+        metadata: { quizId: result.insertedId.toString(), teacherId, subject: doc.subject },
+      });
       const quiz = await roomQuizzes.findOne({ _id: result.insertedId });
       res.status(201).json({ success: true, quiz: publicQuiz(quiz, userId) });
     } catch (err) {
@@ -172,6 +187,21 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       );
 
       const updatedQuiz = await roomQuizzes.findOne({ _id: quiz._id });
+      const quizStarted = updatedQuiz.status === "open";
+      await createRoomNotification({
+        room,
+        type: quizStarted ? "room_quiz_started" : "room_quiz_published",
+        title: quizStarted ? "Quiz started" : "Quiz published",
+        message: `${updatedQuiz.title || "Room quiz"} is ${quizStarted ? "open now" : "scheduled"}.`,
+        actorId: teacherId,
+        actorRole: "teacher",
+        metadata: {
+          quizId: updatedQuiz._id.toString(),
+          subject: updatedQuiz.subject,
+          scheduledAt: updatedQuiz.scheduledAt,
+        },
+        dedupeKey: `room-quiz-${quizStarted ? "started" : "published"}:${updatedQuiz._id.toString()}`,
+      });
       res.json({ success: true, quiz: publicQuiz(updatedQuiz, teacherId) });
     } catch (err) {
       console.error("Error preparing room quiz:", err);
@@ -184,6 +214,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     try {
       const { userId } = req.body;
       let responsePayload = null;
+      let startedNotification = null;
 
       await mongoSession.withTransaction(async () => {
         const room = await getRoom(req.params.roomId);
@@ -210,6 +241,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         if (!["scheduled", "open"].includes(status)) {
           responsePayload = { status: 409, body: { error: "This quiz is not available to join right now." } };
           return;
+        }
+        if (status === "open") {
+          startedNotification = {
+            room,
+            quiz,
+          };
         }
         if (getAttempt(quiz, userId)) {
           responsePayload = { status: 200, body: { success: true, quiz: publicQuiz(quiz, userId) } };
@@ -246,6 +283,22 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         };
       });
 
+      if (startedNotification) {
+        await createRoomNotification({
+          room: startedNotification.room,
+          type: "room_quiz_started",
+          title: "Quiz started",
+          message: `${startedNotification.quiz.title || "Room quiz"} is open now.`,
+          actorId: startedNotification.quiz.teacherId,
+          actorRole: "teacher",
+          metadata: {
+            quizId: startedNotification.quiz._id.toString(),
+            subject: startedNotification.quiz.subject,
+            scheduledAt: startedNotification.quiz.scheduledAt,
+          },
+          dedupeKey: `room-quiz-started:${startedNotification.quiz._id.toString()}`,
+        });
+      }
       res.status(responsePayload.status).json(responsePayload.body);
     } catch (err) {
       console.error("Error attending room quiz:", err);
@@ -319,6 +372,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     try {
       const { teacherId } = req.body;
       let responsePayload = null;
+      let resultsNotification = null;
       await mongoSession.withTransaction(async () => {
         const quiz = await roomQuizzes.findOne(
           { _id: new ObjectId(req.params.quizId), roomId: req.params.roomId },
@@ -333,6 +387,17 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           return;
         }
         const settled = await settleQuiz(quiz._id.toString(), mongoSession);
+        if (settled.ok) {
+          resultsNotification = {
+            type: "room_quiz_results",
+            title: "Quiz results published",
+            message: `${settled.quiz.title || "Room quiz"} results are ready.`,
+            actorId: teacherId,
+            actorRole: "teacher",
+            metadata: { quizId: quiz._id.toString(), subject: quiz.subject },
+            dedupeKey: `room-quiz-results:${quiz._id.toString()}`,
+          };
+        }
         responsePayload = {
           status: settled.ok ? 200 : settled.status,
           body: settled.ok
@@ -340,6 +405,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
             : { error: settled.message },
         };
       });
+      if (resultsNotification) {
+        await createRoomNotification({
+          room: await getRoom(req.params.roomId),
+          ...resultsNotification,
+        });
+      }
       res.status(responsePayload.status).json(responsePayload.body);
     } catch (err) {
       console.error("Error settling room quiz:", err);

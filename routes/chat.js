@@ -259,7 +259,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   });
 
   router.put("/update-feedback", async (req, res) => {
-    const { teacherId, chatId, index, isLike } = req.body;
+    const { teacherId, chatId, index, isLike, feedbackType } = req.body;
 
     try {
       if (!teacherId) return res.status(400).json({ error: "teacherId required" });
@@ -267,30 +267,37 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       const teacher = await userCollection.findOne({ uid: teacherId });
       if (!teacher) return res.status(404).json({ error: "Teacher not found" });
 
-      const { points = 0, rating = 0 } = teacher;
-      const newPoints = isLike && chatId ? points + 3 : points - 3;
-      const newRating = isLike ? (5 - rating) / 10 : -((5 - rating) / 10);
+      const isCall = feedbackType === "call";
+      const pointDelta = isLike ? (isCall ? 5 : 3) : (isCall ? -5 : -3);
+      const newPoints = (teacher.points || 0) + pointDelta;
+
+      const { rating = 0 } = teacher;
+      const ratingDelta = isLike ? (5 - rating) / 10 : -((5 - rating) / 10);
 
       await userCollection.updateOne(
         { uid: teacherId },
-        { $set: { points: newPoints }, $inc: { rating: newRating } }
+        { $set: { points: newPoints }, $inc: { rating: ratingDelta } }
       );
 
-      const chatDB = databaseinmongo.collection("chatDB");
-      const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-      if (!chat) return;
+      // Only update message feedback for chat interactions
+      if (!isCall && chatId && index != null) {
+        const chatDB = databaseinmongo.collection("chatDB");
+        const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+        if (chat) {
+          const messages = chat.messages || [];
+          if (messages[index]) {
+            messages[index] = {
+              ...messages[index],
+              lastMessageFeedback: isLike ? "liked" : "disliked",
+            };
+            await chatDB.updateOne({ _id: new ObjectId(chatId) }, { $set: { messages } });
+            const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+            io.to(chatId).emit("chatUpdate", updatedChat);
+          }
+        }
+      }
 
-      const messages = chat.messages || [];
-      if (!messages[index]) return;
-
-      messages[index] = {
-        ...messages[index],
-        lastMessageFeedback: isLike ? "liked" : "disliked",
-      };
-
-      await chatDB.updateOne({ _id: new ObjectId(chatId) }, { $set: { messages } });
-      const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-      io.to(chatId).emit("chatUpdate", updatedChat);
+      res.json({ success: true });
     } catch (err) {
       console.error(err);
       res.status(500).send("Internal server error.");
