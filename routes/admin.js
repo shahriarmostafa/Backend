@@ -146,9 +146,6 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     const moneyInPlatform = totalMoney - totalAvailableCreditWorth - totalWithdrawals;
     const totalTeacherPoints = await calculateTotalTeacherPoints(category, type);
 
-    // Calculate monthly data
-    const monthlyData = await calculateMonthlyData(category, type);
-
     const summaryCollection = databaseinmongo.collection("platform_money_summary");
     const summaryId = getSummaryId(category, type);
     await summaryCollection.updateOne(
@@ -163,46 +160,50 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
           totalWithdrawals,
           moneyInPlatform,
           totalTeacherPoints,
-          ...monthlyData,
           updatedAt: new Date(),
         },
       },
       { upsert: true }
     );
 
-    return { _id: summaryId, category: category || "general", type: type || "general", totalMoney, totalAvailableCreditWorth, totalWithdrawals, moneyInPlatform, totalTeacherPoints, ...monthlyData };
+    return { _id: summaryId, category: category || "general", type: type || "general", totalMoney, totalAvailableCreditWorth, totalWithdrawals, moneyInPlatform, totalTeacherPoints, updatedAt: new Date() };
   };
 
   const sumPlatformMoneySummaries = async () => {
     const summaryCollection = databaseinmongo.collection("platform_money_summary");
-    const docs = await summaryCollection
-      .find({ _id: { $nin: ["general", "current_platform_money"] } })
+    const sourceDocs = await summaryCollection
+      .find({ _id: { $ne: "current_platform_money" } })
       .toArray();
-    let sourceDocs = docs;
-    if (!sourceDocs.length) {
-      const generalDoc = await summaryCollection.findOne({ _id: "general" });
-      sourceDocs = generalDoc
-        ? [generalDoc]
-        : await summaryCollection.find({ _id: "current_platform_money" }).toArray();
-    }
     const fields = [
       "totalMoney",
       "totalAvailableCreditWorth",
       "totalWithdrawals",
       "moneyInPlatform",
       "totalTeacherPoints",
-      "thisMonthRevenue",
-      "lastMonthRevenue",
-      "revenueChange",
-      "thisMonthEnrollments",
-      "lastMonthEnrollments",
-      "enrollmentChange",
     ];
     const summary = fields.reduce((acc, field) => {
       acc[field] = sourceDocs.reduce((total, doc) => total + (Number(doc[field]) || 0), 0);
       return acc;
     }, {});
     return { _id: "all", category: "all", type: "all", ...summary, updatedAt: new Date() };
+  };
+
+  const getLatestMonthlyHistory = async () => {
+    const historyCollection = databaseinmongo.collection("history");
+    const latestHistory = await historyCollection
+      .find({ summaryId: { $in: [null, "general"] } })
+      .sort({ year: -1, month: -1, updatedAt: -1 })
+      .limit(1)
+      .toArray();
+    const history = latestHistory[0] || {};
+    return {
+      thisMonthRevenue: Number(history.thisMonthRevenue) || 0,
+      lastMonthRevenue: Number(history.lastMonthRevenue) || 0,
+      revenueChange: Number(history.revenueChange) || 0,
+      thisMonthEnrollments: Number(history.thisMonthEnrollments) || 0,
+      lastMonthEnrollments: Number(history.lastMonthEnrollments) || 0,
+      enrollmentChange: Number(history.enrollmentChange) || 0,
+    };
   };
 
   router.get("/download-link", (req, res) => {
@@ -462,12 +463,10 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
   router.get("/dashboard-stats", async (req, res) => {
     try {
-      const { category, type } = req.query;
-      const scopedFilter = getScopedFilter(category, type);
       // Count total teachers
       const teacherCountAgg = await userCollection
         .aggregate([
-          { $match: { role: "teacher", ...scopedFilter } },
+          { $match: { role: "teacher" } },
           { $count: "totalTeachers" }
         ])
         .toArray();
@@ -476,39 +475,29 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       // Count total students
       const studentCountAgg = await userCollection
         .aggregate([
-          { $match: { role: "student", ...scopedFilter } },
+          { $match: { role: "student" } },
           { $count: "totalStudents" }
         ])
         .toArray();
       const totalStudents = studentCountAgg[0]?.totalStudents || 0;
 
-      // Get platform money summary directly without recalculating
-      const summaryCollection = databaseinmongo.collection("platform_money_summary");
-      let platformMoneySummary;
-      if (category || type) {
-        platformMoneySummary = await calculatePlatformMoney(category, type);
-      } else {
-        platformMoneySummary = await sumPlatformMoneySummaries();
-      }
+      const platformMoneySummary = await sumPlatformMoneySummaries();
+      const monthlyHistory = await getLatestMonthlyHistory();
 
       res.status(200).json({
         success: true,
         data: {
           totalTeachers,
           totalStudents,
-          platformMoneySummary: platformMoneySummary || {
+          platformMoneySummary: {
             totalMoney: 0,
             totalAvailableCreditWorth: 0,
             totalWithdrawals: 0,
             moneyInPlatform: 0,
             totalTeacherPoints: 0,
-            thisMonthRevenue: 0,
-            lastMonthRevenue: 0,
-            revenueChange: 0,
-            thisMonthEnrollments: 0,
-            lastMonthEnrollments: 0,
-            enrollmentChange: 0,
-            updatedAt: new Date()
+            updatedAt: new Date(),
+            ...(platformMoneySummary || {}),
+            ...monthlyHistory,
           }
         }
       });
