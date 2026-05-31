@@ -172,7 +172,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     const chatCollection = databaseinmongo.collection("chatCollection");
     const uniqueParticipantIds = [...new Set(participantIds.filter(Boolean))];
     await Promise.all(
-      uniqueParticipantIds.map((participantId) => {
+      uniqueParticipantIds.map(async (participantId) => {
         const receiverId =
           chat.type === "teacher" && participantId !== chat.teacherId
             ? chat.teacherId
@@ -183,6 +183,13 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
               ? "room-teacher"
               : "teacher"
             : "room";
+
+        await chatCollection.updateOne(
+          { _id: participantId },
+          { $setOnInsert: { chats: [] } },
+          { upsert: true }
+        );
+
         return chatCollection.updateOne(
           { _id: participantId, "chats.chatId": { $ne: chat.chatId } },
           {
@@ -204,8 +211,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
                 updatedAt: Date.now(),
               },
             },
-          },
-          { upsert: true }
+          }
         );
       })
     );
