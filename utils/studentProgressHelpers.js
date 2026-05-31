@@ -53,6 +53,36 @@ const makeStudentProgressHelpers = ({
     };
   };
 
+  const getQuizResults = async (collection, studentId, source, extraMatch = {}) => {
+    const quizzes = await collection
+      .find({ ...extraMatch, "attempts.studentId": studentId })
+      .sort({ "attempts.submittedAt": -1, scheduledAt: -1, createdAt: -1 })
+      .limit(80)
+      .toArray();
+
+    return quizzes
+      .map((quiz) => {
+        const attempt = (quiz.attempts || []).find((item) => item.studentId === studentId);
+        if (!attempt?.submittedAt) return null;
+        return {
+          id: quiz._id.toString(),
+          source,
+          roomId: quiz.roomId || null,
+          roomName: quiz.roomName || "",
+          title: quiz.title || `${quiz.subject || "Quiz"} quiz`,
+          subject: quiz.subject || "General",
+          score: Number(attempt.score) || 0,
+          maxScore: Number(attempt.maxScore) || 0,
+          percent: safePercent(Number(attempt.score) || 0, Number(attempt.maxScore) || 0),
+          rewardCredit: Number(attempt.rewardCredit) || 0,
+          submittedAt: attempt.submittedAt,
+          scheduledAt: quiz.scheduledAt || null,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => new Date(b.submittedAt || b.scheduledAt || 0) - new Date(a.submittedAt || a.scheduledAt || 0));
+  };
+
   const getCallStats = async (studentId, roomOnly) => {
     const match = roomOnly
       ? { studentId, roomId: { $exists: true, $ne: null }, seconds: { $gt: 0 } }
@@ -178,12 +208,20 @@ const makeStudentProgressHelpers = ({
     const student = await userCollection.findOne({ uid: studentId, role: "student" });
     if (!student) return null;
 
-    const [generalClasses, publicQuizzesStats, roomStats, chatStats] = await Promise.all([
+    const [generalClasses, publicQuizzesStats, roomStats, chatStats, publicQuizResults] = await Promise.all([
       getCallStats(studentId, false),
       getQuizStats(publicQuizzes, studentId),
       getRoomStats(studentId),
       getChatStats(studentId),
+      getQuizResults(publicQuizzes, studentId, "public"),
     ]);
+    const roomIds = (roomStats.rooms || []).map((room) => room.id);
+    const roomQuizResults = await getQuizResults(roomQuizzes, studentId, "room", {
+      roomId: { $in: roomIds },
+    });
+    const quizResults = [...publicQuizResults, ...roomQuizResults].sort(
+      (a, b) => new Date(b.submittedAt || b.scheduledAt || 0) - new Date(a.submittedAt || a.scheduledAt || 0)
+    );
 
     const totalQuizSubmitted = publicQuizzesStats.submitted + roomStats.quizzes.submitted;
     const totalQuizScore = publicQuizzesStats.totalScore + roomStats.quizzes.totalScore;
@@ -242,6 +280,8 @@ const makeStudentProgressHelpers = ({
         publicQuizzes: publicQuizzesStats,
         rooms: roomStats,
         chats: chatStats,
+        quizResults,
+        latestQuizResult: quizResults[0] || null,
       },
     };
   };

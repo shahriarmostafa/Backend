@@ -65,9 +65,13 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         .limit(80)
         .toArray();
 
+      const visibleQuizzes = quizzes.filter(
+        (quiz) => quiz.status !== "draft" || quiz.teacherId === userId
+      );
+
       res.json({
         success: true,
-        quizzes: quizzes.map((quiz) => publicQuiz(quiz, userId)),
+        quizzes: visibleQuizzes.map((quiz) => publicQuiz(quiz, userId)),
         constants: {
           attendCredit: ROOM_QUIZ_ATTEND_CREDIT,
           rewardRate: ROOM_QUIZ_REWARD_POOL_RATE,
@@ -137,6 +141,42 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     } catch (err) {
       console.error("Error requesting room quiz:", err);
       res.status(500).json({ error: "Failed to request quiz." });
+    }
+  });
+
+  router.post("/api/study-rooms/:roomId/quizzes", async (req, res) => {
+    try {
+      const { teacherId, subject, title = "" } = req.body;
+      const room = await getRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ error: "Room not found." });
+      if (room.teacherControl !== true)
+        return res.status(403).json({ error: "Teachers can create quizzes directly only in teacher-controlled rooms." });
+      if (!teacherId || !isRoomTeacher(room, teacherId, subject))
+        return res.status(404).json({ error: "Teacher is not available in this room subject." });
+
+      const cleanSubject = String(subject || "General").trim();
+      const now = new Date();
+      const doc = {
+        roomId: req.params.roomId,
+        roomName: room.name,
+        subject: cleanSubject,
+        title: String(title || `${cleanSubject} quiz`).trim().slice(0, 120),
+        teacherId,
+        requestedBy: teacherId,
+        requesters: [],
+        teacherCreated: true,
+        status: "draft",
+        questions: [],
+        attempts: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      const result = await roomQuizzes.insertOne(doc);
+      const quiz = await roomQuizzes.findOne({ _id: result.insertedId });
+      res.status(201).json({ success: true, quiz: publicQuiz(quiz, teacherId) });
+    } catch (err) {
+      console.error("Error creating controlled room quiz:", err);
+      res.status(500).json({ error: "Failed to create quiz." });
     }
   });
 

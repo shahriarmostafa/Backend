@@ -144,6 +144,7 @@ module.exports = ({
         type: cleanType,
         keyword,
         createdBy: userId,
+        teacherControl: false,
         memberIds: [userId],
         memberStatuses: {
           [userId]: {
@@ -209,12 +210,15 @@ module.exports = ({
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
 
       if (!room) return res.status(404).json({ error: "Room not found." });
-      if (
-        !userId ||
-        !(room.memberIds || []).includes(userId) ||
-        !getRoomMembership(room, userId).isActive
-      )
-        return res.status(403).json({ error: "Only active room students can add goals." });
+      const isActiveStudent =
+        userId &&
+        (room.memberIds || []).includes(userId) &&
+        getRoomMembership(room, userId).isActive;
+      const isControlledTeacher =
+        room.teacherControl === true &&
+        (room.teacherSessions || []).some((session) => session.teacherId === userId);
+      if (!isActiveStudent && !isControlledTeacher)
+        return res.status(403).json({ error: "Only active students or controlled room teachers can add goals." });
       if (!cleanTitle) return res.status(400).json({ error: "Goal title is required." });
 
       const now = new Date();
@@ -239,7 +243,7 @@ module.exports = ({
         title: "New task added",
         message: cleanTitle,
         actorId: userId,
-        actorRole: "student",
+        actorRole: isControlledTeacher ? "teacher" : "student",
         metadata: { goalId: goal.id },
       });
 
@@ -293,12 +297,15 @@ module.exports = ({
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
 
       if (!room) return res.status(404).json({ error: "Room not found." });
-      if (
-        !userId ||
-        !(room.memberIds || []).includes(userId) ||
-        !getRoomMembership(room, userId).isActive
-      )
-        return res.status(403).json({ error: "Only active room students can delete goals." });
+      const isActiveStudent =
+        userId &&
+        (room.memberIds || []).includes(userId) &&
+        getRoomMembership(room, userId).isActive;
+      const isControlledTeacher =
+        room.teacherControl === true &&
+        (room.teacherSessions || []).some((session) => session.teacherId === userId);
+      if (!isActiveStudent && !isControlledTeacher)
+        return res.status(403).json({ error: "Only active students or controlled room teachers can delete goals." });
 
       const goalExists = (room.progress?.goals || []).some((g) => g.id === goalId);
       if (!goalExists) return res.status(404).json({ error: "Goal not found." });
@@ -333,6 +340,27 @@ module.exports = ({
         if (membership.isActive)
           return res.json({ success: true, room: await hydrateStudyRoom(room), alreadyJoined: true });
 
+        if (room.freeAccess === true || room.creditExpenseEnabled === false) {
+          const now = new Date();
+          await studyRooms.updateOne(
+            { _id: room._id },
+            {
+              $set: {
+                [`memberStatuses.${userId}`]: {
+                  joinedAt: membership.joinedAt,
+                  lastPaymentAt: null,
+                  nextBillingAt: null,
+                  isActive: true,
+                  freeAccess: true,
+                },
+                updatedAt: Date.now(),
+              },
+            }
+          );
+          const freeRenewedRoom = await studyRooms.findOne({ _id: room._id });
+          return res.json({ success: true, room: await hydrateStudyRoom(freeRenewedRoom), renewed: true, freeAccess: true });
+        }
+
         const renewalResult = await renewRoomMembership(room, userId);
         if (!renewalResult.ok)
           return res.status(renewalResult.status).json({ error: renewalResult.message });
@@ -349,9 +377,13 @@ module.exports = ({
       if ((room.memberIds || []).length >= (room.maxStudents || STUDY_ROOM_MAX_STUDENTS))
         return res.status(409).json({ error: "This room is full." });
 
-      const creditResult = await spendStudentCredit(userId, STUDY_ROOM_JOIN_CREDIT);
-      if (!creditResult.ok)
-        return res.status(creditResult.status).json({ error: creditResult.message });
+      const shouldSpendCredit = room.freeAccess !== true && room.creditExpenseEnabled !== false;
+      let creditResult = { ok: true, credit: null };
+      if (shouldSpendCredit) {
+        creditResult = await spendStudentCredit(userId, STUDY_ROOM_JOIN_CREDIT);
+        if (!creditResult.ok)
+          return res.status(creditResult.status).json({ error: creditResult.message });
+      }
 
       const now = new Date();
       const nextMemberIds = [...(room.memberIds || []), userId];
@@ -369,9 +401,10 @@ module.exports = ({
             chats: updatedChats,
             [`memberStatuses.${userId}`]: {
               joinedAt: now,
-              lastPaymentAt: now,
-              nextBillingAt: new Date(now.getTime() + STUDY_ROOM_MONTH_MS),
+              lastPaymentAt: shouldSpendCredit ? now : null,
+              nextBillingAt: shouldSpendCredit ? new Date(now.getTime() + STUDY_ROOM_MONTH_MS) : null,
               isActive: true,
+              freeAccess: !shouldSpendCredit,
             },
             updatedAt: Date.now(),
           },
@@ -404,6 +437,7 @@ module.exports = ({
         success: true,
         room: await hydrateStudyRoom(updatedRoom),
         remainingCredit: creditResult.credit,
+        freeAccess: !shouldSpendCredit,
       });
     } catch (err) {
       console.error("Error joining study room:", err);
@@ -418,6 +452,27 @@ module.exports = ({
 
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
       if (!room) return res.status(404).json({ error: "Room not found." });
+
+      if (room.freeAccess === true || room.creditExpenseEnabled === false) {
+        const membership = getRoomMembership(room, userId);
+        await studyRooms.updateOne(
+          { _id: room._id },
+          {
+            $set: {
+              [`memberStatuses.${userId}`]: {
+                joinedAt: membership.joinedAt,
+                lastPaymentAt: null,
+                nextBillingAt: null,
+                isActive: true,
+                freeAccess: true,
+              },
+              updatedAt: Date.now(),
+            },
+          }
+        );
+        const freeRoom = await studyRooms.findOne({ _id: room._id });
+        return res.json({ success: true, room: await hydrateStudyRoom(freeRoom), freeAccess: true });
+      }
 
       const renewalResult = await renewRoomMembership(room, userId);
       if (!renewalResult.ok)

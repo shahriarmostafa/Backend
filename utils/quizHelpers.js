@@ -75,6 +75,7 @@ const makeQuizHelpers = ({
   const getQuizStatus = (quiz) => {
     if (!quiz) return "missing";
     if (quiz.status === "completed") return "completed";
+    if (quiz.status === "draft") return "draft";
     if (quiz.status === "requested") return "requested";
     if (quiz.status === "assigned") return "assigned";
     const scheduledAt = quiz.scheduledAt ? new Date(quiz.scheduledAt).getTime() : 0;

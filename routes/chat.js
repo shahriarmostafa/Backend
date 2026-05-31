@@ -151,6 +151,25 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
           return res
             .status(403)
             .json({ error: "Renew this room membership before sending messages." });
+
+        if (isAssignedRoomTeacher && room.teacherControl !== true) {
+          const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+          if (!chatDoc) return res.status(404).json({ error: "Chat not found." });
+          const roomStudentIds = new Set(room.memberIds || []);
+          let consecutiveTeacherMessages = 0;
+
+          for (let index = (chatDoc.messages || []).length - 1; index >= 0; index -= 1) {
+            const messageSender = chatDoc.messages[index]?.senderId;
+            if (roomStudentIds.has(messageSender)) break;
+            if (messageSender === senderId) consecutiveTeacherMessages += 1;
+          }
+
+          if (consecutiveTeacherMessages >= 3) {
+            return res.status(429).json({
+              error: "A room teacher can send up to 3 consecutive messages. Please wait for a student reply.",
+            });
+          }
+        }
       }
 
       if (fileUrl) {

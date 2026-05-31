@@ -15,7 +15,8 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     const nextBillingAt = rawStatus?.nextBillingAt
       ? new Date(rawStatus.nextBillingAt)
       : new Date(joinedAt.getTime() + STUDY_ROOM_MONTH_MS);
-    const isActive = rawStatus?.isActive !== false && nextBillingAt.getTime() > Date.now();
+    const isFreeAccess = rawStatus?.freeAccess === true || room?.freeAccess === true || room?.creditExpenseEnabled === false;
+    const isActive = rawStatus?.isActive !== false && (isFreeAccess || nextBillingAt.getTime() > Date.now());
     return {
       joinedAt,
       lastPaymentAt: rawStatus?.lastPaymentAt ? new Date(rawStatus.lastPaymentAt) : joinedAt,
@@ -215,6 +216,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       memberCount: (room.memberIds || []).length,
       memberStatuses: buildMemberStatuses(room),
       maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
+      teacherControl: room.teacherControl === true,
       members,
       progress,
       teacherSessions: (room.teacherSessions || []).map((session) => ({
@@ -234,6 +236,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       roomId: room._id.toString(),
       roomName: room.name,
       roomKeyword: room.keyword,
+      teacherControl: room.teacherControl === true,
       memberIds: room.memberIds || [],
       memberCount: (room.memberIds || []).length,
       maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,

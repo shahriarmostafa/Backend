@@ -1,4 +1,5 @@
 const { Router } = require("express");
+const { ObjectId } = require("mongodb");
 const {
   STUDY_ROOM_TEACHER_CREDIT_RATE,
   STUDY_ROOM_TEACHER_POINT_RATE,
@@ -49,12 +50,27 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
         parentSessionId,
         participantName,
         participantPhotoURL,
+        teacherStarted = false,
       } = req.body;
       const callSession = databaseinmongo.collection("callSession");
       const normalizedCreditRate = Math.min(Math.max(Number(creditRate) || 1, 0.1), 1);
       const sharedRoomCallId = roomId ? roomCallId || parentSessionId || sessionId : null;
       const studentProfile = studentId ? await userCollection.findOne({ uid: studentId }) : null;
       const startTime = Date.now();
+
+      if (roomId && teacherStarted) {
+        if (!ObjectId.isValid(roomId)) {
+          return res.status(400).json({ success: false, message: "Invalid roomId" });
+        }
+        const room = await studyRooms.findOne({ _id: new ObjectId(roomId) });
+        const isRoomTeacher = room?.teacherSessions?.some((session) => session.teacherId === teacherId);
+        if (!room || room.teacherControl !== true || !isRoomTeacher) {
+          return res.status(403).json({
+            success: false,
+            message: "Teacher-started classes are available only in teacher-controlled rooms.",
+          });
+        }
+      }
 
       const result = await callSession.updateOne(
         { sessionId },

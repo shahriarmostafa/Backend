@@ -1,8 +1,19 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
+const { makeRoomHelpers } = require("../utils/roomHelpers");
+const {
+  STUDY_ROOM_MAX_STUDENTS,
+  STUDY_ROOM_MONTH_MS,
+} = require("../utils/constants");
 
-module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, publicQuizzes, databaseinmongo }) => {
+module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, publicQuizzes, studyRooms, roomQuizzes, databaseinmongo }) => {
   const router = Router();
+  const {
+    hydrateStudyRoom,
+    createStudyRoomChat,
+    ensureRoomChatSubscriptions,
+    getUniqueRoomKeyword,
+  } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes });
 
   const getScopedFilter = (category, type) => {
     const filter = {};
@@ -759,6 +770,352 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     } catch (err) {
       console.error("Error deleting public quiz assignment:", err);
       res.status(500).json({ success: false, error: "Failed to delete public quiz." });
+    }
+  });
+
+  const getAdminRoom = async (roomId) => {
+    if (!ObjectId.isValid(roomId)) return null;
+    return studyRooms.findOne({ _id: new ObjectId(roomId) });
+  };
+
+  const findStudentByEmail = async (email) =>
+    userCollection.findOne({
+      email: { $regex: `^${String(email || "").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+      role: "student",
+    });
+
+  const addStudentsToRoom = async (room, students, adminManagedFree = false) => {
+    const now = new Date();
+    const currentMemberIds = room.memberIds || [];
+    const nextMemberIds = [...new Set([...currentMemberIds, ...students.map((student) => student.uid)])];
+    const memberStatuses = { ...(room.memberStatuses || {}) };
+    students.forEach((student) => {
+      if (!memberStatuses[student.uid]) {
+        memberStatuses[student.uid] = {
+          joinedAt: now,
+          lastPaymentAt: adminManagedFree ? null : now,
+          nextBillingAt: adminManagedFree ? null : new Date(now.getTime() + STUDY_ROOM_MONTH_MS),
+          isActive: true,
+          addedByAdmin: true,
+          freeAccess: adminManagedFree,
+        };
+      }
+    });
+
+    const updatedChats = (room.chats || []).map((chat) => ({
+      ...chat,
+      participantIds:
+        chat.type === "students"
+          ? nextMemberIds
+          : [...new Set([...(chat.participantIds || []), ...students.map((student) => student.uid)])],
+    }));
+
+    await studyRooms.updateOne(
+      { _id: room._id },
+      {
+        $set: {
+          memberIds: nextMemberIds,
+          memberStatuses,
+          chats: updatedChats,
+          updatedAt: Date.now(),
+        },
+      }
+    );
+
+    const chatDB = databaseinmongo.collection("chatDB");
+    await Promise.all(
+      updatedChats.map((chat) =>
+        chat.chatId
+          ? chatDB.updateOne(
+              { _id: new ObjectId(chat.chatId) },
+              { $set: { participantIds: chat.participantIds } }
+            )
+          : Promise.resolve()
+      )
+    );
+    await Promise.all(
+      updatedChats.map((chat) =>
+        ensureRoomChatSubscriptions({
+          chat: { ...chat, roomId: room._id.toString() },
+          participantIds: chat.participantIds,
+          roomId: room._id.toString(),
+        })
+      )
+    );
+  };
+
+  router.get("/api/admin/study-rooms", async (req, res) => {
+    try {
+      const { category, type, visibility, search } = req.query;
+      const filter = {};
+      if (category) filter.category = category;
+      if (type) filter.type = type;
+      if (visibility) filter.visibility = visibility;
+      if (search) {
+        filter.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { keyword: String(search).trim().toUpperCase() },
+        ];
+      }
+      const rooms = await studyRooms.find(filter).sort({ updatedAt: -1, createdAt: -1 }).limit(120).toArray();
+      const hydrated = await Promise.all(rooms.map(hydrateStudyRoom));
+      res.json({ success: true, rooms: hydrated });
+    } catch (err) {
+      console.error("Error fetching admin study rooms:", err);
+      res.status(500).json({ success: false, error: "Failed to fetch study rooms." });
+    }
+  });
+
+  router.post("/api/admin/study-rooms", async (req, res) => {
+    try {
+      const {
+        name,
+        visibility = "public",
+        category = "school",
+        type = "bangla_medium",
+        maxStudents = STUDY_ROOM_MAX_STUDENTS,
+        freeAccess = true,
+        creditExpenseEnabled = false,
+        teacherControl = false,
+        studentEmails = [],
+      } = req.body;
+      const cleanName = String(name || "").trim();
+      if (!cleanName) return res.status(400).json({ success: false, error: "Room name is required." });
+
+      const cleanVisibility = visibility === "private" ? "private" : "public";
+      const cleanCategory = ["school", "college", "university"].includes(category) ? category : "school";
+      const cleanType = ["english_medium", "bangla_medium"].includes(type) ? type : "bangla_medium";
+      const students = studentEmails.length
+        ? await userCollection
+            .find({ email: { $in: studentEmails.map((email) => String(email).trim().toLowerCase()) }, role: "student" })
+            .toArray()
+        : [];
+      const memberIds = [...new Set(students.map((student) => student.uid).filter(Boolean))];
+      const keyword = await getUniqueRoomKeyword();
+      const now = new Date();
+      const studentChat = await createStudyRoomChat({
+        name: `${cleanName} Students`,
+        type: "students",
+        participantIds: memberIds,
+      });
+      const memberStatuses = memberIds.reduce((acc, uid) => {
+        acc[uid] = {
+          joinedAt: now,
+          lastPaymentAt: freeAccess ? null : now,
+          nextBillingAt: freeAccess ? null : new Date(now.getTime() + STUDY_ROOM_MONTH_MS),
+          isActive: true,
+          addedByAdmin: true,
+          freeAccess,
+        };
+        return acc;
+      }, {});
+
+      const roomDoc = {
+        name: cleanName,
+        visibility: cleanVisibility,
+        category: cleanCategory,
+        type: cleanType,
+        keyword,
+        createdBy: "admin",
+        createdByAdmin: true,
+        freeAccess: Boolean(freeAccess),
+        creditExpenseEnabled: Boolean(creditExpenseEnabled),
+        teacherControl: Boolean(teacherControl),
+        teacherClassEnabled: Boolean(teacherControl),
+        memberIds,
+        memberStatuses,
+        maxStudents: Math.max(1, Number(maxStudents) || STUDY_ROOM_MAX_STUDENTS),
+        studentChatId: studentChat.chatId,
+        chats: [studentChat],
+        teacherSessions: [],
+        createdAt: now,
+        updatedAt: Date.now(),
+      };
+
+      const result = await studyRooms.insertOne(roomDoc);
+      await ensureRoomChatSubscriptions({
+        chat: { ...studentChat, roomId: result.insertedId.toString() },
+        participantIds: memberIds,
+        roomId: result.insertedId.toString(),
+      });
+      const room = await studyRooms.findOne({ _id: result.insertedId });
+      res.status(201).json({ success: true, room: await hydrateStudyRoom(room) });
+    } catch (err) {
+      console.error("Error creating admin study room:", err);
+      res.status(500).json({ success: false, error: "Failed to create study room." });
+    }
+  });
+
+  router.patch("/api/admin/study-rooms/:roomId", async (req, res) => {
+    try {
+      const room = await getAdminRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ success: false, error: "Room not found." });
+      const { name, visibility, category, type, maxStudents, freeAccess, creditExpenseEnabled, teacherControl } = req.body;
+      const update = { updatedAt: Date.now() };
+      if (typeof name === "string" && name.trim()) update.name = name.trim();
+      if (visibility === "public" || visibility === "private") update.visibility = visibility;
+      if (["school", "college", "university"].includes(category)) update.category = category;
+      if (["english_medium", "bangla_medium"].includes(type)) update.type = type;
+      if (maxStudents !== undefined) update.maxStudents = Math.max(1, Number(maxStudents) || STUDY_ROOM_MAX_STUDENTS);
+      if (freeAccess !== undefined) update.freeAccess = Boolean(freeAccess);
+      if (creditExpenseEnabled !== undefined) update.creditExpenseEnabled = Boolean(creditExpenseEnabled);
+      if (teacherControl !== undefined) {
+        update.teacherControl = Boolean(teacherControl);
+        update.teacherClassEnabled = Boolean(teacherControl);
+      }
+
+      await studyRooms.updateOne({ _id: room._id }, { $set: update });
+      if (teacherControl !== undefined && Array.isArray(room.teacherSessions) && room.teacherSessions.length) {
+        await studyRooms.updateOne(
+          { _id: room._id },
+          { $set: { "teacherSessions.$[].canStartClass": Boolean(teacherControl) } }
+        );
+      }
+      const updatedRoom = await studyRooms.findOne({ _id: room._id });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+    } catch (err) {
+      console.error("Error updating admin study room:", err);
+      res.status(500).json({ success: false, error: "Failed to update study room." });
+    }
+  });
+
+  router.delete("/api/admin/study-rooms/:roomId", async (req, res) => {
+    try {
+      const room = await getAdminRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ success: false, error: "Room not found." });
+      const chatIds = (room.chats || []).map((chat) => chat.chatId).filter(ObjectId.isValid);
+      const objectIds = chatIds.map((chatId) => new ObjectId(chatId));
+      await studyRooms.deleteOne({ _id: room._id });
+      if (objectIds.length) await databaseinmongo.collection("chatDB").deleteMany({ _id: { $in: objectIds } });
+      await databaseinmongo.collection("chatCollection").updateMany(
+        {},
+        { $pull: { chats: { roomId: room._id.toString() } } }
+      );
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error deleting admin study room:", err);
+      res.status(500).json({ success: false, error: "Failed to delete study room." });
+    }
+  });
+
+  router.post("/api/admin/study-rooms/:roomId/students", async (req, res) => {
+    try {
+      const { email } = req.body;
+      const room = await getAdminRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ success: false, error: "Room not found." });
+      const student = await findStudentByEmail(email);
+      if (!student) return res.status(404).json({ success: false, error: "Student not found." });
+      if ((room.memberIds || []).includes(student.uid))
+        return res.status(409).json({ success: false, error: "Student already joined this room." });
+      if ((room.memberIds || []).length >= (room.maxStudents || STUDY_ROOM_MAX_STUDENTS))
+        return res.status(409).json({ success: false, error: "This room is full." });
+
+      await addStudentsToRoom(room, [student], room.freeAccess !== false);
+      const updatedRoom = await studyRooms.findOne({ _id: room._id });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+    } catch (err) {
+      console.error("Error adding student to admin room:", err);
+      res.status(500).json({ success: false, error: "Failed to add student." });
+    }
+  });
+
+  router.delete("/api/admin/study-rooms/:roomId/students/:studentId", async (req, res) => {
+    try {
+      const room = await getAdminRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ success: false, error: "Room not found." });
+      const { studentId } = req.params;
+      const nextMemberIds = (room.memberIds || []).filter((uid) => uid !== studentId);
+      const nextStatuses = { ...(room.memberStatuses || {}) };
+      delete nextStatuses[studentId];
+      const updatedChats = (room.chats || []).map((chat) => ({
+        ...chat,
+        participantIds: (chat.participantIds || []).filter((uid) => uid !== studentId),
+      }));
+      await studyRooms.updateOne(
+        { _id: room._id },
+        { $set: { memberIds: nextMemberIds, memberStatuses: nextStatuses, chats: updatedChats, updatedAt: Date.now() } }
+      );
+      await databaseinmongo.collection("chatCollection").updateOne(
+        { _id: studentId },
+        { $pull: { chats: { roomId: room._id.toString() } } }
+      );
+      const updatedRoom = await studyRooms.findOne({ _id: room._id });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+    } catch (err) {
+      console.error("Error removing student from admin room:", err);
+      res.status(500).json({ success: false, error: "Failed to remove student." });
+    }
+  });
+
+  router.post("/api/admin/study-rooms/:roomId/teachers", async (req, res) => {
+    try {
+      const { teacherId, subject } = req.body;
+      const room = await getAdminRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ success: false, error: "Room not found." });
+      const teacher = await userCollection.findOne({ uid: teacherId, role: "teacher" });
+      if (!teacher) return res.status(404).json({ success: false, error: "Teacher not found." });
+      const selectedSubject = subject || teacher.subjects?.[0] || "General";
+      const alreadyAdded = (room.teacherSessions || []).some(
+        (session) =>
+          session.teacherId === teacherId &&
+          String(session.subject || "General").toLowerCase() === String(selectedSubject).toLowerCase()
+      );
+      if (alreadyAdded)
+        return res.status(409).json({ success: false, error: "This teacher is already added for this subject." });
+      const teacherChat = await createStudyRoomChat({
+        name: `${teacher.displayName || "Teacher"} - ${selectedSubject}`,
+        type: "teacher",
+        participantIds: [...new Set([...(room.memberIds || []), teacherId])],
+        teacherId,
+        subject: selectedSubject,
+      });
+      const teacherSession = {
+        ...teacherChat,
+        addedBy: "admin",
+        addedByAdmin: true,
+        addedAt: new Date(),
+        expiresAt: null,
+        canStartClass: room.teacherControl === true,
+      };
+      await studyRooms.updateOne(
+        { _id: room._id },
+        { $push: { chats: teacherChat, teacherSessions: teacherSession }, $set: { updatedAt: Date.now() } }
+      );
+      await ensureRoomChatSubscriptions({
+        chat: { ...teacherChat, roomId: room._id.toString() },
+        participantIds: teacherChat.participantIds,
+        roomId: room._id.toString(),
+      });
+      const updatedRoom = await studyRooms.findOne({ _id: room._id });
+      res.status(201).json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+    } catch (err) {
+      console.error("Error adding teacher to admin room:", err);
+      res.status(500).json({ success: false, error: "Failed to add teacher." });
+    }
+  });
+
+  router.delete("/api/admin/study-rooms/:roomId/teachers/:chatId", async (req, res) => {
+    try {
+      const room = await getAdminRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ success: false, error: "Room not found." });
+      const { chatId } = req.params;
+      await studyRooms.updateOne(
+        { _id: room._id },
+        {
+          $pull: { chats: { chatId }, teacherSessions: { chatId } },
+          $set: { updatedAt: Date.now() },
+        }
+      );
+      if (ObjectId.isValid(chatId)) await databaseinmongo.collection("chatDB").deleteOne({ _id: new ObjectId(chatId) });
+      await databaseinmongo.collection("chatCollection").updateMany(
+        {},
+        { $pull: { chats: { chatId } } }
+      );
+      const updatedRoom = await studyRooms.findOne({ _id: room._id });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+    } catch (err) {
+      console.error("Error removing teacher from admin room:", err);
+      res.status(500).json({ success: false, error: "Failed to remove teacher." });
     }
   });
 
