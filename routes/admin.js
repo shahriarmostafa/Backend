@@ -428,5 +428,67 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     }
   });
 
+  router.get("/subjects", async (req, res) => {
+    try {
+      const subjectsCollection = databaseinmongo.collection("subjects");
+      const filter = {};
+      if (req.query.category) filter.category = req.query.category;
+      if (req.query.type) filter.type = req.query.type;
+      const result = await subjectsCollection.find(filter).sort({ name: 1 }).toArray();
+      res.status(200).json({ success: true, data: result });
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ success: false, data: [] });
+    }
+  });
+
+  router.post("/subjects", async (req, res) => {
+    try {
+      const { name, category, type } = req.body;
+      if (!name || !category || !type) {
+        return res.status(400).json({ success: false, message: "name, category and type are required" });
+      }
+      const subjectsCollection = databaseinmongo.collection("subjects");
+      const exists = await subjectsCollection.findOne({ name, category, type });
+      if (exists) {
+        return res.status(409).json({ success: false, message: "Subject already exists" });
+      }
+      await subjectsCollection.insertOne({ name, category, type, createdAt: new Date() });
+      res.status(201).json({ success: true });
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ success: false });
+    }
+  });
+
+  router.put("/subjects/:id", async (req, res) => {
+    try {
+      const _id = req.params.id;
+      const { name } = req.body;
+      if (!name) return res.status(400).json({ success: false, message: "name is required" });
+      const subjectsCollection = databaseinmongo.collection("subjects");
+      await subjectsCollection.updateOne(
+        { _id: new ObjectId(_id) },
+        { $set: { name, updatedAt: new Date() } }
+      );
+      res.status(200).json({ success: true });
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ success: false });
+    }
+  });
+
+  router.delete("/subjects/:id", async (req, res) => {
+    try {
+      const _id = req.params.id;
+      const subjectsCollection = databaseinmongo.collection("subjects");
+      await subjectsCollection.deleteOne({ _id: new ObjectId(_id) });
+      res.status(200).json({ success: true });
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ success: false });
+    }
+  });
+
   return router;
 };

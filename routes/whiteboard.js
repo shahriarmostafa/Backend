@@ -51,6 +51,8 @@ module.exports = () => {
     }
   });
 
+
+  // this is for agora video call token generation
   router.post("/generate-token", (req, res) => {
     const { channelName } = req.body;
     if (!channelName) {

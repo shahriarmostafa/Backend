@@ -163,7 +163,8 @@ module.exports = ({
           price: Number(price),
           durationDays: Number(durationDays),
           category,
-          type: "extension",
+          type,
+          packageType: "extension",
           paymentStatus: "free-extension",
           orderId: null,
           internalReference: `FREE_EXT_${Date.now()}`,
@@ -317,7 +318,8 @@ module.exports = ({
               durationDays: Number(durationDays),
               category,
               orderId: order_id,
-              type: paymentType,
+              type,
+              packageType: paymentType,
               paymentStatus: "approved",
               createdAt: new Date(),
             });
@@ -360,7 +362,7 @@ module.exports = ({
       credit,
       amountReceived,
       category = "custom",
-      type: packageType = "custom",
+      type = "custom",
     } = req.body;
 
     if (!email || !durationHours || credit === undefined || amountReceived === undefined)
@@ -374,9 +376,9 @@ module.exports = ({
       const displayName = user.displayName || user.name || email;
       const existingPackage = await activepackages.findOne({ uid });
       const now = new Date();
-      let subscriptionType;
+      let packageType;
       const packageCategory = category || existingPackage?.category || "custom";
-      const selectedPackageType = packageType || existingPackage?.type || "custom";
+      const selectedType = type || existingPackage?.type || "custom";
 
       if (existingPackage?.expiryDate && new Date(existingPackage.expiryDate) > now) {
         const expiryDate = new Date(existingPackage.expiryDate);
@@ -394,12 +396,12 @@ module.exports = ({
               totalCredit: updatedTotalCredit,
               price: (existingPackage.price || 0) + Number(amountReceived),
               category: packageCategory,
-              type: selectedPackageType,
+              type: selectedType,
               updatedAt: new Date(),
             },
           }
         );
-        subscriptionType = "admin-extension";
+        packageType = "admin-extension";
       } else {
         const startDate = new Date();
         const expiryDate = new Date(startDate);
@@ -419,14 +421,14 @@ module.exports = ({
               paymentStatus: "admin-added",
               purchasedAt: new Date(),
               category: packageCategory,
-              type: selectedPackageType,
+              type: selectedType,
               price: Number(amountReceived),
               updatedAt: new Date(),
             },
           },
           { upsert: true }
         );
-        subscriptionType = "admin-new";
+        packageType = "admin-new";
       }
 
       await subscriptions.insertOne({
@@ -438,15 +440,15 @@ module.exports = ({
         price: Number(amountReceived),
         durationDays: Number(durationHours),
         category: packageCategory,
-        packageType: selectedPackageType,
-        type: subscriptionType,
+        type: selectedType,
+        packageType,
         paymentStatus: "admin-added",
         orderId: null,
         internalReference: `ADMIN_${Date.now()}`,
         createdAt: new Date(),
       });
 
-      return res.json({ success: true, type: subscriptionType, uid, displayName });
+      return res.json({ success: true, type: packageType, packageType, uid, displayName });
     } catch (error) {
       console.error("admin-add-subscription error:", error);
       return res.status(500).json({ error: "Internal server error" });
