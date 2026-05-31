@@ -3,9 +3,25 @@ const {
   ROOM_QUIZ_ATTEND_CREDIT,
   ROOM_QUIZ_REWARD_POOL_RATE,
   ROOM_QUIZ_MAX_QUESTIONS,
+  PUBLIC_QUIZ_ATTEND_CREDIT,
+  PUBLIC_QUIZ_REWARD_POOL_RATE,
+  PUBLIC_QUIZ_MAX_QUESTIONS,
+  PUBLIC_QUIZ_REWARD_STEP_SIZE,
+  PUBLIC_QUIZ_REWARD_BASE_WINNERS,
+  PUBLIC_QUIZ_REWARD_WINNER_STEP,
+  PUBLIC_QUIZ_REWARD_MAX_WINNERS,
 } = require("./constants");
 
-const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
+const makeQuizHelpers = ({
+  userCollection,
+  activepackages,
+  roomQuizzes,
+  quizCollection = roomQuizzes,
+  attendCredit = ROOM_QUIZ_ATTEND_CREDIT,
+  rewardPoolRate = ROOM_QUIZ_REWARD_POOL_RATE,
+  maxQuestions = ROOM_QUIZ_MAX_QUESTIONS,
+  getWinnerCount = null,
+} = {}) => {
   const normalizeQuestion = (question = {}) => {
     const type = question.type === "open" ? "open" : "mcq";
     const options = Array.isArray(question.options) ? question.options.slice(0, 4) : [];
@@ -24,7 +40,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
   };
 
   const validateQuestions = (questions = []) => {
-    const cleanQuestions = questions.slice(0, ROOM_QUIZ_MAX_QUESTIONS).map(normalizeQuestion);
+    const cleanQuestions = questions.slice(0, maxQuestions).map(normalizeQuestion);
     const invalid = cleanQuestions.some((question) => {
       if (!question.prompt) return true;
       if (question.type === "mcq") {
@@ -60,6 +76,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
     if (!quiz) return "missing";
     if (quiz.status === "completed") return "completed";
     if (quiz.status === "requested") return "requested";
+    if (quiz.status === "assigned") return "assigned";
     const scheduledAt = quiz.scheduledAt ? new Date(quiz.scheduledAt).getTime() : 0;
     const endsAt = quiz.endsAt ? new Date(quiz.endsAt).getTime() : 0;
     const now = Date.now();
@@ -78,18 +95,18 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
       activePackage?.isActive === true && new Date(activePackage.expiryDate) > new Date();
     if (!isValid)
       return { ok: false, status: 403, message: "No active package found for this student." };
-    if (credit < ROOM_QUIZ_ATTEND_CREDIT)
+    if (credit < attendCredit)
       return {
         ok: false,
         status: 402,
-        message: `At least ${ROOM_QUIZ_ATTEND_CREDIT} credit is required.`,
+        message: `At least ${attendCredit} credit is required.`,
       };
     await activepackages.updateOne(
       { uid: studentId },
-      { $inc: { credit: -ROOM_QUIZ_ATTEND_CREDIT } },
+      { $inc: { credit: -attendCredit } },
       { session }
     );
-    return { ok: true, remainingCredit: credit - ROOM_QUIZ_ATTEND_CREDIT };
+    return { ok: true, remainingCredit: credit - attendCredit };
   };
 
   const distributeRewards = (totalRewardPool, winnerCount) => {
@@ -104,7 +121,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
   };
 
   const settleQuiz = async (quizId, session = null) => {
-    const quiz = await roomQuizzes.findOne({ _id: new ObjectId(quizId) }, { session });
+    const quiz = await quizCollection.findOne({ _id: new ObjectId(quizId) }, { session });
     if (!quiz) return { ok: false, status: 404, message: "Quiz not found." };
     if (quiz.status === "completed" || quiz.settledAt)
       return { ok: true, alreadySettled: true, quiz };
@@ -114,14 +131,20 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
       (sum, attempt) => sum + (Number(attempt.creditDeducted) || 0),
       0
     );
-    const winnerCount = submittedAttempts.length > 5 ? 3 : submittedAttempts.length ? 1 : 0;
+    const winnerCount = getWinnerCount
+      ? getWinnerCount(submittedAttempts.length)
+      : submittedAttempts.length > 5
+      ? 3
+      : submittedAttempts.length
+      ? 1
+      : 0;
     const sortedAttempts = [...submittedAttempts].sort((a, b) => {
       if ((Number(b.score) || 0) !== (Number(a.score) || 0))
         return (Number(b.score) || 0) - (Number(a.score) || 0);
       return new Date(a.submittedAt || 0) - new Date(b.submittedAt || 0);
     });
     const winners = sortedAttempts.slice(0, winnerCount);
-    const rewardPool = Math.round(totalCollectedCredit * ROOM_QUIZ_REWARD_POOL_RATE);
+    const rewardPool = Math.round(totalCollectedCredit * rewardPoolRate);
     const rewardAmounts = distributeRewards(rewardPool, winnerCount);
     const winnerRewards = winners.map((attempt, index) => ({
       studentId: attempt.studentId,
@@ -155,7 +178,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
         : { ...attempt, rewardCredit: Number(attempt.rewardCredit) || 0 };
     });
 
-    await roomQuizzes.updateOne(
+    await quizCollection.updateOne(
       { _id: quiz._id },
       {
         $set: {
@@ -165,7 +188,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
           settlement: {
             totalCollectedCredit,
             rewardPool,
-            rewardRate: ROOM_QUIZ_REWARD_POOL_RATE,
+            rewardRate: rewardPoolRate,
             winners: winnerRewards,
             teacherBasePoints,
           },
@@ -174,7 +197,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
       { session }
     );
 
-    const settledQuiz = await roomQuizzes.findOne({ _id: quiz._id }, { session });
+    const settledQuiz = await quizCollection.findOne({ _id: quiz._id }, { session });
     return { ok: true, quiz: settledQuiz };
   };
 
@@ -198,7 +221,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
       );
     }
 
-    await roomQuizzes.updateOne(
+    await quizCollection.updateOne(
       { _id: quiz._id, "attempts.studentId": studentId },
       {
         $set: {
@@ -217,7 +240,7 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
     if (!quiz) return null;
     const status = getQuizStatus(quiz);
     const attempt = viewerId ? getAttempt(quiz, viewerId) : null;
-    const canShowAnswers = status === "completed";
+    const canShowAnswers = status === "completed" || (viewerId && viewerId === quiz.teacherId);
     return {
       ...quiz,
       id: quiz._id.toString(),
@@ -230,9 +253,9 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
       myAttempt: attempt || null,
       attempts: canShowAnswers ? quiz.attempts || [] : undefined,
       constants: {
-        attendCredit: ROOM_QUIZ_ATTEND_CREDIT,
-        rewardRate: ROOM_QUIZ_REWARD_POOL_RATE,
-        maxQuestions: ROOM_QUIZ_MAX_QUESTIONS,
+        attendCredit,
+        rewardRate: rewardPoolRate,
+        maxQuestions,
       },
     };
   };
@@ -250,4 +273,27 @@ const makeQuizHelpers = ({ userCollection, activepackages, roomQuizzes }) => {
   };
 };
 
-module.exports = { makeQuizHelpers };
+const getPublicQuizWinnerCount = (submittedCount) => {
+  if (submittedCount <= 0) return 0;
+  if (submittedCount <= 5) return 1;
+  if (submittedCount <= PUBLIC_QUIZ_REWARD_STEP_SIZE) return 3;
+  const step = Math.min(Math.floor(submittedCount / PUBLIC_QUIZ_REWARD_STEP_SIZE), 5);
+  return Math.min(
+    PUBLIC_QUIZ_REWARD_BASE_WINNERS + (step - 1) * PUBLIC_QUIZ_REWARD_WINNER_STEP,
+    PUBLIC_QUIZ_REWARD_MAX_WINNERS,
+    submittedCount
+  );
+};
+
+const makePublicQuizHelpers = ({ userCollection, activepackages, publicQuizzes }) =>
+  makeQuizHelpers({
+    userCollection,
+    activepackages,
+    quizCollection: publicQuizzes,
+    attendCredit: PUBLIC_QUIZ_ATTEND_CREDIT,
+    rewardPoolRate: PUBLIC_QUIZ_REWARD_POOL_RATE,
+    maxQuestions: PUBLIC_QUIZ_MAX_QUESTIONS,
+    getWinnerCount: getPublicQuizWinnerCount,
+  });
+
+module.exports = { makeQuizHelpers, makePublicQuizHelpers, getPublicQuizWinnerCount };

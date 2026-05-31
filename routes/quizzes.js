@@ -1,14 +1,17 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
-const { makeQuizHelpers } = require("../utils/quizHelpers");
+const { makeQuizHelpers, makePublicQuizHelpers } = require("../utils/quizHelpers");
 const {
   ROOM_QUIZ_ATTEND_CREDIT,
   ROOM_QUIZ_MAX_QUESTIONS,
   ROOM_QUIZ_REWARD_POOL_RATE,
+  PUBLIC_QUIZ_ATTEND_CREDIT,
+  PUBLIC_QUIZ_MAX_QUESTIONS,
+  PUBLIC_QUIZ_REWARD_POOL_RATE,
 } = require("../utils/constants");
 
-module.exports = ({ userCollection, studyRooms, roomQuizzes, activepackages, databaseinmongo, client }) => {
+module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, activepackages, databaseinmongo, client }) => {
   const router = Router();
   const { getRoomMembership } = makeRoomHelpers({
     userCollection,
@@ -26,6 +29,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, activepackages, dat
     applyQuizRating,
     publicQuiz,
   } = makeQuizHelpers({ userCollection, activepackages, roomQuizzes });
+  const publicHelpers = makePublicQuizHelpers({ userCollection, activepackages, publicQuizzes });
 
   const getRoom = async (roomId) => studyRooms.findOne({ _id: new ObjectId(roomId) });
 
@@ -399,6 +403,296 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, activepackages, dat
     } catch (err) {
       console.error("Error deleting room quiz:", err);
       res.status(500).json({ error: "Failed to delete quiz." });
+    }
+  });
+
+  const getPublicQuiz = async (quizId, session = null) =>
+    publicQuizzes.findOne({ _id: new ObjectId(quizId) }, { session });
+
+  router.get("/api/public-quizzes", async (req, res) => {
+    try {
+      const { userId, teacherId, category, type, subject } = req.query;
+      const filter = {};
+
+      if (teacherId) {
+        filter.teacherId = teacherId;
+      } else if (userId) {
+        const userDoc = await userCollection.findOne({ uid: userId });
+        if (!userDoc) return res.status(404).json({ error: "User not found." });
+        if (userDoc.role === "teacher") filter.teacherId = userId;
+        else {
+          filter.category = category || userDoc.category || "school";
+          filter.type = type || userDoc.type || "bangla_medium";
+          filter.status = { $in: ["scheduled", "open", "completed"] };
+        }
+      }
+
+      if (category) filter.category = category;
+      if (type) filter.type = type;
+      if (subject) filter.subject = subject;
+
+      const quizzes = await publicQuizzes
+        .find(filter)
+        .sort({ scheduledAt: -1, createdAt: -1 })
+        .limit(100)
+        .toArray();
+
+      res.json({
+        success: true,
+        quizzes: quizzes.map((quiz) => publicHelpers.publicQuiz(quiz, userId || teacherId)),
+        constants: {
+          attendCredit: PUBLIC_QUIZ_ATTEND_CREDIT,
+          rewardRate: PUBLIC_QUIZ_REWARD_POOL_RATE,
+          maxQuestions: PUBLIC_QUIZ_MAX_QUESTIONS,
+        },
+      });
+    } catch (err) {
+      console.error("Error fetching public quizzes:", err);
+      res.status(500).json({ error: "Failed to fetch public quizzes." });
+    }
+  });
+
+  router.get("/api/public-quizzes/:quizId", async (req, res) => {
+    try {
+      const { userId } = req.query;
+      const quiz = await getPublicQuiz(req.params.quizId);
+      if (!quiz) return res.status(404).json({ error: "Quiz not found." });
+      res.json({ success: true, quiz: publicHelpers.publicQuiz(quiz, userId) });
+    } catch (err) {
+      console.error("Error fetching public quiz:", err);
+      res.status(500).json({ error: "Failed to fetch public quiz." });
+    }
+  });
+
+  router.patch("/api/public-quizzes/:quizId", async (req, res) => {
+    try {
+      const { teacherId, title, scheduledAt, timeLimitMinutes, questions = [] } = req.body;
+      const quiz = await getPublicQuiz(req.params.quizId);
+      if (!quiz) return res.status(404).json({ error: "Quiz not found." });
+      if (quiz.teacherId !== teacherId)
+        return res.status(403).json({ error: "Only the assigned teacher can prepare this quiz." });
+      if (quiz.status === "completed")
+        return res.status(409).json({ error: "Completed quizzes cannot be edited." });
+
+      const { cleanQuestions, invalid } = publicHelpers.validateQuestions(questions);
+      if (!cleanQuestions.length || invalid)
+        return res.status(400).json({ error: "Add valid questions and answers before scheduling." });
+
+      const cleanTimeLimit = Math.max(1, Math.min(Number(timeLimitMinutes) || 10, 240));
+      const start = scheduledAt ? new Date(scheduledAt) : new Date();
+      if (Number.isNaN(start.getTime()))
+        return res.status(400).json({ error: "Valid scheduled time is required." });
+      const endsAt = new Date(start.getTime() + cleanTimeLimit * 60 * 1000);
+
+      await publicQuizzes.updateOne(
+        { _id: quiz._id },
+        {
+          $set: {
+            title: String(title || quiz.title || "Public quiz").trim().slice(0, 120),
+            scheduledAt: start,
+            endsAt,
+            timeLimitMinutes: cleanTimeLimit,
+            questions: cleanQuestions,
+            status: start.getTime() <= Date.now() ? "open" : "scheduled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      const updatedQuiz = await getPublicQuiz(req.params.quizId);
+      res.json({ success: true, quiz: publicHelpers.publicQuiz(updatedQuiz, teacherId) });
+    } catch (err) {
+      console.error("Error preparing public quiz:", err);
+      res.status(500).json({ error: "Failed to prepare public quiz." });
+    }
+  });
+
+  router.post("/api/public-quizzes/:quizId/attend", async (req, res) => {
+    const mongoSession = client.startSession();
+    try {
+      const { userId } = req.body;
+      let responsePayload = null;
+
+      await mongoSession.withTransaction(async () => {
+        const userDoc = await userCollection.findOne({ uid: userId, role: "student" }, { session: mongoSession });
+        if (!userDoc) {
+          responsePayload = { status: 403, body: { error: "Only students can attend public quizzes." } };
+          return;
+        }
+        const quiz = await getPublicQuiz(req.params.quizId, mongoSession);
+        if (!quiz) {
+          responsePayload = { status: 404, body: { error: "Quiz not found." } };
+          return;
+        }
+        if (
+          quiz.category !== (userDoc.category || "school") ||
+          quiz.type !== (userDoc.type || "bangla_medium")
+        ) {
+          responsePayload = { status: 403, body: { error: "This quiz is not available for your category and medium." } };
+          return;
+        }
+        const status = publicHelpers.getQuizStatus(quiz);
+        if (!["scheduled", "open"].includes(status)) {
+          responsePayload = { status: 409, body: { error: "This quiz is not available to join right now." } };
+          return;
+        }
+        if (publicHelpers.getAttempt(quiz, userId)) {
+          responsePayload = { status: 200, body: { success: true, quiz: publicHelpers.publicQuiz(quiz, userId) } };
+          return;
+        }
+
+        const creditResult = await publicHelpers.spendQuizCredit(userId, mongoSession);
+        if (!creditResult.ok) {
+          responsePayload = { status: creditResult.status, body: { error: creditResult.message } };
+          return;
+        }
+
+        const attempt = {
+          studentId: userId,
+          joinedAt: new Date(),
+          creditDeducted: PUBLIC_QUIZ_ATTEND_CREDIT,
+          answers: {},
+          score: 0,
+          maxScore: (quiz.questions || []).length,
+        };
+        await publicQuizzes.updateOne(
+          { _id: quiz._id, "attempts.studentId": { $ne: userId } },
+          { $push: { attempts: attempt }, $set: { updatedAt: new Date() } },
+          { session: mongoSession }
+        );
+        const updatedQuiz = await getPublicQuiz(req.params.quizId, mongoSession);
+        responsePayload = {
+          status: 201,
+          body: {
+            success: true,
+            quiz: publicHelpers.publicQuiz(updatedQuiz, userId),
+            remainingCredit: creditResult.remainingCredit,
+          },
+        };
+      });
+
+      res.status(responsePayload.status).json(responsePayload.body);
+    } catch (err) {
+      console.error("Error attending public quiz:", err);
+      res.status(500).json({ error: "Failed to attend public quiz." });
+    } finally {
+      await mongoSession.endSession();
+    }
+  });
+
+  router.post("/api/public-quizzes/:quizId/submit", async (req, res) => {
+    const mongoSession = client.startSession();
+    try {
+      const { userId, answers = {} } = req.body;
+      let responsePayload = null;
+      await mongoSession.withTransaction(async () => {
+        const quiz = await getPublicQuiz(req.params.quizId, mongoSession);
+        if (!quiz) {
+          responsePayload = { status: 404, body: { error: "Quiz not found." } };
+          return;
+        }
+        const attempt = publicHelpers.getAttempt(quiz, userId);
+        if (!attempt) {
+          responsePayload = { status: 403, body: { error: "Attend this quiz before submitting." } };
+          return;
+        }
+        if (attempt.submittedAt) {
+          responsePayload = { status: 409, body: { error: "Quiz already submitted." } };
+          return;
+        }
+        if (publicHelpers.getQuizStatus(quiz) === "completed") {
+          responsePayload = { status: 409, body: { error: "This quiz is already completed." } };
+          return;
+        }
+
+        const scored = publicHelpers.scoreAnswers(quiz.questions || [], answers);
+        await publicQuizzes.updateOne(
+          { _id: quiz._id, "attempts.studentId": userId },
+          {
+            $set: {
+              "attempts.$.answers": scored.checkedAnswers,
+              "attempts.$.score": scored.score,
+              "attempts.$.maxScore": scored.maxScore,
+              "attempts.$.submittedAt": new Date(),
+              updatedAt: new Date(),
+            },
+          },
+          { session: mongoSession }
+        );
+
+        let updatedQuiz = await getPublicQuiz(req.params.quizId, mongoSession);
+        if (new Date(updatedQuiz.endsAt).getTime() <= Date.now()) {
+          const settled = await publicHelpers.settleQuiz(updatedQuiz._id.toString(), mongoSession);
+          updatedQuiz = settled.quiz;
+        }
+        responsePayload = { status: 200, body: { success: true, quiz: publicHelpers.publicQuiz(updatedQuiz, userId) } };
+      });
+      res.status(responsePayload.status).json(responsePayload.body);
+    } catch (err) {
+      console.error("Error submitting public quiz:", err);
+      res.status(500).json({ error: "Failed to submit public quiz." });
+    } finally {
+      await mongoSession.endSession();
+    }
+  });
+
+  router.post("/api/public-quizzes/:quizId/settle", async (req, res) => {
+    const mongoSession = client.startSession();
+    try {
+      const { teacherId } = req.body;
+      let responsePayload = null;
+      await mongoSession.withTransaction(async () => {
+        const quiz = await getPublicQuiz(req.params.quizId, mongoSession);
+        if (!quiz) {
+          responsePayload = { status: 404, body: { error: "Quiz not found." } };
+          return;
+        }
+        if (quiz.teacherId !== teacherId) {
+          responsePayload = { status: 403, body: { error: "Only the assigned teacher can finish this quiz." } };
+          return;
+        }
+        const settled = await publicHelpers.settleQuiz(quiz._id.toString(), mongoSession);
+        responsePayload = {
+          status: settled.ok ? 200 : settled.status,
+          body: settled.ok
+            ? { success: true, quiz: publicHelpers.publicQuiz(settled.quiz, teacherId) }
+            : { error: settled.message },
+        };
+      });
+      res.status(responsePayload.status).json(responsePayload.body);
+    } catch (err) {
+      console.error("Error settling public quiz:", err);
+      res.status(500).json({ error: "Failed to finish public quiz." });
+    } finally {
+      await mongoSession.endSession();
+    }
+  });
+
+  router.post("/api/public-quizzes/:quizId/rate", async (req, res) => {
+    const mongoSession = client.startSession();
+    try {
+      const { userId, rating } = req.body;
+      let responsePayload = null;
+      await mongoSession.withTransaction(async () => {
+        const quiz = await getPublicQuiz(req.params.quizId, mongoSession);
+        if (!quiz) {
+          responsePayload = { status: 404, body: { error: "Quiz not found." } };
+          return;
+        }
+        const result = await publicHelpers.applyQuizRating({ quiz, studentId: userId, rating, session: mongoSession });
+        if (!result.ok) {
+          responsePayload = { status: result.status, body: { error: result.message } };
+          return;
+        }
+        const updatedQuiz = await getPublicQuiz(req.params.quizId, mongoSession);
+        responsePayload = { status: 200, body: { success: true, quiz: publicHelpers.publicQuiz(updatedQuiz, userId) } };
+      });
+      res.status(responsePayload.status).json(responsePayload.body);
+    } catch (err) {
+      console.error("Error rating public quiz:", err);
+      res.status(500).json({ error: "Failed to rate public quiz." });
+    } finally {
+      await mongoSession.endSession();
     }
   });
 

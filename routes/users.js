@@ -1,5 +1,9 @@
 const { Router } = require("express");
-const { REFERRAL_REWARD_CREDIT, REFERRAL_REWARD_DURATION_HOURS } = require("../utils/constants");
+const {
+  REFERRAL_REWARD_CREDIT,
+  REFERRAL_REWARD_DURATION_HOURS,
+  TEACHER_EXPERIENCE_LEVELS,
+} = require("../utils/constants");
 
 module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, admin }) => {
   const router = Router();
@@ -33,6 +37,8 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
   router.post("/newTeacher", async (req, res) => {
     try {
       const user = req.body;
+      user.experience = Math.max(1, Number(user.experience) || 1);
+      user.totalPoints = Math.max(0, Number(user.totalPoints) || 0);
       const existingUser = await userCollection.findOne({ email: user.email });
 
       if (existingUser) {
@@ -180,6 +186,89 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
     } catch (err) {
       console.error("Error updating FCM token:", err);
       res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  const getTeacherLevelState = (teacher = {}) => {
+    const totalPoints = Number(teacher.totalPoints) || 0;
+    const currentLevel = Number(teacher.experience) || 1;
+    const highestUnlocked =
+      [...TEACHER_EXPERIENCE_LEVELS]
+        .reverse()
+        .find((item) => totalPoints >= item.points)?.level || 1;
+    const nextLevel = TEACHER_EXPERIENCE_LEVELS.find((item) => item.level === currentLevel + 1) || null;
+    const currentThreshold =
+      TEACHER_EXPERIENCE_LEVELS.find((item) => item.level === currentLevel)?.points || 0;
+    const nextThreshold = nextLevel?.points || currentThreshold;
+    const progressRange = Math.max(1, nextThreshold - currentThreshold);
+    const progress = nextLevel
+      ? Math.min(100, Math.max(0, ((totalPoints - currentThreshold) / progressRange) * 100))
+      : 100;
+
+    return {
+      totalPoints,
+      currentLevel,
+      highestUnlocked,
+      canClaim: highestUnlocked > currentLevel,
+      nextLevel,
+      nextRequiredPoints: nextLevel?.points || null,
+      pointsToNextLevel: nextLevel ? Math.max(0, nextLevel.points - totalPoints) : 0,
+      progress,
+      levels: TEACHER_EXPERIENCE_LEVELS,
+    };
+  };
+
+  router.get("/api/teachers/:teacherId/experience", async (req, res) => {
+    try {
+      const teacher = await userCollection.findOne({
+        uid: req.params.teacherId,
+        role: "teacher",
+      });
+      if (!teacher) return res.status(404).json({ error: "Teacher not found." });
+      res.json({ success: true, experience: getTeacherLevelState(teacher) });
+    } catch (err) {
+      console.error("Error fetching teacher experience:", err);
+      res.status(500).json({ error: "Failed to fetch teacher experience." });
+    }
+  });
+
+  router.post("/api/teachers/:teacherId/claim-level", async (req, res) => {
+    try {
+      const teacher = await userCollection.findOne({
+        uid: req.params.teacherId,
+        role: "teacher",
+      });
+      if (!teacher) return res.status(404).json({ error: "Teacher not found." });
+
+      const levelState = getTeacherLevelState(teacher);
+      if (!levelState.canClaim) {
+        return res.status(409).json({
+          error: levelState.nextLevel
+            ? `You need ${levelState.pointsToNextLevel} more total points to claim level ${levelState.nextLevel.level}.`
+            : "You already reached the highest teacher level.",
+          experience: levelState,
+        });
+      }
+
+      await userCollection.updateOne(
+        { uid: teacher.uid, role: "teacher" },
+        {
+          $set: {
+            experience: levelState.highestUnlocked,
+            levelClaimedAt: new Date(),
+          },
+        }
+      );
+
+      const updatedTeacher = await userCollection.findOne({ uid: teacher.uid });
+      res.json({
+        success: true,
+        userDoc: updatedTeacher,
+        experience: getTeacherLevelState(updatedTeacher),
+      });
+    } catch (err) {
+      console.error("Error claiming teacher level:", err);
+      res.status(500).json({ error: "Failed to claim teacher level." });
     }
   });
 

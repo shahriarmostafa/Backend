@@ -8,15 +8,28 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client }) =
   const router = Router();
 
   const getGeneralCallPoints = (totalSeconds) => {
-    if (totalSeconds >= 40 && totalSeconds < 180) return 2;
-    if (totalSeconds >= 180 && totalSeconds < 300) return 3;
-    if (totalSeconds >= 300 && totalSeconds < 600) return 5;
-    if (totalSeconds >= 600 && totalSeconds < 900) return 8;
-    if (totalSeconds >= 900 && totalSeconds < 1200) return 12;
-    if (totalSeconds >= 1200 && totalSeconds < 1500) return 15;
-    if (totalSeconds >= 1500) return 18;
-    return 0;
-  };
+    // Ignore extremely short calls
+    if (totalSeconds < 40) return 0;
+
+    // 40s - 3m
+    if (totalSeconds < 180) return 3;
+
+    // 3m - 5m
+    if (totalSeconds < 300) return 5;
+
+    // 5m - 10m
+    if (totalSeconds < 600) return 8;
+
+    // 10m - 15m
+    if (totalSeconds < 900) return 12;
+
+    // 15m - 20m
+    if (totalSeconds < 1200) return 16;
+
+    // 20m - 30m
+    if (totalSeconds < 1800) return 22;
+    return 28;
+};
 
   router.post("/start-call", async (req, res) => {
     try {

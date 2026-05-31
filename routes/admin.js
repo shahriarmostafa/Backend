@@ -1,7 +1,7 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 
-module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, databaseinmongo }) => {
+module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, publicQuizzes, databaseinmongo }) => {
   const router = Router();
 
   const calculateTotalTeacherPoints = async () => {
@@ -151,7 +151,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
   router.get("/download-link", (req, res) => {
     res.json({
-      url: "https://www.dropbox.com/scl/fi/syo7s5nvt44iq5sufn516/PoperL.apk?rlkey=w91illigslfci3lky1olytuub6&st=f2zjqc8g&dl=1",
+      url: "https://github.com/shahriarmostafa/The-release/releases/download/v1.0.0/PoperLApk.apk",
     });
   });
 
@@ -483,6 +483,213 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       const _id = req.params.id;
       const subjectsCollection = databaseinmongo.collection("subjects");
       await subjectsCollection.deleteOne({ _id: new ObjectId(_id) });
+      res.status(200).json({ success: true });
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ success: false });
+    }
+  });
+
+  router.get("/api/admin/public-quizzes", async (req, res) => {
+    try {
+      const { category, type, subject, teacherId } = req.query;
+      const filter = {};
+      if (category) filter.category = category;
+      if (type) filter.type = type;
+      if (subject) filter.subject = subject;
+      if (teacherId) filter.teacherId = teacherId;
+
+      const quizzes = await publicQuizzes
+        .find(filter)
+        .sort({ scheduledAt: -1, createdAt: -1 })
+        .limit(120)
+        .toArray();
+      const teacherIds = [...new Set(quizzes.map((quiz) => quiz.teacherId).filter(Boolean))];
+      const teachers = await userCollection.find({ uid: { $in: teacherIds } }).toArray();
+      const teachersById = teachers.reduce((acc, teacher) => {
+        acc[teacher.uid] = teacher;
+        return acc;
+      }, {});
+
+      res.json({
+        success: true,
+        quizzes: quizzes.map((quiz) => ({
+          ...quiz,
+          id: quiz._id.toString(),
+          teacher: teachersById[quiz.teacherId] || null,
+        })),
+      });
+    } catch (err) {
+      console.error("Error fetching admin public quizzes:", err);
+      res.status(500).json({ success: false, error: "Failed to fetch public quizzes." });
+    }
+  });
+
+  router.post("/api/admin/public-quizzes", async (req, res) => {
+    try {
+      const {
+        title,
+        category = "school",
+        type = "bangla_medium",
+        subject,
+        teacherId,
+      } = req.body;
+      const cleanTitle = String(title || `${subject || "Public"} quiz`).trim().slice(0, 120);
+      const cleanSubject = String(subject || "").trim();
+      const cleanCategory = ["school", "college", "university"].includes(category)
+        ? category
+        : "school";
+      const cleanType = ["english_medium", "bangla_medium"].includes(type)
+        ? type
+        : "bangla_medium";
+
+      if (!cleanSubject || !teacherId)
+        return res.status(400).json({ success: false, error: "subject and teacherId are required." });
+
+      const teacher = await userCollection.findOne({
+        uid: teacherId,
+        role: "teacher",
+        approved: true,
+        category: cleanCategory,
+        type: cleanType,
+        subjects: cleanSubject,
+      });
+      if (!teacher)
+        return res.status(404).json({ success: false, error: "Approved teacher not found for this subject." });
+
+      const now = new Date();
+      const doc = {
+        title: cleanTitle,
+        category: cleanCategory,
+        type: cleanType,
+        subject: cleanSubject,
+        teacherId,
+        status: "assigned",
+        questions: [],
+        attempts: [],
+        createdAt: now,
+        updatedAt: now,
+        assignedByAdmin: true,
+      };
+
+      const result = await publicQuizzes.insertOne(doc);
+      const quiz = await publicQuizzes.findOne({ _id: result.insertedId });
+      res.status(201).json({ success: true, quiz: { ...quiz, id: quiz._id.toString(), teacher } });
+    } catch (err) {
+      console.error("Error creating public quiz assignment:", err);
+      res.status(500).json({ success: false, error: "Failed to assign public quiz." });
+    }
+  });
+
+  router.patch("/api/admin/public-quizzes/:quizId", async (req, res) => {
+    try {
+      const { title, category, type, subject, teacherId } = req.body;
+      const quiz = await publicQuizzes.findOne({ _id: new ObjectId(req.params.quizId) });
+      if (!quiz) return res.status(404).json({ success: false, error: "Quiz not found." });
+      if (quiz.status === "completed")
+        return res.status(409).json({ success: false, error: "Completed public quizzes cannot be reassigned." });
+
+      const update = { updatedAt: new Date() };
+      if (typeof title === "string" && title.trim()) update.title = title.trim().slice(0, 120);
+      if (["school", "college", "university"].includes(category)) update.category = category;
+      if (["english_medium", "bangla_medium"].includes(type)) update.type = type;
+      if (typeof subject === "string" && subject.trim()) update.subject = subject.trim();
+      if (teacherId) {
+        const teacher = await userCollection.findOne({
+          uid: teacherId,
+          role: "teacher",
+          approved: true,
+          category: update.category || quiz.category,
+          type: update.type || quiz.type,
+          subjects: update.subject || quiz.subject,
+        });
+        if (!teacher)
+          return res.status(404).json({ success: false, error: "Approved teacher not found for this subject." });
+        update.teacherId = teacherId;
+      }
+
+      await publicQuizzes.updateOne({ _id: quiz._id }, { $set: update });
+      const updatedQuiz = await publicQuizzes.findOne({ _id: quiz._id });
+      res.json({ success: true, quiz: { ...updatedQuiz, id: updatedQuiz._id.toString() } });
+    } catch (err) {
+      console.error("Error updating public quiz assignment:", err);
+      res.status(500).json({ success: false, error: "Failed to update public quiz." });
+    }
+  });
+
+  router.delete("/api/admin/public-quizzes/:quizId", async (req, res) => {
+    try {
+      const quiz = await publicQuizzes.findOne({ _id: new ObjectId(req.params.quizId) });
+      if (!quiz) return res.status(404).json({ success: false, error: "Quiz not found." });
+      if (quiz.status === "completed")
+        return res.status(409).json({ success: false, error: "Completed public quiz results should not be deleted here." });
+      await publicQuizzes.deleteOne({ _id: quiz._id });
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error deleting public quiz assignment:", err);
+      res.status(500).json({ success: false, error: "Failed to delete public quiz." });
+    }
+  });
+
+  router.get("/active-packages", async (req, res) => {
+    try {
+      const { search, category, type, active } = req.query;
+      const filter = {};
+      if (category) filter.category = category;
+      if (type) filter.type = type;
+      if (active === "true") filter.isActive = true;
+      else if (active === "false") filter.isActive = { $ne: true };
+
+      let pkgList = await activepackages
+        .find(filter)
+        .sort({ purchasedAt: -1 })
+        .limit(200)
+        .toArray();
+
+      if (search) {
+        const s = search.toLowerCase();
+        pkgList = pkgList.filter(
+          (p) =>
+            (p.uid || "").toLowerCase().includes(s) ||
+            (p.packageName || "").toLowerCase().includes(s)
+        );
+      }
+
+      const uids = [...new Set(pkgList.map((p) => p.uid).filter(Boolean))];
+      const users = await userCollection
+        .find({ uid: { $in: uids } }, { projection: { uid: 1, email: 1, displayName: 1 } })
+        .toArray();
+      const userMap = {};
+      users.forEach((u) => { userMap[u.uid] = u; });
+
+      const data = pkgList.map((p) => ({
+        ...p,
+        email: userMap[p.uid]?.email || "",
+        userName: userMap[p.uid]?.displayName || "",
+      }));
+
+      res.status(200).json({ success: true, data });
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ success: false, data: [] });
+    }
+  });
+
+  router.patch("/active-packages/:uid", async (req, res) => {
+    try {
+      const { uid } = req.params;
+      const { packageName, category, type, credit, totalCredit, startDate, expiryDate, isActive, isUnlimited } = req.body;
+      const update = { updatedAt: new Date() };
+      if (packageName !== undefined) update.packageName = packageName;
+      if (category !== undefined) update.category = category;
+      if (type !== undefined) update.type = type;
+      if (credit !== undefined) update.credit = Number(credit);
+      if (totalCredit !== undefined) update.totalCredit = Number(totalCredit);
+      if (startDate !== undefined) update.startDate = startDate;
+      if (expiryDate !== undefined) update.expiryDate = expiryDate;
+      if (isActive !== undefined) update.isActive = Boolean(isActive);
+      if (isUnlimited !== undefined) update.isUnlimited = Boolean(isUnlimited);
+      await activepackages.updateOne({ uid }, { $set: update });
       res.status(200).json({ success: true });
     } catch (err) {
       console.log(err);

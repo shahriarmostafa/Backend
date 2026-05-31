@@ -57,6 +57,7 @@ async function run() {
       userCollection: db.collection("userCollection"),
       studyRooms: db.collection("studyRooms"),
       roomQuizzes: db.collection("roomQuizzes"),
+      publicQuizzes: db.collection("publicQuizzes"),
       databaseinmongo: db,
       client,
     };
