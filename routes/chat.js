@@ -1,6 +1,7 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
+const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 
 module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo, io }) => {
   const router = Router();
@@ -11,6 +12,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     studyRooms,
     activepackages,
   });
+  const supabaseStorage = makeSupabaseStorage();
 
   const hydrateChatListForUser = async (userId, chatCollection) => {
     const userChatDoc = await chatCollection.findOne({ _id: userId });
@@ -116,8 +118,11 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         senderId,
         text,
         imageUrl,
+        imagePath,
         audioUrl,
+        audioPath,
         fileUrl,
+        filePath,
         fileName,
         fileType,
         fileSize,
@@ -194,8 +199,11 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         ...(text && { text }),
         createdAt: new Date(),
         ...(imageUrl && { imageUrl }),
+        ...(imagePath && { imagePath }),
         ...(audioUrl && { audioUrl }),
+        ...(audioPath && { audioPath }),
         ...(fileUrl && { fileUrl }),
+        ...(filePath && { filePath }),
         ...(fileName && { fileName }),
         ...(fileType && { fileType }),
         ...(fileSize && { fileSize }),
@@ -245,6 +253,50 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     } catch (error) {
       console.error("Error sending message:", error);
       res.status(500).json({ error: "Internal server error." });
+    }
+  });
+
+  router.delete("/api/chats/:chatId", async (req, res) => {
+    try {
+      const { chatId } = req.params;
+      const { userId } = req.body || {};
+      if (!ObjectId.isValid(chatId)) return res.status(400).json({ error: "Invalid chatId." });
+      if (!userId) return res.status(400).json({ error: "userId is required." });
+
+      const chatCollection = databaseinmongo.collection("chatCollection");
+      const chatDB = databaseinmongo.collection("chatDB");
+      const userChatDoc = await chatCollection.findOne({ _id: userId, "chats.chatId": chatId });
+      if (!userChatDoc) return res.status(404).json({ error: "Chat not found for this user." });
+
+      const chatEntry = (userChatDoc.chats || []).find((item) => item.chatId === chatId);
+      if (chatEntry?.roomChat || chatEntry?.roomId)
+        return res.status(403).json({ error: "Room chats are deleted with the room by admin." });
+
+      const participants = await chatCollection
+        .find({ "chats.chatId": chatId }, { projection: { _id: 1 } })
+        .toArray();
+      const participantIds = participants.map((item) => item._id);
+      const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+      const storagePaths = supabaseStorage.collectMessageStoragePaths(chatDoc?.messages || []);
+      const storageResult = await supabaseStorage.deletePaths(storagePaths);
+      const folderStorageResult = await supabaseStorage.deleteFolders([`chats/${chatId}`]);
+
+      await chatDB.deleteOne({ _id: new ObjectId(chatId) });
+      await chatCollection.updateMany({}, { $pull: { chats: { chatId } } });
+
+      const updatedChatLists = await Promise.all(
+        participantIds.map((id) => hydrateChatListForUser(id, chatCollection))
+      );
+      participantIds.forEach((id, index) => {
+        const { chatList, unseenCount } = updatedChatLists[index];
+        io.to(id).emit("chatListUpdate", { chatList, unseenCount });
+      });
+      io.to(chatId).emit("chatDeleted", { chatId });
+
+      res.json({ success: true, storage: { files: storageResult, folders: folderStorageResult } });
+    } catch (err) {
+      console.error("Error deleting chat:", err);
+      res.status(500).json({ error: "Failed to delete chat." });
     }
   });
 

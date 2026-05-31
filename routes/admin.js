@@ -1,6 +1,7 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
+const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const {
   STUDY_ROOM_MAX_STUDENTS,
   STUDY_ROOM_MONTH_MS,
@@ -14,6 +15,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     ensureRoomChatSubscriptions,
     getUniqueRoomKeyword,
   } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes });
+  const supabaseStorage = makeSupabaseStorage();
 
   const getScopedFilter = (category, type) => {
     const filter = {};
@@ -983,15 +985,30 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     try {
       const room = await getAdminRoom(req.params.roomId);
       if (!room) return res.status(404).json({ success: false, error: "Room not found." });
+      const roomId = room._id.toString();
       const chatIds = (room.chats || []).map((chat) => chat.chatId).filter(ObjectId.isValid);
       const objectIds = chatIds.map((chatId) => new ObjectId(chatId));
+      const chatDocs = objectIds.length
+        ? await databaseinmongo.collection("chatDB").find({ _id: { $in: objectIds } }).toArray()
+        : [];
+      const chatStoragePaths = chatDocs.flatMap((chat) =>
+        supabaseStorage.collectMessageStoragePaths(chat.messages || [])
+      );
+      const storageResult = await supabaseStorage.deletePaths(chatStoragePaths);
+      const folderStorageResult = await supabaseStorage.deleteFolders([
+        `rooms/${roomId}`,
+        ...chatIds.map((chatId) => `chats/${chatId}`),
+      ]);
+
       await studyRooms.deleteOne({ _id: room._id });
       if (objectIds.length) await databaseinmongo.collection("chatDB").deleteMany({ _id: { $in: objectIds } });
+      if (roomQuizzes) await roomQuizzes.deleteMany({ roomId });
+      await databaseinmongo.collection("notifications").deleteMany({ scope: "room", scopeId: roomId });
       await databaseinmongo.collection("chatCollection").updateMany(
         {},
-        { $pull: { chats: { roomId: room._id.toString() } } }
+        { $pull: { chats: { roomId } } }
       );
-      res.json({ success: true });
+      res.json({ success: true, storage: { files: storageResult, folders: folderStorageResult } });
     } catch (err) {
       console.error("Error deleting admin study room:", err);
       res.status(500).json({ success: false, error: "Failed to delete study room." });
@@ -1099,6 +1116,10 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       const room = await getAdminRoom(req.params.roomId);
       if (!room) return res.status(404).json({ success: false, error: "Room not found." });
       const { chatId } = req.params;
+      const chatObjectId = ObjectId.isValid(chatId) ? new ObjectId(chatId) : null;
+      const chatDoc = chatObjectId ? await databaseinmongo.collection("chatDB").findOne({ _id: chatObjectId }) : null;
+      await supabaseStorage.deletePaths(supabaseStorage.collectMessageStoragePaths(chatDoc?.messages || []));
+      await supabaseStorage.deleteFolders([`chats/${chatId}`]);
       await studyRooms.updateOne(
         { _id: room._id },
         {
@@ -1106,7 +1127,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
           $set: { updatedAt: Date.now() },
         }
       );
-      if (ObjectId.isValid(chatId)) await databaseinmongo.collection("chatDB").deleteOne({ _id: new ObjectId(chatId) });
+      if (chatObjectId) await databaseinmongo.collection("chatDB").deleteOne({ _id: chatObjectId });
       await databaseinmongo.collection("chatCollection").updateMany(
         {},
         { $pull: { chats: { chatId } } }
