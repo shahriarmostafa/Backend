@@ -16,6 +16,15 @@ module.exports = {
   PUBLIC_QUIZ_REWARD_BASE_WINNERS: 10,
   PUBLIC_QUIZ_REWARD_WINNER_STEP: 5,
   PUBLIC_QUIZ_REWARD_MAX_WINNERS: 30,
+  COURSE_MARKETPLACE_COMMISSION_RATE: 0.2,
+  COURSE_TEACHER_POOL_RATE: 0.8,
+  COURSE_PERFORMANCE_WEIGHTS: {
+    classesTaken: 0.5,
+    ratings: 0.2,
+    completionOnTime: 0.2,
+    monthlyQuiz: 0.05,
+    resourcesShared: 0.05,
+  },
   TEACHER_EXPERIENCE_LEVELS: [
     { level: 1, points: 0 },
     { level: 2, points: 400 },

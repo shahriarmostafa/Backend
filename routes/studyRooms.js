@@ -145,6 +145,7 @@ module.exports = ({
         keyword,
         createdBy: userId,
         teacherControl: false,
+        quizExpenseEnabled: true,
         memberIds: [userId],
         memberStatuses: {
           [userId]: {

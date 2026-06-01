@@ -18,6 +18,7 @@ const makeStudentProgressHelpers = ({
   const callSession = databaseinmongo.collection("callSession");
   const chatCollection = databaseinmongo.collection("chatCollection");
   const chatDB = databaseinmongo.collection("chatDB");
+  const leaderboardSnapshots = databaseinmongo.collection("leaderboardSnapshots");
 
   const getQuizStats = async (collection, studentId, extraMatch = {}) => {
     const result = await collection
@@ -114,6 +115,26 @@ const makeStudentProgressHelpers = ({
       totalMinutes: Math.round((stats.totalSeconds || 0) / 60),
       totalCredit: stats.totalCredit || 0,
       lastClassAt: stats.lastClassAt || null,
+    };
+  };
+
+  const getRoomCallStats = async (studentId, roomId) => {
+    const result = await callSession
+      .aggregate([
+        { $match: { studentId, roomId, seconds: { $gt: 0 } } },
+        {
+          $group: {
+            _id: null,
+            classes: { $sum: 1 },
+            totalSeconds: { $sum: "$seconds" },
+          },
+        },
+      ])
+      .toArray();
+    const stats = result[0] || {};
+    return {
+      classes: stats.classes || 0,
+      learningMinutes: Math.round((stats.totalSeconds || 0) / 60),
     };
   };
 
@@ -286,7 +307,154 @@ const makeStudentProgressHelpers = ({
     };
   };
 
-  return { getStudentProgress };
+  const calculateXpFromProgress = (progress, roomId = null, roomCallStats = null) => {
+    if (!progress) return null;
+    const quizResults = progress.breakdowns?.quizResults || [];
+    const scopedQuizResults = roomId
+      ? quizResults.filter((quiz) => quiz.source === "room" && quiz.roomId === roomId)
+      : quizResults;
+    const quizSubmitted = scopedQuizResults.length;
+    const quizAverage = safePercent(
+      scopedQuizResults.reduce((sum, quiz) => sum + (Number(quiz.score) || 0), 0),
+      scopedQuizResults.reduce((sum, quiz) => sum + (Number(quiz.maxScore) || 0), 0)
+    );
+    const roomInfo = roomId ? (progress.breakdowns?.rooms?.rooms || []).find((room) => room.id === roomId) : null;
+    const learningMinutes = roomId ? Number(roomCallStats?.learningMinutes) || 0 : Number(progress.summary.totalMinutes) || 0;
+    const completedGoals = roomId ? Number(roomInfo?.goalsDone) || 0 : Number(progress.summary.completedRoomGoals) || 0;
+    const classes = roomId ? Number(roomCallStats?.classes) || 0 : Number(progress.summary.totalClasses) || 0;
+    const rewards = roomId
+      ? scopedQuizResults.reduce((sum, quiz) => sum + (Number(quiz.rewardCredit) || 0), 0)
+      : Number(progress.summary.totalRewards) || 0;
+    const xp =
+      quizSubmitted * 60 +
+      Math.round(quizAverage * 2) +
+      Math.round(learningMinutes * 1.5) +
+      completedGoals * 35 +
+      classes * 45 +
+      rewards;
+
+    return {
+      xp: Math.max(0, Math.round(xp)),
+      quizAverage,
+      quizSubmitted,
+      learningMinutes,
+      completedGoals,
+      classes,
+      rewards,
+    };
+  };
+
+  const upsertLeaderboardSnapshot = async ({ scope, scopeId = "public", student, stats }) => {
+    if (!student?.uid || !stats) return null;
+    const now = new Date();
+    const doc = {
+      scope,
+      scopeId,
+      studentId: student.uid,
+      displayName: student.displayName || student.name || "Student",
+      photoURL: student.photoURL || "",
+      category: student.category || "school",
+      type: student.type || "bangla_medium",
+      xp: stats.xp,
+      quizAverage: stats.quizAverage,
+      quizSubmitted: stats.quizSubmitted,
+      learningMinutes: stats.learningMinutes,
+      completedGoals: stats.completedGoals,
+      classes: stats.classes,
+      rewards: stats.rewards,
+      updatedAt: now,
+    };
+    await leaderboardSnapshots.updateOne(
+      { scope, scopeId, studentId: student.uid },
+      { $set: doc, $setOnInsert: { createdAt: now } },
+      { upsert: true }
+    );
+    return doc;
+  };
+
+  const refreshStudentXp = async (studentId) => {
+    const progress = await getStudentProgress(studentId);
+    if (!progress) return null;
+    const student = await userCollection.findOne(
+      { uid: studentId, role: "student" },
+      { projection: { uid: 1, displayName: 1, name: 1, photoURL: 1, category: 1, type: 1 } }
+    );
+    if (!student) return null;
+
+    const publicStats = calculateXpFromProgress(progress);
+    const publicDoc = await upsertLeaderboardSnapshot({
+      scope: "public",
+      scopeId: "public",
+      student,
+      stats: publicStats,
+    });
+    await userCollection.updateOne(
+      { uid: studentId },
+      {
+        $set: {
+          progressXp: {
+            xp: publicStats.xp,
+            quizAverage: publicStats.quizAverage,
+            learningMinutes: publicStats.learningMinutes,
+            updatedAt: new Date(),
+          },
+        },
+      }
+    );
+
+    const roomDocs = [];
+    for (const room of progress.breakdowns?.rooms?.rooms || []) {
+      const roomCallStats = await getRoomCallStats(studentId, room.id);
+      const stats = calculateXpFromProgress(progress, room.id, roomCallStats);
+      roomDocs.push(await upsertLeaderboardSnapshot({
+        scope: "room",
+        scopeId: room.id,
+        student,
+        stats,
+      }));
+    }
+
+    return { public: publicDoc, rooms: roomDocs.filter(Boolean) };
+  };
+
+  const refreshStudentXpInBackground = (studentId) => {
+    if (!studentId) return;
+    setImmediate(() => {
+      refreshStudentXp(studentId).catch((err) => {
+        console.error("Background XP refresh failed:", err);
+      });
+    });
+  };
+
+  const getLeaderboard = async ({ scope = "public", scopeId = "public", limit = 50, category, type }) => {
+    const filter = { scope, scopeId };
+    if (scope === "public" && category) filter.category = category;
+    if (scope === "public" && type) filter.type = type;
+    const items = await leaderboardSnapshots
+      .find(filter)
+      .sort({ xp: -1, quizAverage: -1, learningMinutes: -1, updatedAt: 1 })
+      .limit(Math.min(Math.max(Number(limit) || 50, 1), 100))
+      .toArray();
+    return items.map((item, index) => ({
+      id: item._id.toString(),
+      rank: index + 1,
+      studentId: item.studentId,
+      displayName: item.displayName,
+      photoURL: item.photoURL,
+      category: item.category,
+      type: item.type,
+      xp: item.xp || 0,
+      quizAverage: item.quizAverage || 0,
+      quizSubmitted: item.quizSubmitted || 0,
+      learningMinutes: item.learningMinutes || 0,
+      completedGoals: item.completedGoals || 0,
+      classes: item.classes || 0,
+      rewards: item.rewards || 0,
+      updatedAt: item.updatedAt,
+    }));
+  };
+
+  return { getStudentProgress, refreshStudentXp, refreshStudentXpInBackground, getLeaderboard };
 };
 
 module.exports = { makeStudentProgressHelpers };

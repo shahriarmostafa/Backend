@@ -121,9 +121,13 @@ const makeQuizHelpers = ({
     return rewards;
   };
 
-  const settleQuiz = async (quizId, session = null) => {
+  const settleQuiz = async (quizId, session = null, options = {}) => {
     const quiz = await quizCollection.findOne({ _id: new ObjectId(quizId) }, { session });
     if (!quiz) return { ok: false, status: 404, message: "Quiz not found." };
+    const economyEnabled =
+      options.economyEnabled !== undefined
+        ? options.economyEnabled !== false
+        : quiz.quizExpenseEnabled !== false;
     if (quiz.status === "completed" || quiz.settledAt)
       return { ok: true, alreadySettled: true, quiz };
 
@@ -132,12 +136,14 @@ const makeQuizHelpers = ({
       (sum, attempt) => sum + (Number(attempt.creditDeducted) || 0),
       0
     );
-    const winnerCount = getWinnerCount
-      ? getWinnerCount(submittedAttempts.length)
-      : submittedAttempts.length > 5
-      ? 3
-      : submittedAttempts.length
-      ? 1
+    const winnerCount = economyEnabled
+      ? getWinnerCount
+        ? getWinnerCount(submittedAttempts.length)
+        : submittedAttempts.length > 5
+        ? 3
+        : submittedAttempts.length
+        ? 1
+        : 0
       : 0;
     const sortedAttempts = [...submittedAttempts].sort((a, b) => {
       if ((Number(b.score) || 0) !== (Number(a.score) || 0))
@@ -145,7 +151,7 @@ const makeQuizHelpers = ({
       return new Date(a.submittedAt || 0) - new Date(b.submittedAt || 0);
     });
     const winners = sortedAttempts.slice(0, winnerCount);
-    const rewardPool = Math.round(totalCollectedCredit * rewardPoolRate);
+    const rewardPool = economyEnabled ? Math.round(totalCollectedCredit * rewardPoolRate) : 0;
     const rewardAmounts = distributeRewards(rewardPool, winnerCount);
     const winnerRewards = winners.map((attempt, index) => ({
       studentId: attempt.studentId,
@@ -163,7 +169,7 @@ const makeQuizHelpers = ({
       }
     }
 
-    const teacherBasePoints = Math.ceil(((quiz.questions || []).length || 0) / 2);
+    const teacherBasePoints = economyEnabled ? Math.ceil(((quiz.questions || []).length || 0) / 2) : 0;
     if (teacherBasePoints > 0 && quiz.teacherId) {
       await userCollection.updateOne(
         { uid: quiz.teacherId },
@@ -189,9 +195,10 @@ const makeQuizHelpers = ({
           settlement: {
             totalCollectedCredit,
             rewardPool,
-            rewardRate: rewardPoolRate,
+            rewardRate: economyEnabled ? rewardPoolRate : 0,
             winners: winnerRewards,
             teacherBasePoints,
+            economyEnabled,
           },
         },
       },
@@ -202,7 +209,7 @@ const makeQuizHelpers = ({
     return { ok: true, quiz: settledQuiz };
   };
 
-  const applyQuizRating = async ({ quiz, studentId, rating, session = null }) => {
+  const applyQuizRating = async ({ quiz, studentId, rating, session = null, economyEnabled = undefined }) => {
     const normalizedRating = Math.min(Math.max(Number(rating) || 0, 1), 5);
     const attempt = getAttempt(quiz, studentId);
     if (!attempt?.submittedAt)
@@ -210,9 +217,13 @@ const makeQuizHelpers = ({
     if (attempt.rating)
       return { ok: false, status: 409, message: "You already rated this quiz." };
 
+    const shouldApplyEconomy =
+      economyEnabled !== undefined ? economyEnabled !== false : quiz.quizExpenseEnabled !== false;
     let pointDelta = 0;
-    if (normalizedRating === 5) pointDelta = 1;
-    else if (normalizedRating < 4) pointDelta = normalizedRating <= 2 ? -2 : -1;
+    if (shouldApplyEconomy) {
+      if (normalizedRating === 5) pointDelta = 1;
+      else if (normalizedRating < 4) pointDelta = normalizedRating <= 2 ? -2 : -1;
+    }
 
     if (pointDelta !== 0 && quiz.teacherId) {
       await userCollection.updateOne(
@@ -242,6 +253,7 @@ const makeQuizHelpers = ({
     const status = getQuizStatus(quiz);
     const attempt = viewerId ? getAttempt(quiz, viewerId) : null;
     const canShowAnswers = status === "completed" || (viewerId && viewerId === quiz.teacherId);
+    const economyEnabled = quiz.quizExpenseEnabled !== false;
     return {
       ...quiz,
       id: quiz._id.toString(),
@@ -254,9 +266,10 @@ const makeQuizHelpers = ({
       myAttempt: attempt || null,
       attempts: canShowAnswers ? quiz.attempts || [] : undefined,
       constants: {
-        attendCredit,
-        rewardRate: rewardPoolRate,
+        attendCredit: economyEnabled ? attendCredit : 0,
+        rewardRate: economyEnabled ? rewardPoolRate : 0,
         maxQuestions,
+        economyEnabled,
       },
     };
   };

@@ -2,14 +2,44 @@ const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 
-module.exports = ({ databaseinmongo, userCollection, studyRooms }) => {
+const ALLOWED_ANNOUNCEMENT_FILE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+]);
+
+const sanitizeAnnouncementAttachments = (attachments = []) => {
+  if (!Array.isArray(attachments)) return [];
+  return attachments
+    .slice(0, 5)
+    .map((attachment) => ({
+      name: String(attachment?.name || "Attachment").trim().slice(0, 120),
+      url: String(attachment?.url || "").trim(),
+      path: String(attachment?.path || "").trim(),
+      type: String(attachment?.type || "").trim(),
+      size: Math.max(0, Number(attachment?.size) || 0),
+    }))
+    .filter((attachment) => {
+      if (!attachment.url || !attachment.path) return false;
+      if (ALLOWED_ANNOUNCEMENT_FILE_TYPES.has(attachment.type)) return true;
+      const name = attachment.name.toLowerCase();
+      return /\.(jpe?g|png|webp|gif|pdf|docx|pptx)$/.test(name);
+    });
+};
+
+module.exports = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
   const router = Router();
   const {
     createRoomNotification,
+    createCourseNotification,
     getScopedNotifications,
     getUnreadCount,
     markNotificationsRead,
-  } = makeNotificationHelpers({ databaseinmongo, userCollection, studyRooms });
+  } = makeNotificationHelpers({ databaseinmongo, userCollection, studyRooms, courses });
 
   const getRoomAccess = async (roomId, userId) => {
     if (!ObjectId.isValid(roomId) || !userId) return { allowed: false };
@@ -20,9 +50,19 @@ module.exports = ({ databaseinmongo, userCollection, studyRooms }) => {
     return { allowed: isStudent || isTeacher, room };
   };
 
+  const getCourseAccess = async (courseId, userId) => {
+    if (!ObjectId.isValid(courseId) || !userId) return { allowed: false };
+    const course = await courses.findOne({ _id: new ObjectId(courseId) });
+    if (!course) return { allowed: false, status: 404, message: "Course not found." };
+    const isTeacher = course.teacherId === userId;
+    const isStudent = (course.enrollments || []).some((enrollment) => enrollment.studentId === userId && enrollment.status !== "cancelled");
+    return { allowed: isTeacher || isStudent, course };
+  };
+
   const assertScopedAccess = async ({ scope, scopeId, userId }) => {
-    if (scope !== "room") return { allowed: false, status: 400, message: "Unsupported notification scope." };
-    return getRoomAccess(scopeId, userId);
+    if (scope === "room") return getRoomAccess(scopeId, userId);
+    if (scope === "course") return getCourseAccess(scopeId, userId);
+    return { allowed: false, status: 400, message: "Unsupported notification scope." };
   };
 
   router.get("/api/notifications", async (req, res) => {
@@ -81,23 +121,31 @@ module.exports = ({ databaseinmongo, userCollection, studyRooms }) => {
         actorRole = "",
         title = "Announcement",
         message,
+        attachments = [],
       } = req.body;
       const access = await assertScopedAccess({ scope, scopeId, userId: actorId });
       if (!access.allowed)
         return res.status(access.status || 403).json({ error: access.message || "Not allowed." });
+      if (scope === "course" && access.course?.teacherId !== actorId)
+        return res.status(403).json({ error: "Only the course teacher can post course announcements." });
 
       const cleanMessage = String(message || "").trim();
-      if (!cleanMessage) return res.status(400).json({ error: "Announcement message is required." });
+      const cleanAttachments = sanitizeAnnouncementAttachments(attachments);
+      if (!cleanMessage && !cleanAttachments.length)
+        return res.status(400).json({ error: "Announcement message or file is required." });
 
-      const result = await createRoomNotification({
-        room: access.room,
+      const payload = {
         type: "announcement",
         title: String(title || "Announcement").trim().slice(0, 80),
         message: cleanMessage,
         actorId,
         actorRole,
-        metadata: { announcement: true },
-      });
+        metadata: { announcement: true, attachments: cleanAttachments },
+      };
+      const result =
+        scope === "course"
+          ? await createCourseNotification({ course: access.course, ...payload })
+          : await createRoomNotification({ room: access.room, ...payload });
 
       res.status(201).json({ success: true, notificationCreated: result.ok });
     } catch (err) {

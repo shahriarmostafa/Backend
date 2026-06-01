@@ -878,6 +878,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
         maxStudents = STUDY_ROOM_MAX_STUDENTS,
         freeAccess = true,
         creditExpenseEnabled = false,
+        quizExpenseEnabled = true,
         teacherControl = false,
         studentEmails = [],
       } = req.body;
@@ -922,6 +923,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
         createdByAdmin: true,
         freeAccess: Boolean(freeAccess),
         creditExpenseEnabled: Boolean(creditExpenseEnabled),
+        quizExpenseEnabled: quizExpenseEnabled !== false,
         teacherControl: Boolean(teacherControl),
         teacherClassEnabled: Boolean(teacherControl),
         memberIds,
@@ -952,7 +954,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     try {
       const room = await getAdminRoom(req.params.roomId);
       if (!room) return res.status(404).json({ success: false, error: "Room not found." });
-      const { name, visibility, category, type, maxStudents, freeAccess, creditExpenseEnabled, teacherControl } = req.body;
+      const { name, visibility, category, type, maxStudents, freeAccess, creditExpenseEnabled, quizExpenseEnabled, teacherControl } = req.body;
       const update = { updatedAt: Date.now() };
       if (typeof name === "string" && name.trim()) update.name = name.trim();
       if (visibility === "public" || visibility === "private") update.visibility = visibility;
@@ -961,6 +963,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       if (maxStudents !== undefined) update.maxStudents = Math.max(1, Number(maxStudents) || STUDY_ROOM_MAX_STUDENTS);
       if (freeAccess !== undefined) update.freeAccess = Boolean(freeAccess);
       if (creditExpenseEnabled !== undefined) update.creditExpenseEnabled = Boolean(creditExpenseEnabled);
+      if (quizExpenseEnabled !== undefined) update.quizExpenseEnabled = Boolean(quizExpenseEnabled);
       if (teacherControl !== undefined) {
         update.teacherControl = Boolean(teacherControl);
         update.teacherClassEnabled = Boolean(teacherControl);

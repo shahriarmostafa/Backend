@@ -15,9 +15,17 @@ const getRoomNotificationRecipients = (room = {}) => {
   return uniqueIds([...studentIds, ...teacherIds]);
 };
 
-const makeNotificationHelpers = ({ databaseinmongo, userCollection, studyRooms }) => {
+const getCourseNotificationRecipients = (course = {}) => {
+  const studentIds = (course.enrollments || [])
+    .filter((enrollment) => enrollment.status !== "cancelled")
+    .map((enrollment) => enrollment.studentId);
+  return uniqueIds([course.teacherId, ...studentIds]);
+};
+
+const makeNotificationHelpers = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
   const notifications = databaseinmongo.collection("notifications");
   const roomsCollection = studyRooms || databaseinmongo.collection("studyRooms");
+  const coursesCollection = courses || databaseinmongo.collection("courses");
 
   const getActorSnapshot = async (actorId) => {
     if (!actorId || !userCollection) return null;
@@ -114,6 +122,38 @@ const makeNotificationHelpers = ({ databaseinmongo, userCollection, studyRooms }
     });
   };
 
+  const createCourseNotification = async ({
+    course,
+    courseId,
+    type,
+    title,
+    message = "",
+    actorId = "",
+    actorRole = "",
+    metadata = {},
+    dedupeKey = "",
+  }) => {
+    const targetCourse =
+      course ||
+      (ObjectId.isValid(courseId)
+        ? await coursesCollection.findOne({ _id: new ObjectId(courseId) })
+        : null);
+    if (!targetCourse) return { ok: false, reason: "course_not_found" };
+
+    return createNotification({
+      scope: "course",
+      scopeId: asStringId(targetCourse._id),
+      type,
+      title,
+      message,
+      actorId,
+      actorRole,
+      recipients: getCourseNotificationRecipients(targetCourse),
+      metadata: { courseId: asStringId(targetCourse._id), courseTitle: targetCourse.title || "", ...metadata },
+      dedupeKey,
+    });
+  };
+
   const getScopedNotifications = async ({ scope, scopeId, userId, limit = 80 }) => {
     const items = await notifications
       .find({ scope, scopeId: asStringId(scopeId), recipients: userId })
@@ -165,11 +205,13 @@ const makeNotificationHelpers = ({ databaseinmongo, userCollection, studyRooms }
   return {
     createNotification,
     createRoomNotification,
+    createCourseNotification,
     getRoomNotificationRecipients,
+    getCourseNotificationRecipients,
     getScopedNotifications,
     getUnreadCount,
     markNotificationsRead,
   };
 };
 
-module.exports = { makeNotificationHelpers, getRoomNotificationRecipients };
+module.exports = { makeNotificationHelpers, getRoomNotificationRecipients, getCourseNotificationRecipients };

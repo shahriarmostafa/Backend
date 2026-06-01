@@ -217,6 +217,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       memberStatuses: buildMemberStatuses(room),
       maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
       teacherControl: room.teacherControl === true,
+      quizExpenseEnabled: room.quizExpenseEnabled !== false,
       members,
       progress,
       teacherSessions: (room.teacherSessions || []).map((session) => ({
@@ -237,6 +238,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       roomName: room.name,
       roomKeyword: room.keyword,
       teacherControl: room.teacherControl === true,
+      quizExpenseEnabled: room.quizExpenseEnabled !== false,
       memberIds: room.memberIds || [],
       memberCount: (room.memberIds || []).length,
       maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,

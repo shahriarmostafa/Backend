@@ -49,6 +49,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   const assertActiveStudent = (room, userId) =>
     userId && (room.memberIds || []).includes(userId) && getRoomMembership(room, userId).isActive;
 
+  const publicRoomQuiz = (quiz, viewerId, room) =>
+    publicQuiz(
+      quiz && room ? { ...quiz, quizExpenseEnabled: room.quizExpenseEnabled !== false } : quiz,
+      viewerId
+    );
+
   router.get("/api/study-rooms/:roomId/quizzes", async (req, res) => {
     try {
       const { userId } = req.query;
@@ -58,6 +64,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         (room.memberIds || []).includes(userId) ||
         (room.teacherSessions || []).some((session) => session.teacherId === userId);
       if (!isAllowed) return res.status(403).json({ error: "Join this room to view quizzes." });
+      const quizEconomyEnabled = room.quizExpenseEnabled !== false;
 
       const quizzes = await roomQuizzes
         .find({ roomId: req.params.roomId })
@@ -71,11 +78,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
       res.json({
         success: true,
-        quizzes: visibleQuizzes.map((quiz) => publicQuiz(quiz, userId)),
+        quizzes: visibleQuizzes.map((quiz) => publicRoomQuiz(quiz, userId, room)),
         constants: {
-          attendCredit: ROOM_QUIZ_ATTEND_CREDIT,
-          rewardRate: ROOM_QUIZ_REWARD_POOL_RATE,
+          attendCredit: quizEconomyEnabled ? ROOM_QUIZ_ATTEND_CREDIT : 0,
+          rewardRate: quizEconomyEnabled ? ROOM_QUIZ_REWARD_POOL_RATE : 0,
           maxQuestions: ROOM_QUIZ_MAX_QUESTIONS,
+          economyEnabled: quizEconomyEnabled,
         },
       });
     } catch (err) {
@@ -94,7 +102,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         roomId: req.params.roomId,
       });
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
-      res.json({ success: true, quiz: publicQuiz(quiz, userId) });
+      res.json({ success: true, quiz: publicRoomQuiz(quiz, userId, room) });
     } catch (err) {
       console.error("Error fetching room quiz:", err);
       res.status(500).json({ error: "Failed to fetch quiz." });
@@ -120,6 +128,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         teacherId,
         requestedBy: userId,
         requesters: [userId],
+        quizExpenseEnabled: room.quizExpenseEnabled !== false,
         status: "requested",
         questions: [],
         attempts: [],
@@ -137,7 +146,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         metadata: { quizId: result.insertedId.toString(), teacherId, subject: doc.subject },
       });
       const quiz = await roomQuizzes.findOne({ _id: result.insertedId });
-      res.status(201).json({ success: true, quiz: publicQuiz(quiz, userId) });
+      res.status(201).json({ success: true, quiz: publicRoomQuiz(quiz, userId, room) });
     } catch (err) {
       console.error("Error requesting room quiz:", err);
       res.status(500).json({ error: "Failed to request quiz." });
@@ -165,6 +174,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         requestedBy: teacherId,
         requesters: [],
         teacherCreated: true,
+        quizExpenseEnabled: room.quizExpenseEnabled !== false,
         status: "draft",
         questions: [],
         attempts: [],
@@ -173,7 +183,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       };
       const result = await roomQuizzes.insertOne(doc);
       const quiz = await roomQuizzes.findOne({ _id: result.insertedId });
-      res.status(201).json({ success: true, quiz: publicQuiz(quiz, teacherId) });
+      res.status(201).json({ success: true, quiz: publicRoomQuiz(quiz, teacherId, room) });
     } catch (err) {
       console.error("Error creating controlled room quiz:", err);
       res.status(500).json({ error: "Failed to create quiz." });
@@ -220,6 +230,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
             endsAt,
             timeLimitMinutes: cleanTimeLimit,
             questions: cleanQuestions,
+            quizExpenseEnabled: room.quizExpenseEnabled !== false,
             status: start.getTime() <= Date.now() ? "open" : "scheduled",
             updatedAt: new Date(),
           },
@@ -242,7 +253,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         },
         dedupeKey: `room-quiz-${quizStarted ? "started" : "published"}:${updatedQuiz._id.toString()}`,
       });
-      res.json({ success: true, quiz: publicQuiz(updatedQuiz, teacherId) });
+      res.json({ success: true, quiz: publicRoomQuiz(updatedQuiz, teacherId, room) });
     } catch (err) {
       console.error("Error preparing room quiz:", err);
       res.status(500).json({ error: "Failed to prepare quiz." });
@@ -269,6 +280,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           };
           return;
         }
+        const quizEconomyEnabled = room.quizExpenseEnabled !== false;
         const quiz = await roomQuizzes.findOne(
           { _id: new ObjectId(req.params.quizId), roomId: req.params.roomId },
           { session: mongoSession }
@@ -289,20 +301,23 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           };
         }
         if (getAttempt(quiz, userId)) {
-          responsePayload = { status: 200, body: { success: true, quiz: publicQuiz(quiz, userId) } };
+          responsePayload = { status: 200, body: { success: true, quiz: publicRoomQuiz(quiz, userId, room) } };
           return;
         }
 
-        const creditResult = await spendQuizCredit(userId, mongoSession);
-        if (!creditResult.ok) {
-          responsePayload = { status: creditResult.status, body: { error: creditResult.message } };
-          return;
+        let creditResult = { ok: true, remainingCredit: null };
+        if (quizEconomyEnabled) {
+          creditResult = await spendQuizCredit(userId, mongoSession);
+          if (!creditResult.ok) {
+            responsePayload = { status: creditResult.status, body: { error: creditResult.message } };
+            return;
+          }
         }
 
         const attempt = {
           studentId: userId,
           joinedAt: new Date(),
-          creditDeducted: ROOM_QUIZ_ATTEND_CREDIT,
+          creditDeducted: quizEconomyEnabled ? ROOM_QUIZ_ATTEND_CREDIT : 0,
           answers: {},
           score: 0,
           maxScore: (quiz.questions || []).length,
@@ -317,7 +332,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           status: 201,
           body: {
             success: true,
-            quiz: publicQuiz(updatedQuiz, userId),
+            quiz: publicRoomQuiz(updatedQuiz, userId, room),
             remainingCredit: creditResult.remainingCredit,
           },
         };
@@ -354,6 +369,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       const { userId, answers = {} } = req.body;
       let responsePayload = null;
       await mongoSession.withTransaction(async () => {
+        const room = await getRoom(req.params.roomId);
+        if (!room) {
+          responsePayload = { status: 404, body: { error: "Room not found." } };
+          return;
+        }
+        const quizEconomyEnabled = room.quizExpenseEnabled !== false;
         const quiz = await roomQuizzes.findOne(
           { _id: new ObjectId(req.params.quizId), roomId: req.params.roomId },
           { session: mongoSession }
@@ -393,10 +414,10 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
         let updatedQuiz = await roomQuizzes.findOne({ _id: quiz._id }, { session: mongoSession });
         if (new Date(updatedQuiz.endsAt).getTime() <= Date.now()) {
-          const settled = await settleQuiz(updatedQuiz._id.toString(), mongoSession);
+          const settled = await settleQuiz(updatedQuiz._id.toString(), mongoSession, { economyEnabled: quizEconomyEnabled });
           updatedQuiz = settled.quiz;
         }
-        responsePayload = { status: 200, body: { success: true, quiz: publicQuiz(updatedQuiz, userId) } };
+        responsePayload = { status: 200, body: { success: true, quiz: publicRoomQuiz(updatedQuiz, userId, room) } };
       });
       res.status(responsePayload.status).json(responsePayload.body);
     } catch (err) {
@@ -414,6 +435,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       let responsePayload = null;
       let resultsNotification = null;
       await mongoSession.withTransaction(async () => {
+        const room = await getRoom(req.params.roomId);
+        if (!room) {
+          responsePayload = { status: 404, body: { error: "Room not found." } };
+          return;
+        }
+        const quizEconomyEnabled = room.quizExpenseEnabled !== false;
         const quiz = await roomQuizzes.findOne(
           { _id: new ObjectId(req.params.quizId), roomId: req.params.roomId },
           { session: mongoSession }
@@ -426,7 +453,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           responsePayload = { status: 403, body: { error: "Only the quiz teacher can finish it." } };
           return;
         }
-        const settled = await settleQuiz(quiz._id.toString(), mongoSession);
+        const settled = await settleQuiz(quiz._id.toString(), mongoSession, { economyEnabled: quizEconomyEnabled });
         if (settled.ok) {
           resultsNotification = {
             type: "room_quiz_results",
@@ -441,7 +468,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         responsePayload = {
           status: settled.ok ? 200 : settled.status,
           body: settled.ok
-            ? { success: true, quiz: publicQuiz(settled.quiz, teacherId) }
+            ? { success: true, quiz: publicRoomQuiz(settled.quiz, teacherId, room) }
             : { error: settled.message },
         };
       });
@@ -466,6 +493,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       const { userId, rating } = req.body;
       let responsePayload = null;
       await mongoSession.withTransaction(async () => {
+        const room = await getRoom(req.params.roomId);
+        if (!room) {
+          responsePayload = { status: 404, body: { error: "Room not found." } };
+          return;
+        }
+        const quizEconomyEnabled = room.quizExpenseEnabled !== false;
         const quiz = await roomQuizzes.findOne(
           { _id: new ObjectId(req.params.quizId), roomId: req.params.roomId },
           { session: mongoSession }
@@ -474,13 +507,13 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           responsePayload = { status: 404, body: { error: "Quiz not found." } };
           return;
         }
-        const result = await applyQuizRating({ quiz, studentId: userId, rating, session: mongoSession });
+        const result = await applyQuizRating({ quiz, studentId: userId, rating, session: mongoSession, economyEnabled: quizEconomyEnabled });
         if (!result.ok) {
           responsePayload = { status: result.status, body: { error: result.message } };
           return;
         }
         const updatedQuiz = await roomQuizzes.findOne({ _id: quiz._id }, { session: mongoSession });
-        responsePayload = { status: 200, body: { success: true, quiz: publicQuiz(updatedQuiz, userId) } };
+        responsePayload = { status: 200, body: { success: true, quiz: publicRoomQuiz(updatedQuiz, userId, room) } };
       });
       res.status(responsePayload.status).json(responsePayload.body);
     } catch (err) {
