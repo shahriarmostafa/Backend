@@ -16,8 +16,6 @@ const makeStudentProgressHelpers = ({
   publicQuizzes,
 }) => {
   const callSession = databaseinmongo.collection("callSession");
-  const chatCollection = databaseinmongo.collection("chatCollection");
-  const chatDB = databaseinmongo.collection("chatDB");
   const leaderboardSnapshots = databaseinmongo.collection("leaderboardSnapshots");
 
   const getQuizStats = async (collection, studentId, extraMatch = {}) => {
@@ -36,7 +34,6 @@ const makeStudentProgressHelpers = ({
             totalScore: { $sum: { $ifNull: ["$attempts.score", 0] } },
             totalMaxScore: { $sum: { $ifNull: ["$attempts.maxScore", 0] } },
             totalRewards: { $sum: { $ifNull: ["$attempts.rewardCredit", 0] } },
-            lastSubmittedAt: { $max: "$attempts.submittedAt" },
           },
         },
       ])
@@ -50,7 +47,6 @@ const makeStudentProgressHelpers = ({
       totalMaxScore: stats.totalMaxScore || 0,
       averageScore: safePercent(stats.totalScore || 0, stats.totalMaxScore || 0),
       totalRewards: stats.totalRewards || 0,
-      lastSubmittedAt: stats.lastSubmittedAt || null,
     };
   };
 
@@ -102,7 +98,6 @@ const makeStudentProgressHelpers = ({
             classes: { $sum: 1 },
             totalSeconds: { $sum: "$seconds" },
             totalCredit: { $sum: { $ifNull: ["$creditDeducted", 0] } },
-            lastClassAt: { $max: "$endedAt" },
           },
         },
       ])
@@ -114,7 +109,6 @@ const makeStudentProgressHelpers = ({
       totalSeconds: stats.totalSeconds || 0,
       totalMinutes: Math.round((stats.totalSeconds || 0) / 60),
       totalCredit: stats.totalCredit || 0,
-      lastClassAt: stats.lastClassAt || null,
     };
   };
 
@@ -169,71 +163,14 @@ const makeStudentProgressHelpers = ({
     };
   };
 
-  const getChatStats = async (studentId) => {
-    const chatDoc = await chatCollection.findOne({ _id: studentId });
-    const chats = chatDoc?.chats || [];
-    const chatIds = chats.map((chat) => chat.chatId).filter(Boolean);
-    if (!chatIds.length) {
-      return {
-        generalChats: 0,
-        roomChats: 0,
-        sentMessages: 0,
-        generalMessages: 0,
-        roomMessages: 0,
-        lastMessageAt: null,
-      };
-    }
-
-    const objectIds = chatIds.map((chatId) => {
-      try {
-        return new (require("mongodb").ObjectId)(chatId);
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
-    const roomChatIds = new Set(chats.filter((chat) => chat.roomChat).map((chat) => chat.chatId));
-
-    const docs = objectIds.length
-      ? await chatDB.find({ _id: { $in: objectIds } }).project({ messages: 1 }).toArray()
-      : [];
-
-    let sentMessages = 0;
-    let generalMessages = 0;
-    let roomMessages = 0;
-    let lastMessageAt = null;
-    docs.forEach((doc) => {
-      const chatId = doc._id.toString();
-      (doc.messages || []).forEach((message) => {
-        if (message.senderId !== studentId) return;
-        sentMessages += 1;
-        if (roomChatIds.has(chatId)) roomMessages += 1;
-        else generalMessages += 1;
-        const createdAt = message.createdAt ? new Date(message.createdAt) : null;
-        if (createdAt && !Number.isNaN(createdAt.getTime())) {
-          if (!lastMessageAt || createdAt > lastMessageAt) lastMessageAt = createdAt;
-        }
-      });
-    });
-
-    return {
-      generalChats: chats.filter((chat) => !chat.roomChat).length,
-      roomChats: chats.filter((chat) => chat.roomChat).length,
-      sentMessages,
-      generalMessages,
-      roomMessages,
-      lastMessageAt,
-    };
-  };
-
   const getStudentProgress = async (studentId) => {
     const student = await userCollection.findOne({ uid: studentId, role: "student" });
     if (!student) return null;
 
-    const [generalClasses, publicQuizzesStats, roomStats, chatStats, publicQuizResults] = await Promise.all([
+    const [generalClasses, publicQuizzesStats, roomStats, publicQuizResults] = await Promise.all([
       getCallStats(studentId, false),
       getQuizStats(publicQuizzes, studentId),
       getRoomStats(studentId),
-      getChatStats(studentId),
       getQuizResults(publicQuizzes, studentId, "public"),
     ]);
     const roomIds = (roomStats.rooms || []).map((room) => room.id);
@@ -262,7 +199,6 @@ const makeStudentProgressHelpers = ({
       joinedRooms: roomStats.joinedRooms,
       activeRooms: roomStats.activeRooms,
       completedRoomGoals: roomStats.completedGoals,
-      sentMessages: chatStats.sentMessages,
       totalRewards: publicQuizzesStats.totalRewards + roomStats.quizzes.totalRewards,
     };
 
@@ -300,7 +236,6 @@ const makeStudentProgressHelpers = ({
         generalClasses,
         publicQuizzes: publicQuizzesStats,
         rooms: roomStats,
-        chats: chatStats,
         quizResults,
         latestQuizResult: quizResults[0] || null,
       },
