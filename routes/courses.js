@@ -309,33 +309,47 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
         { $push: { "sessions.$.ratings": review }, $set: { updatedAt: new Date() } }
       );
       const updated = await courseCollection.findOne({ _id: course._id });
-      res.json({ success: true, course: await helpers.hydrateCourse(updated, userId) });
+      res.json({ success: true, course: await helpers.hydrateCourse(updated, teacherId) });
     } catch (err) {
       console.error("Error rating course session:", err);
       res.status(500).json({ error: "Failed to rate session." });
     }
   });
 
-  router.post("/api/courses/:courseId/sessions/:sessionId/attendance", async (req, res) => {
+  router.patch("/api/courses/:courseId/sessions/:sessionId/reschedule", async (req, res) => {
     try {
-      const { userId, role = "student", attended = true } = req.body;
+      const { teacherId, scheduledAt, time = "" } = req.body;
       const course = await getCourse(req.params.courseId);
       if (!course) return res.status(404).json({ error: "Course not found." });
-      if (role === "teacher" && course.teacherId !== userId)
-        return res.status(403).json({ error: "Only the course teacher can mark teacher attendance." });
-      if (role === "student" && !(course.enrollments || []).some((item) => item.studentId === userId))
-        return res.status(403).json({ error: "Only enrolled students can mark attendance." });
-      const field = role === "teacher" ? "sessions.$.teacherAttendance" : `sessions.$.studentAttendance.${userId}`;
+      if (course.teacherId !== teacherId)
+        return res.status(403).json({ error: "Only the course teacher can reschedule classes." });
+      const nextScheduledAt = scheduledAt ? new Date(scheduledAt) : null;
+      if (!nextScheduledAt || Number.isNaN(nextScheduledAt.getTime()))
+        return res.status(400).json({ error: "Valid class time is required." });
       await courseCollection.updateOne(
         { _id: course._id, "sessions.id": req.params.sessionId },
-        { $set: { [field]: Boolean(attended), "sessions.$.status": "completed", updatedAt: new Date() } }
+        {
+          $set: {
+            "sessions.$.scheduledAt": nextScheduledAt,
+            "sessions.$.time": String(time || "").trim(),
+            "sessions.$.status": "scheduled",
+            "sessions.$.rescheduledAt": new Date(),
+            updatedAt: new Date(),
+          },
+        }
       );
       const updated = await courseCollection.findOne({ _id: course._id });
       res.json({ success: true, course: await helpers.hydrateCourse(updated, userId) });
     } catch (err) {
-      console.error("Error marking course attendance:", err);
-      res.status(500).json({ error: "Failed to update attendance." });
+      console.error("Error rescheduling course session:", err);
+      res.status(500).json({ error: "Failed to reschedule class." });
     }
+  });
+
+  router.post("/api/courses/:courseId/sessions/:sessionId/attendance", async (req, res) => {
+    res.status(410).json({
+      error: "Course attendance is tracked automatically from class calls.",
+    });
   });
 
   router.get("/api/admin/courses", async (req, res) => {

@@ -34,6 +34,23 @@ const collectMessageStoragePaths = (messages = []) => {
   return [...new Set(paths.map(normalizePath).filter(Boolean))];
 };
 
+const collectQuizStoragePaths = (quiz = {}) => {
+  const paths = [];
+  (quiz.questions || []).forEach((question) => {
+    if (question.storagePath) paths.push(question.storagePath);
+    const imagePath = extractSupabasePath(question.imageUrl);
+    if (imagePath) paths.push(imagePath);
+  });
+  (quiz.attempts || []).forEach((attempt) => {
+    Object.values(attempt.answers || {}).forEach((answer) => {
+      if (answer?.storagePath) paths.push(answer.storagePath);
+      const imagePath = extractSupabasePath(answer?.imageUrl);
+      if (imagePath) paths.push(imagePath);
+    });
+  });
+  return [...new Set(paths.map(normalizePath).filter(Boolean))];
+};
+
 const makeSupabaseStorage = () => {
   const { url, key, bucket } = getSupabaseConfig();
   const enabled = Boolean(url && key && bucket);
@@ -93,7 +110,7 @@ const makeSupabaseStorage = () => {
     return deletePaths(paths);
   };
 
-  return { collectMessageStoragePaths, deletePaths, deleteFolders, enabled };
+  return { collectMessageStoragePaths, collectQuizStoragePaths, deletePaths, deleteFolders, enabled };
 };
 
-module.exports = { makeSupabaseStorage, collectMessageStoragePaths, extractSupabasePath };
+module.exports = { makeSupabaseStorage, collectMessageStoragePaths, collectQuizStoragePaths, extractSupabasePath };

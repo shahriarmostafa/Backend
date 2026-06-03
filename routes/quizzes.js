@@ -3,6 +3,7 @@ const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeQuizHelpers, makePublicQuizHelpers } = require("../utils/quizHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
+const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const {
   ROOM_QUIZ_ATTEND_CREDIT,
   ROOM_QUIZ_MAX_QUESTIONS,
@@ -14,6 +15,7 @@ const {
 
 module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, activepackages, databaseinmongo, client }) => {
   const router = Router();
+  const supabaseStorage = makeSupabaseStorage();
   const { createRoomNotification } = makeNotificationHelpers({
     databaseinmongo,
     userCollection,
@@ -33,6 +35,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     spendQuizCredit,
     settleQuiz,
     applyQuizRating,
+    isAttemptFullyMarked,
     publicQuiz,
   } = makeQuizHelpers({ userCollection, activepackages, roomQuizzes });
   const publicHelpers = makePublicQuizHelpers({ userCollection, activepackages, publicQuizzes });
@@ -106,6 +109,25 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     } catch (err) {
       console.error("Error fetching room quiz:", err);
       res.status(500).json({ error: "Failed to fetch quiz." });
+    }
+  });
+
+  router.get("/api/admin/study-rooms/:roomId/quizzes", async (req, res) => {
+    try {
+      const room = await getRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ error: "Room not found." });
+      const quizzes = await roomQuizzes
+        .find({ roomId: req.params.roomId })
+        .sort({ scheduledAt: -1, createdAt: -1 })
+        .limit(120)
+        .toArray();
+      res.json({
+        success: true,
+        quizzes: quizzes.map((quiz) => publicRoomQuiz(quiz, quiz.teacherId, room)),
+      });
+    } catch (err) {
+      console.error("Error fetching admin room quizzes:", err);
+      res.status(500).json({ error: "Failed to fetch room quizzes." });
     }
   });
 
@@ -280,7 +302,6 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           };
           return;
         }
-        const quizEconomyEnabled = room.quizExpenseEnabled !== false;
         const quiz = await roomQuizzes.findOne(
           { _id: new ObjectId(req.params.quizId), roomId: req.params.roomId },
           { session: mongoSession }
@@ -412,11 +433,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           { session: mongoSession }
         );
 
-        let updatedQuiz = await roomQuizzes.findOne({ _id: quiz._id }, { session: mongoSession });
-        if (new Date(updatedQuiz.endsAt).getTime() <= Date.now()) {
-          const settled = await settleQuiz(updatedQuiz._id.toString(), mongoSession, { economyEnabled: quizEconomyEnabled });
-          updatedQuiz = settled.quiz;
-        }
+        const updatedQuiz = await roomQuizzes.findOne({ _id: quiz._id }, { session: mongoSession });
         responsePayload = { status: 200, body: { success: true, quiz: publicRoomQuiz(updatedQuiz, userId, room) } };
       });
       res.status(responsePayload.status).json(responsePayload.body);
@@ -428,13 +445,81 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     }
   });
 
-  router.post("/api/study-rooms/:roomId/quizzes/:quizId/settle", async (req, res) => {
+  router.post("/api/study-rooms/:roomId/quizzes/:quizId/marks", async (req, res) => {
+    try {
+      const { teacherId, marks = {} } = req.body;
+      const room = await getRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ error: "Room not found." });
+      const quiz = await roomQuizzes.findOne({
+        _id: new ObjectId(req.params.quizId),
+        roomId: req.params.roomId,
+      });
+      if (!quiz) return res.status(404).json({ error: "Quiz not found." });
+      if (quiz.teacherId !== teacherId)
+        return res.status(403).json({ error: "Only the quiz teacher can submit marks." });
+
+      const manualQuestionIds = new Set((quiz.questions || [])
+        .filter((question) => ["open", "image"].includes(question.type))
+        .map((question) => question.id));
+      const updatedAttempts = (quiz.attempts || []).map((attempt) => {
+        if (!attempt.submittedAt) return attempt;
+        let score = 0;
+        const answers = { ...(attempt.answers || {}) };
+        (quiz.questions || []).forEach((question) => {
+          const answer = answers[question.id] || {};
+          if (question.type === "mcq") {
+            if (answer.isCorrect) score += 1;
+            return;
+          }
+          const rawScore = marks?.[attempt.studentId]?.[question.id];
+          const manualScore = rawScore === undefined ? answer.manualScore : Math.min(Math.max(Number(rawScore) || 0, 0), 1);
+          answers[question.id] = { ...answer, manualScore, markedAt: new Date(), markedBy: teacherId };
+          score += manualScore;
+        });
+        return {
+          ...attempt,
+          answers,
+          score,
+          maxScore: (quiz.questions || []).length,
+          manuallyMarkedAt: new Date(),
+        };
+      });
+      const allMarked = updatedAttempts
+        .filter((attempt) => attempt.submittedAt)
+        .every((attempt) => isAttemptFullyMarked({ ...quiz, attempts: updatedAttempts }, attempt));
+
+      await roomQuizzes.updateOne(
+        { _id: quiz._id },
+        {
+          $set: {
+            attempts: updatedAttempts,
+            markingCompletedAt: allMarked ? new Date() : null,
+            markingCompletedBy: allMarked ? teacherId : null,
+            manualQuestionCount: manualQuestionIds.size,
+            updatedAt: new Date(),
+          },
+        }
+      );
+      const updatedQuiz = await roomQuizzes.findOne({ _id: quiz._id });
+      res.json({ success: true, allMarked, quiz: publicRoomQuiz(updatedQuiz, teacherId, room) });
+    } catch (err) {
+      console.error("Error marking room quiz:", err);
+      res.status(500).json({ error: "Failed to submit marks." });
+    }
+  });
+
+  router.post("/api/admin/study-rooms/:roomId/quizzes/:quizId/settle", async (req, res) => {
     const mongoSession = client.startSession();
     try {
-      const { teacherId } = req.body;
+      const { adminId } = req.body;
       let responsePayload = null;
       let resultsNotification = null;
       await mongoSession.withTransaction(async () => {
+        const adminUser = adminId ? await userCollection.findOne({ uid: adminId }, { session: mongoSession }) : null;
+        if (adminId && !["admin", "owner"].includes(adminUser?.role)) {
+          responsePayload = { status: 403, body: { error: "Only admin can calculate quiz rewards and points." } };
+          return;
+        }
         const room = await getRoom(req.params.roomId);
         if (!room) {
           responsePayload = { status: 404, body: { error: "Room not found." } };
@@ -449,18 +534,14 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           responsePayload = { status: 404, body: { error: "Quiz not found." } };
           return;
         }
-        if (quiz.teacherId !== teacherId) {
-          responsePayload = { status: 403, body: { error: "Only the quiz teacher can finish it." } };
-          return;
-        }
         const settled = await settleQuiz(quiz._id.toString(), mongoSession, { economyEnabled: quizEconomyEnabled });
         if (settled.ok) {
           resultsNotification = {
             type: "room_quiz_results",
             title: "Quiz results published",
             message: `${settled.quiz.title || "Room quiz"} results are ready.`,
-            actorId: teacherId,
-            actorRole: "teacher",
+            actorId: adminId || "admin",
+            actorRole: "admin",
             metadata: { quizId: quiz._id.toString(), subject: quiz.subject },
             dedupeKey: `room-quiz-results:${quiz._id.toString()}`,
           };
@@ -468,7 +549,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         responsePayload = {
           status: settled.ok ? 200 : settled.status,
           body: settled.ok
-            ? { success: true, quiz: publicRoomQuiz(settled.quiz, teacherId, room) }
+            ? { success: true, quiz: publicRoomQuiz(settled.quiz, adminId || quiz.teacherId, room) }
             : { error: settled.message },
         };
       });
@@ -484,6 +565,44 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       res.status(500).json({ error: "Failed to finish quiz." });
     } finally {
       await mongoSession.endSession();
+    }
+  });
+
+  router.post("/api/study-rooms/:roomId/quizzes/:quizId/settle", async (req, res) => {
+    res.status(403).json({ error: "Quiz reward and point calculation is handled by admin after teacher marking." });
+  });
+
+  router.delete("/api/admin/study-rooms/:roomId/quizzes/:quizId", async (req, res) => {
+    try {
+      const { adminId } = req.body || {};
+      const adminUser = adminId ? await userCollection.findOne({ uid: adminId }) : null;
+      if (adminId && !["admin", "owner"].includes(adminUser?.role))
+        return res.status(403).json({ error: "Only admin can delete room quizzes." });
+
+      const room = await getRoom(req.params.roomId);
+      if (!room) return res.status(404).json({ error: "Room not found." });
+      const quiz = await roomQuizzes.findOne({
+        _id: new ObjectId(req.params.quizId),
+        roomId: req.params.roomId,
+      });
+      if (!quiz) return res.status(404).json({ error: "Quiz not found." });
+
+      await supabaseStorage.deletePaths(supabaseStorage.collectQuizStoragePaths(quiz));
+      await supabaseStorage.deleteFolders([`rooms/${req.params.roomId}/quizzes/${quiz._id.toString()}`]);
+      await roomQuizzes.deleteOne({ _id: quiz._id });
+      await createRoomNotification({
+        room,
+        type: "room_quiz_deleted",
+        title: "Quiz removed",
+        message: `${quiz.title || "Room quiz"} was removed by admin.`,
+        actorId: adminId || "admin",
+        actorRole: "admin",
+        metadata: { quizId: quiz._id.toString(), subject: quiz.subject },
+      });
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error deleting room quiz as admin:", err);
+      res.status(500).json({ error: "Failed to delete quiz." });
     }
   });
 
@@ -542,6 +661,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       if (!canDelete)
         return res.status(403).json({ error: "Only the quiz teacher or room creator can delete this quiz." });
 
+      await supabaseStorage.deletePaths(supabaseStorage.collectQuizStoragePaths(quiz));
+      await supabaseStorage.deleteFolders([`rooms/${req.params.roomId}/quizzes/${quiz._id.toString()}`]);
       await roomQuizzes.deleteOne({ _id: quiz._id });
       res.json({ success: true });
     } catch (err) {
@@ -764,11 +885,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           { session: mongoSession }
         );
 
-        let updatedQuiz = await getPublicQuiz(req.params.quizId, mongoSession);
-        if (new Date(updatedQuiz.endsAt).getTime() <= Date.now()) {
-          const settled = await publicHelpers.settleQuiz(updatedQuiz._id.toString(), mongoSession);
-          updatedQuiz = settled.quiz;
-        }
+        const updatedQuiz = await getPublicQuiz(req.params.quizId, mongoSession);
         responsePayload = { status: 200, body: { success: true, quiz: publicHelpers.publicQuiz(updatedQuiz, userId) } };
       });
       res.status(responsePayload.status).json(responsePayload.body);
@@ -780,26 +897,27 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     }
   });
 
-  router.post("/api/public-quizzes/:quizId/settle", async (req, res) => {
+  router.post("/api/admin/public-quizzes/:quizId/settle", async (req, res) => {
     const mongoSession = client.startSession();
     try {
-      const { teacherId } = req.body;
+      const { adminId } = req.body || {};
       let responsePayload = null;
       await mongoSession.withTransaction(async () => {
+        const adminUser = adminId ? await userCollection.findOne({ uid: adminId }, { session: mongoSession }) : null;
+        if (adminId && !["admin", "owner"].includes(adminUser?.role)) {
+          responsePayload = { status: 403, body: { error: "Only admin can calculate public quiz rewards and points." } };
+          return;
+        }
         const quiz = await getPublicQuiz(req.params.quizId, mongoSession);
         if (!quiz) {
           responsePayload = { status: 404, body: { error: "Quiz not found." } };
-          return;
-        }
-        if (quiz.teacherId !== teacherId) {
-          responsePayload = { status: 403, body: { error: "Only the assigned teacher can finish this quiz." } };
           return;
         }
         const settled = await publicHelpers.settleQuiz(quiz._id.toString(), mongoSession);
         responsePayload = {
           status: settled.ok ? 200 : settled.status,
           body: settled.ok
-            ? { success: true, quiz: publicHelpers.publicQuiz(settled.quiz, teacherId) }
+            ? { success: true, quiz: publicHelpers.publicQuiz(settled.quiz, adminId || quiz.teacherId) }
             : { error: settled.message },
         };
       });
@@ -809,6 +927,68 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       res.status(500).json({ error: "Failed to finish public quiz." });
     } finally {
       await mongoSession.endSession();
+    }
+  });
+
+  router.post("/api/public-quizzes/:quizId/settle", async (req, res) => {
+    res.status(403).json({ error: "Quiz reward and point calculation is handled by admin after teacher marking." });
+  });
+
+  router.post("/api/public-quizzes/:quizId/marks", async (req, res) => {
+    try {
+      const { teacherId, marks = {} } = req.body;
+      const quiz = await getPublicQuiz(req.params.quizId);
+      if (!quiz) return res.status(404).json({ error: "Quiz not found." });
+      if (quiz.teacherId !== teacherId)
+        return res.status(403).json({ error: "Only the assigned quiz teacher can submit marks." });
+
+      const manualQuestionIds = new Set((quiz.questions || [])
+        .filter((question) => ["open", "image"].includes(question.type))
+        .map((question) => question.id));
+      const updatedAttempts = (quiz.attempts || []).map((attempt) => {
+        if (!attempt.submittedAt) return attempt;
+        let score = 0;
+        const answers = { ...(attempt.answers || {}) };
+        (quiz.questions || []).forEach((question) => {
+          const answer = answers[question.id] || {};
+          if (question.type === "mcq") {
+            if (answer.isCorrect) score += 1;
+            return;
+          }
+          const rawScore = marks?.[attempt.studentId]?.[question.id];
+          const manualScore = rawScore === undefined ? answer.manualScore : Math.min(Math.max(Number(rawScore) || 0, 0), 1);
+          answers[question.id] = { ...answer, manualScore, markedAt: new Date(), markedBy: teacherId };
+          score += manualScore;
+        });
+        return {
+          ...attempt,
+          answers,
+          score,
+          maxScore: (quiz.questions || []).length,
+          manuallyMarkedAt: new Date(),
+        };
+      });
+      const allMarked = updatedAttempts
+        .filter((attempt) => attempt.submittedAt)
+        .every((attempt) => publicHelpers.isAttemptFullyMarked({ ...quiz, attempts: updatedAttempts }, attempt));
+
+      await publicQuizzes.updateOne(
+        { _id: quiz._id },
+        {
+          $set: {
+            attempts: updatedAttempts,
+            markingCompletedAt: allMarked ? new Date() : null,
+            markingCompletedBy: allMarked ? teacherId : null,
+            manualQuestionCount: manualQuestionIds.size,
+            updatedAt: new Date(),
+          },
+        }
+      );
+      const updatedQuiz = await getPublicQuiz(req.params.quizId);
+      res.json({ success: true, allMarked, quiz: publicHelpers.publicQuiz(updatedQuiz, teacherId) });
+    } catch (err) {
+      console.error("Error marking public quiz:", err);
+      res.status(500).json({ error: "Failed to submit marks." });
     }
   });
 

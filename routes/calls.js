@@ -6,7 +6,7 @@ const {
 } = require("../utils/constants");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 
-module.exports = ({ userCollection, activepackages, databaseinmongo, client, studyRooms }) => {
+module.exports = ({ userCollection, activepackages, databaseinmongo, client, studyRooms, courses }) => {
   const router = Router();
   const { createRoomNotification } = makeNotificationHelpers({
     databaseinmongo,
@@ -50,6 +50,8 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
         parentSessionId,
         participantName,
         participantPhotoURL,
+        courseId,
+        courseSessionId,
         teacherStarted = false,
       } = req.body;
       const callSession = databaseinmongo.collection("callSession");
@@ -81,6 +83,8 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
             startTime,
             roomId: roomId || null,
             roomCallId: sharedRoomCallId,
+            courseId: courseId || null,
+            courseSessionId: courseSessionId || null,
             creditRate: normalizedCreditRate,
             participantName: participantName || studentProfile?.displayName || null,
             participantPhotoURL: participantPhotoURL || studentProfile?.photoURL || null,
@@ -321,8 +325,26 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
           session = { ...session, endTime, seconds, callPoints: generalCallPoints };
         }
 
+        if (session.courseId && session.courseSessionId && ObjectId.isValid(session.courseId)) {
+          const attendanceField = session.studentId
+            ? `sessions.$.studentAttendance.${session.studentId}`
+            : "sessions.$.teacherAttendance";
+          await courses.updateOne(
+            { _id: new ObjectId(session.courseId), "sessions.id": session.courseSessionId },
+            {
+              $set: {
+                [attendanceField]: true,
+                "sessions.$.status": "completed",
+                "sessions.$.lastCallEndedAt": new Date(endTime),
+                updatedAt: new Date(),
+              },
+            },
+            { session: mongoSession }
+          );
+        }
+
         let teacherPointsToAdd = Number(session.teacherPointsAdded) || 0;
-        if (!session.teacherPointsFinalized && session.teacherId && !session.roomId) {
+        if (!session.teacherPointsFinalized && session.teacherId && !session.roomId && !session.courseId) {
           teacherPointsToAdd = generalCallPoints;
 
           if (teacherPointsToAdd > 0) {
@@ -347,7 +369,7 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
         }
 
         let creditToDeduct = Number(session.creditDeducted) || 0;
-        if (!session.creditFinalized && session.studentId && !session.roomId) {
+        if (!session.creditFinalized && session.studentId && !session.roomId && !session.courseId) {
           let creditRate = Math.min(Math.max(Number(session.creditRate) || 1, 0.1), 1);
           const baseCreditToDeduct = Math.floor(seconds / 10);
           creditToDeduct = Math.ceil(baseCreditToDeduct * creditRate);

@@ -765,8 +765,8 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     try {
       const quiz = await publicQuizzes.findOne({ _id: new ObjectId(req.params.quizId) });
       if (!quiz) return res.status(404).json({ success: false, error: "Quiz not found." });
-      if (quiz.status === "completed")
-        return res.status(409).json({ success: false, error: "Completed public quiz results should not be deleted here." });
+      await supabaseStorage.deletePaths(supabaseStorage.collectQuizStoragePaths(quiz));
+      await supabaseStorage.deleteFolders([`public-quizzes/${quiz._id.toString()}`]);
       await publicQuizzes.deleteOne({ _id: quiz._id });
       res.json({ success: true });
     } catch (err) {

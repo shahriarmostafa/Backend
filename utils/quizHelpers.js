@@ -23,7 +23,7 @@ const makeQuizHelpers = ({
   getWinnerCount = null,
 } = {}) => {
   const normalizeQuestion = (question = {}) => {
-    const type = question.type === "open" ? "open" : "mcq";
+    const type = ["open", "image"].includes(question.type) ? question.type : "mcq";
     const options = Array.isArray(question.options) ? question.options.slice(0, 4) : [];
     return {
       id: question.id || new ObjectId().toString(),
@@ -36,6 +36,7 @@ const makeQuizHelpers = ({
           : null,
       answerText: type === "open" ? String(question.answerText || "").trim().slice(0, 400) : "",
       imageUrl: String(question.imageUrl || "").trim(),
+      storagePath: String(question.storagePath || "").trim(),
     };
   };
 
@@ -46,7 +47,8 @@ const makeQuizHelpers = ({
       if (question.type === "mcq") {
         return question.options.length !== 4 || question.options.some((item) => !item);
       }
-      return !question.answerText;
+      if (question.type === "open") return !question.answerText;
+      return false;
     });
     return { cleanQuestions, invalid };
   };
@@ -61,15 +63,26 @@ const makeQuizHelpers = ({
         const selectedOption = Number(rawAnswer?.selectedOption ?? rawAnswer);
         isCorrect = selectedOption === Number(question.correctOption);
         checkedAnswers[question.id] = { selectedOption, isCorrect };
-      } else {
+      } else if (question.type === "open") {
         const text = String(rawAnswer?.text ?? rawAnswer ?? "").trim();
-        isCorrect =
-          text.toLowerCase() === String(question.answerText || "").trim().toLowerCase();
-        checkedAnswers[question.id] = { text, isCorrect };
+        checkedAnswers[question.id] = { text, isCorrect: false, needsManualMarking: true };
+      } else {
+        const imageUrl = String(rawAnswer?.imageUrl ?? rawAnswer?.image ?? rawAnswer ?? "").trim();
+        const storagePath = String(rawAnswer?.storagePath || "").trim();
+        checkedAnswers[question.id] = { imageUrl, storagePath, isCorrect: false, needsManualMarking: true };
       }
       if (isCorrect) score += 1;
     });
     return { score, maxScore: questions.length, checkedAnswers };
+  };
+
+  const isAttemptFullyMarked = (quiz, attempt) => {
+    const manualQuestions = (quiz.questions || []).filter((question) => ["open", "image"].includes(question.type));
+    if (!attempt?.submittedAt) return true;
+    return manualQuestions.every((question) => {
+      const answer = attempt.answers?.[question.id];
+      return answer && answer.manualScore !== undefined && answer.manualScore !== null;
+    });
   };
 
   const getQuizStatus = (quiz) => {
@@ -132,6 +145,10 @@ const makeQuizHelpers = ({
       return { ok: true, alreadySettled: true, quiz };
 
     const submittedAttempts = (quiz.attempts || []).filter((attempt) => attempt.submittedAt);
+    const hasUnmarkedAttempts = submittedAttempts.some((attempt) => !isAttemptFullyMarked(quiz, attempt));
+    if (hasUnmarkedAttempts) {
+      return { ok: false, status: 409, message: "Teacher must finish marking open-ended and image answers first." };
+    }
     const totalCollectedCredit = submittedAttempts.reduce(
       (sum, attempt) => sum + (Number(attempt.creditDeducted) || 0),
       0
@@ -278,6 +295,7 @@ const makeQuizHelpers = ({
     normalizeQuestion,
     validateQuestions,
     scoreAnswers,
+    isAttemptFullyMarked,
     getQuizStatus,
     getAttempt,
     spendQuizCredit,
