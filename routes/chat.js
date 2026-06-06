@@ -383,9 +383,19 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo }) => {
   io.on("connection", (socket) => {
     console.log("A user connected:", socket.id);
     const chatDB = databaseinmongo.collection("chatDB");
+    const sendChatList = async (userId) => {
+      if (!userId) return;
+      try {
+        const chatCollection = databaseinmongo.collection("chatCollection");
+        const { chatList, unseenCount } = await hydrateChatListForUser(userId, chatCollection);
+        socket.emit("chatListUpdate", { chatList, unseenCount });
+      } catch (err) {
+        console.error("Error fetching chat list:", err);
+        socket.emit("chatListError", { message: "Failed to fetch chat list" });
+      }
+    };
 
     socket.on("typing", (chatId) => {
-      console.log(socket.id);
       socket.to(chatId).emit("userTyping", { userId: socket.id });
     });
 
@@ -422,16 +432,18 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo }) => {
     });
 
     socket.on("joinRoom", async (userId) => {
+      if (!userId) return;
       socket.join(userId);
       console.log(`User ${userId} joined the room.`);
-      try {
-        const chatCollection = databaseinmongo.collection("chatCollection");
-        const { chatList, unseenCount } = await hydrateChatListForUser(userId, chatCollection);
-        socket.emit("chatListUpdate", { chatList, unseenCount });
-      } catch (err) {
-        console.error("Error fetching chat list:", err);
-        socket.emit("chatListError", { message: "Failed to fetch chat list" });
-      }
+      await sendChatList(userId);
+    });
+
+    socket.on("requestChatList", sendChatList);
+
+    socket.on("leaveRoom", (userId) => {
+      if (!userId) return;
+      socket.leave(userId);
+      console.log(`User ${userId} left the room.`);
     });
 
     socket.on("register-user", ({ userId }) => {
