@@ -176,6 +176,47 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
     }
   });
 
+  router.post("/api/users/study-profile", async (req, res) => {
+    try {
+      const { uid, category, type } = req.body || {};
+      const cleanCategory = ["school", "college", "university"].includes(category)
+        ? category
+        : "";
+      const cleanType =
+        cleanCategory === "university"
+          ? "english_medium"
+          : ["english_medium", "bangla_medium"].includes(type)
+          ? type
+          : "";
+
+      if (!uid || !cleanCategory || !cleanType) {
+        return res.status(400).json({ error: "uid, category and type are required." });
+      }
+
+      const userDoc = await userCollection.findOne({ uid });
+      if (!userDoc) return res.status(404).json({ error: "User not found." });
+      if (userDoc.role !== "student") {
+        return res.status(403).json({ error: "Only students can update study profile here." });
+      }
+
+      await userCollection.updateOne(
+        { uid },
+        {
+          $set: {
+            category: cleanCategory,
+            type: cleanType,
+            studyProfileUpdatedAt: new Date(),
+          },
+        }
+      );
+      const updatedUser = await userCollection.findOne({ uid });
+      res.json({ success: true, userDoc: updatedUser });
+    } catch (err) {
+      console.error("Error updating study profile:", err);
+      res.status(500).json({ error: "Failed to update study profile." });
+    }
+  });
+
   router.post("/api/users/update-fcm", async (req, res) => {
     try {
       const { userId, FCMToken } = req.body;
