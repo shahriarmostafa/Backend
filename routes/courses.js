@@ -1,10 +1,15 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeCourseHelpers } = require("../utils/courseHelpers");
+const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 
 module.exports = ({ userCollection, activepackages, databaseinmongo, courses, client }) => {
   const router = Router();
   const helpers = makeCourseHelpers({ userCollection, activepackages, databaseinmongo, courses });
+  const { recordRatingEvent, applyTeacherQualitySnapshot } = makeTeacherQualityHelpers({
+    databaseinmongo,
+    userCollection,
+  });
   const courseCollection = helpers.courseCollection;
   const coursePayments = helpers.coursePayments;
 
@@ -308,8 +313,25 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
         { _id: course._id, "sessions.id": req.params.sessionId },
         { $push: { "sessions.$.ratings": review }, $set: { updatedAt: new Date() } }
       );
+      await recordRatingEvent({
+        teacherId: course.teacherId,
+        studentId: userId,
+        source: "course_session_rating",
+        sourceId: `${course._id}:${req.params.sessionId}`,
+        dedupeKey: `course_session_rating:${course._id}:${req.params.sessionId}:${userId}`,
+        rating: review.rating,
+        metadata: {
+          courseId: String(course._id),
+          sessionId: req.params.sessionId,
+        },
+      });
+      const teacher = await userCollection.findOne(
+        { uid: course.teacherId },
+        { projection: { points: 1 } }
+      );
+      await applyTeacherQualitySnapshot({ teacherId: course.teacherId, basePoints: teacher?.points || 0 });
       const updated = await courseCollection.findOne({ _id: course._id });
-      res.json({ success: true, course: await helpers.hydrateCourse(updated, teacherId) });
+      res.json({ success: true, course: await helpers.hydrateCourse(updated, userId) });
     } catch (err) {
       console.error("Error rating course session:", err);
       res.status(500).json({ error: "Failed to rate session." });

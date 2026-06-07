@@ -2,12 +2,16 @@ const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeSupabaseStorage } = require("../utils/supabaseStorage");
+const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 const {
   STUDY_ROOM_MAX_STUDENTS,
   STUDY_ROOM_MONTH_MS,
+  TEACHER_WITHDRAW_EARNING_RATE,
+  TEACHER_WITHDRAW_PLATFORM_BONUS_RATE,
+  TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE,
 } = require("../utils/constants");
 
-module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, publicQuizzes, studyRooms, roomQuizzes, databaseinmongo }) => {
+module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes, studyRooms, roomQuizzes, databaseinmongo, client }) => {
   const router = Router();
   const {
     hydrateStudyRoom,
@@ -16,12 +20,52 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     getUniqueRoomKeyword,
   } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes });
   const supabaseStorage = makeSupabaseStorage();
+  const { getTeacherQualitySummary } = makeTeacherQualityHelpers({ databaseinmongo, userCollection });
 
   const getScopedFilter = (category, type) => {
     const filter = {};
     if (category && category !== "general") filter.category = category;
     if (type && type !== "general") filter.type = type;
     return filter;
+  };
+
+  const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
+
+  const getTeacherWithdrawalBreakdown = ({
+    points,
+    totalTeacherPoints,
+    moneyPool,
+    qualityAdjustedPoints = points,
+  }) => {
+    const safePoints = Number(points) || 0;
+    const safeQualityAdjustedPoints = Math.max(Number(qualityAdjustedPoints) || safePoints, 0);
+    const safeTotalTeacherPoints = Number(totalTeacherPoints) || 0;
+    const safeMoneyPool = Math.max(Number(moneyPool) || 0, 0);
+    const grossPointValue = safeTotalTeacherPoints > 0 ? safeMoneyPool / safeTotalTeacherPoints : 0;
+    const earningPointValue = grossPointValue * TEACHER_WITHDRAW_EARNING_RATE;
+    const profitPointValue = grossPointValue * TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE;
+    const earningsAmount = roundMoney(safePoints * earningPointValue);
+    const qualityAdjustmentPoints = roundMoney(safeQualityAdjustedPoints - safePoints);
+    const qualityAdjustmentAmount = roundMoney(qualityAdjustmentPoints * earningPointValue);
+    const adjustedEarningsAmount = roundMoney(safeQualityAdjustedPoints * earningPointValue);
+    const platformProfitAmount = roundMoney(safePoints * profitPointValue);
+    const amount = Math.max(roundMoney(adjustedEarningsAmount), 0);
+
+    return {
+      amount,
+      earningsAmount,
+      adjustedEarningsAmount,
+      qualityAdjustmentPoints,
+      qualityAdjustmentAmount,
+      platformProfitAmount,
+      grossPointValue,
+      earningPointValue,
+      profitPointValue,
+      rates: {
+        teacherEarningRate: TEACHER_WITHDRAW_EARNING_RATE,
+        platformProfitRate: TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE,
+      },
+    };
   };
 
   const getSummaryId = (category, type) =>
@@ -38,6 +82,23 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       ])
       .toArray();
     return result[0]?.totalPoints || 0;
+  };
+
+  const calculateTotalTeacherEffectivePoints = async (category, type) => {
+    const teachers = await userCollection
+      .find(
+        { role: "teacher", points: { $exists: true }, ...getScopedFilter(category, type) },
+        { projection: { uid: 1, points: 1 } }
+      )
+      .toArray();
+
+    let total = 0;
+    for (const teacher of teachers) {
+      const points = Number(teacher.points) || 0;
+      const qualitySummary = await getTeacherQualitySummary({ teacherId: teacher.uid, basePoints: points });
+      total += Math.max(points + Number(qualitySummary.qualityAdjustmentPoints || 0), 0);
+    }
+    return Math.round(total * 100) / 100;
   };
 
   const calculateMonthlyData = async (category, type) => {
@@ -85,6 +146,9 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
 
     const revenueChange = thisMonthRevenue - lastMonthRevenue;
     const enrollmentChange = thisMonthEnrollments - lastMonthEnrollments;
+    const thisMonthProfit = roundMoney(thisMonthRevenue * TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE);
+    const lastMonthProfit = roundMoney(lastMonthRevenue * TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE);
+    const profitChange = roundMoney(thisMonthProfit - lastMonthProfit);
 
     // Store in history collection
     const historyCollection = databaseinmongo.collection("history");
@@ -107,6 +171,9 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
           thisMonthEnrollments,
           lastMonthEnrollments,
           enrollmentChange,
+          thisMonthProfit,
+          lastMonthProfit,
+          profitChange,
           updatedAt: new Date()
         }
       },
@@ -119,7 +186,10 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       revenueChange,
       thisMonthEnrollments,
       lastMonthEnrollments,
-      enrollmentChange
+      enrollmentChange,
+      thisMonthProfit,
+      lastMonthProfit,
+      profitChange
     };
   };
 
@@ -148,16 +218,43 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       .toArray();
     const totalAvailableCreditWorth = availableCreditWorthAgg[0]?.totalCreditWorth || 0;
 
-    const totalWithdrawalsAgg = await withdrawals
+    const salaryCollection = databaseinmongo.collection("salaryHistory");
+    const withdrawalScopeFilter = getScopedFilter(category, type);
+    const totalWithdrawalsAgg = await salaryCollection
       .aggregate([
-        { $match: { paid: true, ...scopedFilter } },
+        { $match: { paid: true, ...withdrawalScopeFilter } },
         { $group: { _id: null, totalWithdrawals: { $sum: "$amount" } } },
       ])
       .toArray();
     const totalWithdrawals = totalWithdrawalsAgg[0]?.totalWithdrawals || 0;
+    const pendingWithdrawalsAgg = await salaryCollection
+      .aggregate([
+        {
+          $match: {
+            paid: { $ne: true },
+            status: { $nin: ["rejected", "cancelled"] },
+            ...withdrawalScopeFilter,
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            pendingWithdrawals: { $sum: "$amount" },
+            reservedTeacherPoints: { $sum: "$points" },
+          },
+        },
+      ])
+      .toArray();
+    const pendingWithdrawals = pendingWithdrawalsAgg[0]?.pendingWithdrawals || 0;
+    const reservedTeacherPoints = pendingWithdrawalsAgg[0]?.reservedTeacherPoints || 0;
 
     const moneyInPlatform = totalMoney - totalAvailableCreditWorth - totalWithdrawals;
+    const availablePlatformBalance = Math.max(moneyInPlatform - pendingWithdrawals, 0);
+    const teacherEarningPool = roundMoney(availablePlatformBalance * TEACHER_WITHDRAW_EARNING_RATE);
+    const teacherPlatformBonusPool = roundMoney(availablePlatformBalance * TEACHER_WITHDRAW_PLATFORM_BONUS_RATE);
+    const platformProfit = roundMoney(moneyInPlatform * TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE);
     const totalTeacherPoints = await calculateTotalTeacherPoints(category, type);
+    const totalTeacherEffectivePoints = await calculateTotalTeacherEffectivePoints(category, type);
 
     const summaryCollection = databaseinmongo.collection("platform_money_summary");
     const summaryId = getSummaryId(category, type);
@@ -171,15 +268,25 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
           totalMoney,
           totalAvailableCreditWorth,
           totalWithdrawals,
+          pendingWithdrawals,
+          reservedTeacherPoints,
           moneyInPlatform,
+          availablePlatformBalance,
+          teacherEarningPool,
+          teacherPlatformBonusPool,
+          platformProfit,
+          teacherEarningRate: TEACHER_WITHDRAW_EARNING_RATE,
+          teacherPlatformBonusRate: TEACHER_WITHDRAW_PLATFORM_BONUS_RATE,
+          platformProfitRate: TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE,
           totalTeacherPoints,
+          totalTeacherEffectivePoints,
           updatedAt: new Date(),
         },
       },
       { upsert: true }
     );
 
-    return { _id: summaryId, category: category || "general", type: type || "general", totalMoney, totalAvailableCreditWorth, totalWithdrawals, moneyInPlatform, totalTeacherPoints, updatedAt: new Date() };
+    return { _id: summaryId, category: category || "general", type: type || "general", totalMoney, totalAvailableCreditWorth, totalWithdrawals, pendingWithdrawals, reservedTeacherPoints, moneyInPlatform, availablePlatformBalance, teacherEarningPool, teacherPlatformBonusPool, platformProfit, teacherEarningRate: TEACHER_WITHDRAW_EARNING_RATE, teacherPlatformBonusRate: TEACHER_WITHDRAW_PLATFORM_BONUS_RATE, platformProfitRate: TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE, totalTeacherPoints, totalTeacherEffectivePoints, updatedAt: new Date() };
   };
 
   const sumPlatformMoneySummaries = async () => {
@@ -191,8 +298,15 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       "totalMoney",
       "totalAvailableCreditWorth",
       "totalWithdrawals",
+      "pendingWithdrawals",
+      "reservedTeacherPoints",
       "moneyInPlatform",
+      "availablePlatformBalance",
+      "teacherEarningPool",
+      "teacherPlatformBonusPool",
+      "platformProfit",
       "totalTeacherPoints",
+      "totalTeacherEffectivePoints",
     ];
     const summary = fields.reduce((acc, field) => {
       acc[field] = sourceDocs.reduce((total, doc) => total + (Number(doc[field]) || 0), 0);
@@ -216,6 +330,9 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       thisMonthEnrollments: Number(history.thisMonthEnrollments) || 0,
       lastMonthEnrollments: Number(history.lastMonthEnrollments) || 0,
       enrollmentChange: Number(history.enrollmentChange) || 0,
+      thisMonthProfit: Number(history.thisMonthProfit) || 0,
+      lastMonthProfit: Number(history.lastMonthProfit) || 0,
+      profitChange: Number(history.profitChange) || 0,
     };
   };
 
@@ -238,11 +355,12 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       if (!summaryDoc)
         return res.status(404).json({ error: "Summary document not found." });
 
-      const { moneyInPlatform, totalTeacherPoints } = summaryDoc;
+      const moneyPool = Number(summaryDoc.availablePlatformBalance ?? summaryDoc.moneyInPlatform) || 0;
+      const { totalTeacherPoints } = summaryDoc;
       if (!totalTeacherPoints || totalTeacherPoints === 0)
         return res.status(400).json({ error: "totalTeacherPoints is zero or missing." });
 
-      res.json({ pointValue: moneyInPlatform / totalTeacherPoints });
+      res.json({ pointValue: moneyPool / totalTeacherPoints });
     } catch (error) {
       console.error("Error fetching point value:", error);
       res.status(500).json({ error: "Internal server error." });
@@ -262,16 +380,93 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
   
 
   router.patch("/paySalary/:id", async (req, res) => {
+    const mongoSession = client.startSession();
     try {
       const id = req.params.id;
       const salaryCollection = databaseinmongo.collection("salaryHistory");
-      await salaryCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { paid: true, paidAt: new Date() } }
-      );
+      let salaryDoc = null;
+      await mongoSession.withTransaction(async () => {
+        salaryDoc = await salaryCollection.findOne({ _id: new ObjectId(id) }, { session: mongoSession });
+        if (!salaryDoc) throw new Error("SALARY_NOT_FOUND");
+        if (salaryDoc.paid === true || salaryDoc.status === "paid") return;
+        if (["rejected", "cancelled"].includes(salaryDoc.status)) throw new Error("SALARY_NOT_PAYABLE");
+
+        await salaryCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { paid: true, status: "paid", paidAt: new Date() } },
+          { session: mongoSession }
+        );
+
+        if (salaryDoc.pointsReserved === true) {
+          const points = Number(salaryDoc.reservedPoints ?? salaryDoc.points) || 0;
+          await userCollection.updateOne(
+            { uid: salaryDoc.uid },
+            { $inc: { reservedPoints: -points, totalPoints: points } },
+            { session: mongoSession }
+          );
+        }
+      });
+      if (salaryDoc?.category || salaryDoc?.type) {
+        await calculatePlatformMoney(salaryDoc.category, salaryDoc.type).catch(console.error);
+      }
       res.status(200).json({ success: true });
     } catch (err) {
+      if (err.message === "SALARY_NOT_FOUND") return res.status(404).json({ error: "Withdrawal request not found." });
+      if (err.message === "SALARY_NOT_PAYABLE") return res.status(400).json({ error: "This withdrawal request cannot be marked as paid." });
       console.log(err);
+      res.status(500).json({ error: "Failed to mark salary as paid." });
+    } finally {
+      await mongoSession.endSession();
+    }
+  });
+
+  router.patch("/rejectSalary/:id", async (req, res) => {
+    const mongoSession = client.startSession();
+    try {
+      const id = req.params.id;
+      const salaryCollection = databaseinmongo.collection("salaryHistory");
+      let salaryDoc = null;
+      await mongoSession.withTransaction(async () => {
+        salaryDoc = await salaryCollection.findOne({ _id: new ObjectId(id) }, { session: mongoSession });
+        if (!salaryDoc) throw new Error("SALARY_NOT_FOUND");
+        if (salaryDoc.paid === true || salaryDoc.status === "paid") throw new Error("SALARY_ALREADY_PAID");
+        if (salaryDoc.status === "rejected") return;
+
+        await salaryCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { paid: false, status: "rejected", rejectedAt: new Date() } },
+          { session: mongoSession }
+        );
+
+        if (salaryDoc.pointsReserved === true) {
+          const points = Number(salaryDoc.reservedPoints ?? salaryDoc.points) || 0;
+          await userCollection.updateOne(
+            { uid: salaryDoc.uid },
+            { $inc: { reservedPoints: -points, points: points } },
+            { session: mongoSession }
+          );
+        } else {
+          const points = Number(salaryDoc.points) || 0;
+          if (points > 0) {
+            await userCollection.updateOne(
+              { uid: salaryDoc.uid },
+              { $inc: { points: points, totalPoints: -points } },
+              { session: mongoSession }
+            );
+          }
+        }
+      });
+      if (salaryDoc?.category || salaryDoc?.type) {
+        await calculatePlatformMoney(salaryDoc.category, salaryDoc.type).catch(console.error);
+      }
+      res.status(200).json({ success: true });
+    } catch (err) {
+      if (err.message === "SALARY_NOT_FOUND") return res.status(404).json({ error: "Withdrawal request not found." });
+      if (err.message === "SALARY_ALREADY_PAID") return res.status(400).json({ error: "Paid requests cannot be rejected." });
+      console.log(err);
+      res.status(500).json({ error: "Failed to reject salary request." });
+    } finally {
+      await mongoSession.endSession();
     }
   });
 
@@ -290,12 +485,48 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       const summary = await summaryCollection.findOne({ _id: getSummaryId(scopedCategory, scopedType) });
 
       const points = Number(teacher.points) || 0;
+      const reservedPoints = Number(teacher.reservedPoints) || 0;
+      const qualitySummary = await getTeacherQualitySummary({ teacherId: uid, basePoints: points });
+      const qualityAdjustedPoints = Math.max(
+        0,
+        Math.round((points + Number(qualitySummary.qualityAdjustmentPoints || 0)) * 100) / 100
+      );
       const totalTeacherPoints = Number(summary?.totalTeacherPoints) || 0;
+      const totalTeacherEffectivePoints = Number(summary?.totalTeacherEffectivePoints) || totalTeacherPoints;
       const moneyInPlatform = Number(summary?.moneyInPlatform) || 0;
-      const pointValue = totalTeacherPoints > 0 ? moneyInPlatform / totalTeacherPoints : 0;
-      const earnings = Math.round(points * pointValue * 100) / 100;
+      const availablePlatformBalance = Number(summary?.availablePlatformBalance ?? moneyInPlatform) || 0;
+      const breakdown = getTeacherWithdrawalBreakdown({
+        points,
+        qualityAdjustedPoints,
+        totalTeacherPoints: totalTeacherEffectivePoints,
+        moneyPool: availablePlatformBalance,
+      });
 
-      res.json({ success: true, points, totalPoints: teacher.totalPoints || 0, pointValue, earnings, moneyInPlatform, totalTeacherPoints, category: scopedCategory, type: scopedType });
+      const teacherRates = { teacherEarningRate: breakdown.rates.teacherEarningRate };
+
+      res.json({
+        success: true,
+        points,
+        reservedPoints,
+        totalPoints: teacher.totalPoints || 0,
+        qualitySummary,
+        qualityAdjustedPoints,
+        pointValue: breakdown.grossPointValue,
+        earningPointValue: breakdown.earningPointValue,
+        earnings: breakdown.earningsAmount,
+        adjustedEarnings: breakdown.adjustedEarningsAmount,
+        qualityAdjustmentAmount: breakdown.qualityAdjustmentAmount,
+        qualityAdjustmentPoints: breakdown.qualityAdjustmentPoints,
+        withdrawableAmount: breakdown.amount,
+        rates: teacherRates,
+        moneyInPlatform,
+        availablePlatformBalance,
+        pendingWithdrawals: Number(summary?.pendingWithdrawals) || 0,
+        totalTeacherPoints,
+        totalTeacherEffectivePoints,
+        category: scopedCategory,
+        type: scopedType,
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error" });
@@ -303,6 +534,7 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
   });
 
   router.post("/api/teachers/withdraw", async (req, res) => {
+    const mongoSession = client.startSession();
     try {
       const { uid, bkashNumber } = req.body;
       if (!uid || !bkashNumber) return res.status(400).json({ error: "uid and bkashNumber are required" });
@@ -314,35 +546,77 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
       if (points < 100) return res.status(400).json({ error: "Minimum 100 points required to withdraw" });
 
       const freshData = await calculatePlatformMoney(teacher.category, teacher.type);
-      const { moneyInPlatform, totalTeacherPoints } = freshData;
-
-      const pointValue = totalTeacherPoints > 0 ? moneyInPlatform / totalTeacherPoints : 0;
-      const amount = Math.round(points * pointValue * 100) / 100;
-
-      const salaryCollection = databaseinmongo.collection("salaryHistory");
-      await salaryCollection.insertOne({
-        uid,
-        name: teacher.displayName || "",
-        category: teacher.category || "general",
-        type: teacher.type || "general",
-        bkashNumber,
-        points,
-        amount,
-        pointValue,
-        paid: false,
-        requestedAt: new Date(),
-        paidAt: null,
-      });
-
-      await userCollection.updateOne(
-        { uid },
-        { $inc: { totalPoints: points }, $set: { points: 0 } }
+      const { availablePlatformBalance, totalTeacherPoints, totalTeacherEffectivePoints } = freshData;
+      const qualitySummary = await getTeacherQualitySummary({ teacherId: uid, basePoints: points });
+      const qualityAdjustedPoints = Math.max(
+        0,
+        Math.round((points + Number(qualitySummary.qualityAdjustmentPoints || 0)) * 100) / 100
       );
 
-      res.json({ success: true, amount, points });
+      const breakdown = getTeacherWithdrawalBreakdown({
+        points,
+        qualityAdjustedPoints,
+        totalTeacherPoints: Number(totalTeacherEffectivePoints) || totalTeacherPoints,
+        moneyPool: availablePlatformBalance,
+      });
+      const amount = breakdown.amount;
+      if (amount <= 0) return res.status(400).json({ error: "No platform balance is available for withdrawal right now." });
+
+      const salaryCollection = databaseinmongo.collection("salaryHistory");
+      let insertedId = null;
+      await mongoSession.withTransaction(async () => {
+        const freshTeacher = await userCollection.findOne({ uid, role: "teacher" }, { session: mongoSession });
+        const freshPoints = Number(freshTeacher?.points) || 0;
+        if (freshPoints < points) throw new Error("POINTS_CHANGED");
+
+        const insertResult = await salaryCollection.insertOne({
+          uid,
+          name: teacher.displayName || "",
+          category: teacher.category || "general",
+          type: teacher.type || "general",
+          bkashNumber,
+          points,
+          reservedPoints: points,
+          qualityAdjustedPoints,
+          qualityAdjustmentPoints: breakdown.qualityAdjustmentPoints,
+          amount,
+          earningsAmount: breakdown.earningsAmount,
+          adjustedEarningsAmount: breakdown.adjustedEarningsAmount,
+          qualityAdjustmentAmount: breakdown.qualityAdjustmentAmount,
+          platformProfitAmount: breakdown.platformProfitAmount,
+          pointValue: breakdown.grossPointValue,
+          earningPointValue: breakdown.earningPointValue,
+          profitPointValue: breakdown.profitPointValue,
+          qualitySummary,
+          rates: breakdown.rates,
+          paid: false,
+          status: "pending",
+          pointsReserved: true,
+          requestedAt: new Date(),
+          paidAt: null,
+          rejectedAt: null,
+        }, { session: mongoSession });
+        insertedId = insertResult.insertedId;
+
+        const reserveResult = await userCollection.updateOne(
+          { uid, points: { $gte: points } },
+          { $inc: { points: -points, reservedPoints: points } },
+          { session: mongoSession }
+        );
+        if (reserveResult.modifiedCount === 0) throw new Error("POINTS_CHANGED");
+      });
+
+      await calculatePlatformMoney(teacher.category, teacher.type).catch(console.error);
+
+      res.json({ success: true, amount, earningsAmount: breakdown.earningsAmount, adjustedEarningsAmount: breakdown.adjustedEarningsAmount, qualityAdjustmentAmount: breakdown.qualityAdjustmentAmount, qualityAdjustmentPoints: breakdown.qualityAdjustmentPoints, points, reservedPoints: points, qualitySummary, qualityAdjustedPoints, salaryId: insertedId });
     } catch (err) {
+      if (err.message === "POINTS_CHANGED") {
+        return res.status(409).json({ error: "Your points changed. Please try again." });
+      }
       console.error(err);
       res.status(500).json({ error: "Server error" });
+    } finally {
+      await mongoSession.endSession();
     }
   });
 
@@ -506,8 +780,18 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
             totalMoney: 0,
             totalAvailableCreditWorth: 0,
             totalWithdrawals: 0,
+            pendingWithdrawals: 0,
+            reservedTeacherPoints: 0,
             moneyInPlatform: 0,
+            availablePlatformBalance: 0,
+            teacherEarningPool: 0,
+            teacherPlatformBonusPool: 0,
+            platformProfit: 0,
+            thisMonthProfit: 0,
+            lastMonthProfit: 0,
+            profitChange: 0,
             totalTeacherPoints: 0,
+            totalTeacherEffectivePoints: 0,
             updatedAt: new Date(),
             ...(platformMoneySummary || {}),
             ...monthlyHistory,
@@ -553,8 +837,25 @@ module.exports = ({ userCollection, subscriptions, withdrawals, activepackages, 
     try {
       const salaryCollection = databaseinmongo.collection("salaryHistory");
       const result = await salaryCollection
-        .find()
-        .sort({ paid: 1, requestedAt: -1 })
+        .aggregate([
+          {
+            $addFields: {
+              statusSort: {
+                $switch: {
+                  branches: [
+                    { case: { $eq: ["$status", "pending"] }, then: 0 },
+                    { case: { $and: [{ $ne: ["$paid", true] }, { $not: [{ $in: ["$status", ["rejected", "cancelled"]] }] }] }, then: 0 },
+                    { case: { $eq: ["$status", "paid"] }, then: 1 },
+                    { case: { $eq: ["$paid", true] }, then: 1 },
+                    { case: { $in: ["$status", ["rejected", "cancelled"]] }, then: 2 },
+                  ],
+                  default: 3,
+                },
+              },
+            },
+          },
+          { $sort: { statusSort: 1, requestedAt: -1 } },
+        ])
         .toArray();
       res.status(200).json({ success: true, data: result });
     } catch (err) {

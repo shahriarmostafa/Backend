@@ -11,6 +11,7 @@ const {
   PUBLIC_QUIZ_REWARD_WINNER_STEP,
   PUBLIC_QUIZ_REWARD_MAX_WINNERS,
 } = require("./constants");
+const { makeTeacherQualityHelpers } = require("./teacherQualityHelpers");
 
 const makeQuizHelpers = ({
   userCollection,
@@ -21,7 +22,12 @@ const makeQuizHelpers = ({
   rewardPoolRate = ROOM_QUIZ_REWARD_POOL_RATE,
   maxQuestions = ROOM_QUIZ_MAX_QUESTIONS,
   getWinnerCount = null,
+  databaseinmongo = null,
 } = {}) => {
+  const { recordRatingEvent, applyTeacherQualitySnapshot } = makeTeacherQualityHelpers({
+    databaseinmongo,
+    userCollection,
+  });
   const normalizeQuestion = (question = {}) => {
     const type = ["open", "image"].includes(question.type) ? question.type : "mcq";
     const options = Array.isArray(question.options) ? question.options.slice(0, 4) : [];
@@ -35,8 +41,8 @@ const makeQuizHelpers = ({
           ? Math.min(Math.max(Number(question.correctOption), 0), 3)
           : null,
       answerText: type === "open" ? String(question.answerText || "").trim().slice(0, 400) : "",
-      imageUrl: String(question.imageUrl || "").trim(),
-      storagePath: String(question.storagePath || "").trim(),
+      imageUrl: "",
+      storagePath: "",
     };
   };
 
@@ -250,6 +256,33 @@ const makeQuizHelpers = ({
       );
     }
 
+    if (quiz.teacherId) {
+      await recordRatingEvent({
+        teacherId: quiz.teacherId,
+        studentId,
+        source: "quiz_rating",
+        sourceId: quiz._id,
+        dedupeKey: `quiz_rating:${quiz._id}:${studentId}`,
+        rating: normalizedRating,
+        metadata: {
+          quizId: String(quiz._id),
+          roomId: quiz.roomId || null,
+          publicQuiz: !quiz.roomId,
+          pointDelta,
+        },
+        session,
+      });
+      const teacher = await userCollection.findOne(
+        { uid: quiz.teacherId },
+        { projection: { points: 1 }, session }
+      );
+      await applyTeacherQualitySnapshot({
+        teacherId: quiz.teacherId,
+        basePoints: Number(teacher?.points) || 0,
+        session,
+      });
+    }
+
     await quizCollection.updateOne(
       { _id: quiz._id, "attempts.studentId": studentId },
       {
@@ -317,11 +350,12 @@ const getPublicQuizWinnerCount = (submittedCount) => {
   );
 };
 
-const makePublicQuizHelpers = ({ userCollection, activepackages, publicQuizzes }) =>
+const makePublicQuizHelpers = ({ userCollection, activepackages, publicQuizzes, databaseinmongo }) =>
   makeQuizHelpers({
     userCollection,
     activepackages,
     quizCollection: publicQuizzes,
+    databaseinmongo,
     attendCredit: PUBLIC_QUIZ_ATTEND_CREDIT,
     rewardPoolRate: PUBLIC_QUIZ_REWARD_POOL_RATE,
     maxQuestions: PUBLIC_QUIZ_MAX_QUESTIONS,

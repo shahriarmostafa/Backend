@@ -37,8 +37,13 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     applyQuizRating,
     isAttemptFullyMarked,
     publicQuiz,
-  } = makeQuizHelpers({ userCollection, activepackages, roomQuizzes });
-  const publicHelpers = makePublicQuizHelpers({ userCollection, activepackages, publicQuizzes });
+  } = makeQuizHelpers({ userCollection, activepackages, roomQuizzes, databaseinmongo });
+  const publicHelpers = makePublicQuizHelpers({
+    userCollection,
+    activepackages,
+    publicQuizzes,
+    databaseinmongo,
+  });
 
   const getRoom = async (roomId) => studyRooms.findOne({ _id: new ObjectId(roomId) });
 

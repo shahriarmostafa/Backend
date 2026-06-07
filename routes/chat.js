@@ -2,6 +2,7 @@ const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeSupabaseStorage } = require("../utils/supabaseStorage");
+const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 
 module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo, io }) => {
   const router = Router();
@@ -13,6 +14,51 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     activepackages,
   });
   const supabaseStorage = makeSupabaseStorage();
+  const { recordReactionEvent, recordFirstReplySpeedEvent, applyTeacherQualitySnapshot } =
+    makeTeacherQualityHelpers({ databaseinmongo, userCollection });
+
+  const recordTeacherFirstReplyIfNeeded = async ({ chatId, teacherId }) => {
+    try {
+      if (!ObjectId.isValid(chatId) || !teacherId) return;
+      const sender = await userCollection.findOne(
+        { uid: teacherId },
+        { projection: { uid: 1, role: 1, points: 1 } }
+      );
+      if (sender?.role !== "teacher") return;
+
+      const chatDB = databaseinmongo.collection("chatDB");
+      const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+      const messages = Array.isArray(chat?.messages) ? chat.messages : [];
+      const teacherMessageIndex = messages.findIndex((item) => item.senderId === teacherId);
+      if (teacherMessageIndex < 0) return;
+
+      const firstStudentMessage = messages.find(
+        (item, index) => index < teacherMessageIndex && item.senderId && item.senderId !== teacherId
+      );
+      if (!firstStudentMessage?.createdAt) return;
+
+      const firstTeacherMessage = messages[teacherMessageIndex];
+      const replyAt = new Date(firstTeacherMessage.createdAt || Date.now()).getTime();
+      const askedAt = new Date(firstStudentMessage.createdAt).getTime();
+      const minutes = Math.max((replyAt - askedAt) / 60000, 0);
+
+      await recordFirstReplySpeedEvent({
+        teacherId,
+        studentId: firstStudentMessage.senderId,
+        sourceId: chatId,
+        dedupeKey: `first_reply_speed:${chatId}:${teacherId}:${firstStudentMessage.senderId}`,
+        minutes,
+        metadata: {
+          chatId,
+          teacherMessageIndex,
+          studentMessageIndex: messages.indexOf(firstStudentMessage),
+        },
+      });
+      await applyTeacherQualitySnapshot({ teacherId, basePoints: sender.points || 0 });
+    } catch (err) {
+      console.error("Error recording teacher first reply quality:", err);
+    }
+  };
 
   const hydrateChatListForUser = async (userId, chatCollection) => {
     const userChatDoc = await chatCollection.findOne({ _id: userId });
@@ -250,6 +296,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       });
 
       res.json({ success: true, message });
+      setImmediate(() => recordTeacherFirstReplyIfNeeded({ chatId, teacherId: senderId }));
     } catch (error) {
       console.error("Error sending message:", error);
       res.status(500).json({ error: "Internal server error." });
@@ -330,7 +377,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   });
 
   router.put("/update-feedback", async (req, res) => {
-    const { teacherId, chatId, index, isLike, feedbackType } = req.body;
+    const { teacherId, studentId, chatId, index, isLike, feedbackType, reaction } = req.body;
 
     try {
       if (!teacherId) return res.status(400).json({ error: "teacherId required" });
@@ -350,6 +397,20 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         { $set: { points: newPoints }, $inc: { rating: ratingDelta } }
       );
 
+      await recordReactionEvent({
+        teacherId,
+        studentId,
+        source: isCall ? "call_review" : "chat_reaction",
+        sourceId: isCall ? `call:${teacherId}:${studentId || "unknown"}:${Date.now()}` : `${chatId}:${index}`,
+        dedupeKey: isCall
+          ? `call_review:${teacherId}:${studentId || "unknown"}:${Date.now()}`
+          : `chat_reaction:${chatId}:${index}:${studentId || "unknown"}`,
+        isLike,
+        reaction,
+        metadata: { chatId, index, feedbackType },
+      });
+      await applyTeacherQualitySnapshot({ teacherId, basePoints: newPoints });
+
       // Only update message feedback for chat interactions
       if (!isCall && chatId && index != null) {
         const chatDB = databaseinmongo.collection("chatDB");
@@ -359,7 +420,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
           if (messages[index]) {
             messages[index] = {
               ...messages[index],
-              lastMessageFeedback: isLike ? "liked" : "disliked",
+              lastMessageFeedback: reaction || (isLike ? "liked" : "disliked"),
             };
             await chatDB.updateOne({ _id: new ObjectId(chatId) }, { $set: { messages } });
             const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });

@@ -579,6 +579,19 @@ module.exports = ({
         .find({ "teacherSessions.teacherId": teacherId })
         .sort({ updatedAt: -1, createdAt: -1 })
         .toArray();
+      const allMemberIds = [
+        ...new Set(rooms.flatMap((room) => room.memberIds || []).filter(Boolean)),
+      ];
+      const roomMembers = allMemberIds.length
+        ? await userCollection
+            .find({ uid: { $in: allMemberIds } })
+            .project({ uid: 1, displayName: 1, photoURL: 1, email: 1, role: 1 })
+            .toArray()
+        : [];
+      const membersById = roomMembers.reduce((acc, member) => {
+        acc[member.uid] = member;
+        return acc;
+      }, {});
       await Promise.all(
         rooms.flatMap((room) =>
           (room.chats || []).map((chat) =>
@@ -612,6 +625,11 @@ module.exports = ({
             const key = `${room._id.toString()}:${String(session.subject || "General").toLowerCase()}`;
             return {
               ...chat,
+              members: (room.memberIds || []).map((memberId) => membersById[memberId]).filter(Boolean),
+              participants: [
+                ...(room.memberIds || []).map((memberId) => membersById[memberId]).filter(Boolean),
+                { uid: teacher.uid, displayName: teacher.displayName, photoURL: teacher.photoURL, role: "teacher" },
+              ],
               quizRequestCount: requestCountByRoomSubject[key] || 0,
             };
           })
@@ -692,17 +710,43 @@ module.exports = ({
           endTime: 1,
         })
         .toArray();
-
-      res.json({
-        success: true,
-        participants: sessions.map((item) => ({
+      const teacher = teacherId
+        ? await userCollection.findOne(
+            { uid: teacherId },
+            { projection: { uid: 1, displayName: 1, photoURL: 1, role: 1 } }
+          )
+        : null;
+      const teacherSession = sessions.find((item) => !item.studentId);
+      const students = sessions
+        .filter((item) => item.studentId)
+        .map((item) => ({
           uid: item.studentId,
           displayName: item.participantName,
           photoURL: item.participantPhotoURL,
+          role: "student",
           joinedAt: item.startTime,
           leftAt: item.endTime || null,
           isActive: !item.endTime,
-        })),
+        }));
+
+      res.json({
+        success: true,
+        participants: [
+          ...(teacherId
+            ? [
+                {
+                  uid: teacher?.uid || teacherId,
+                  displayName: teacher?.displayName || teacherSession?.participantName || "Teacher",
+                  photoURL: teacher?.photoURL || teacherSession?.participantPhotoURL || null,
+                  role: "teacher",
+                  joinedAt: teacherSession?.startTime || null,
+                  leftAt: teacherSession?.endTime || null,
+                  isActive: !teacherSession?.endTime,
+                },
+              ]
+            : []),
+          ...students,
+        ],
       });
     } catch (err) {
       console.error("Error fetching room call participants:", err);
