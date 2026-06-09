@@ -95,7 +95,7 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
       updatedAt: new Date(),
     };
 
-    await qualityEvents.updateOne(
+    const result = await qualityEvents.updateOne(
       { dedupeKey: uniqueKey },
       {
         $setOnInsert: event,
@@ -104,7 +104,7 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
       { upsert: true, session }
     );
 
-    return { ok: true, delta: normalizedDelta, monthKey };
+    return { ok: true, delta: normalizedDelta, monthKey, inserted: result.upsertedCount > 0 };
   };
 
   const recordRatingEvent = (payload = {}) =>

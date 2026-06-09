@@ -48,6 +48,7 @@ module.exports = {
     call_review: 20,
     course_session_rating: 20,
   },
+  CHAT_REACTION_STUDENT_XP: 2,
   COURSE_PERFORMANCE_WEIGHTS: {
     classesTaken: 0.5,
     ratings: 0.2,

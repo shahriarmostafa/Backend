@@ -186,6 +186,7 @@ const makeStudentProgressHelpers = ({
     const totalQuizMaxScore = publicQuizzesStats.totalMaxScore + roomStats.quizzes.totalMaxScore;
     const totalClasses = generalClasses.classes + roomStats.classes.classes;
     const totalMinutes = generalClasses.totalMinutes + roomStats.classes.totalMinutes;
+    const reactionXp = Math.max(Number(student.reactionXp) || 0, 0);
 
     const summary = {
       studentId,
@@ -200,6 +201,7 @@ const makeStudentProgressHelpers = ({
       activeRooms: roomStats.activeRooms,
       completedRoomGoals: roomStats.completedGoals,
       totalRewards: publicQuizzesStats.totalRewards + roomStats.quizzes.totalRewards,
+      reactionXp,
     };
 
     return {
@@ -260,13 +262,15 @@ const makeStudentProgressHelpers = ({
     const rewards = roomId
       ? scopedQuizResults.reduce((sum, quiz) => sum + (Number(quiz.rewardCredit) || 0), 0)
       : Number(progress.summary.totalRewards) || 0;
+    const reactionXp = roomId ? 0 : Number(progress.summary.reactionXp) || 0;
     const xp =
       quizSubmitted * 60 +
       Math.round(quizAverage * 2) +
       Math.round(learningMinutes * 1.5) +
       completedGoals * 35 +
       classes * 45 +
-      rewards;
+      rewards +
+      reactionXp;
 
     return {
       xp: Math.max(0, Math.round(xp)),
@@ -276,6 +280,7 @@ const makeStudentProgressHelpers = ({
       completedGoals,
       classes,
       rewards,
+      reactionXp,
     };
   };
 
@@ -297,6 +302,7 @@ const makeStudentProgressHelpers = ({
       completedGoals: stats.completedGoals,
       classes: stats.classes,
       rewards: stats.rewards,
+      reactionXp: stats.reactionXp || 0,
       updatedAt: now,
     };
     await leaderboardSnapshots.updateOne(

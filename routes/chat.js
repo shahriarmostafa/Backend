@@ -3,6 +3,7 @@ const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
+const { CHAT_REACTION_STUDENT_XP } = require("../utils/constants");
 
 module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo, io }) => {
   const router = Router();
@@ -397,7 +398,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         { $set: { points: newPoints }, $inc: { rating: ratingDelta } }
       );
 
-      await recordReactionEvent({
+      const qualityResult = await recordReactionEvent({
         teacherId,
         studentId,
         source: isCall ? "call_review" : "chat_reaction",
@@ -410,6 +411,30 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         metadata: { chatId, index, feedbackType },
       });
       await applyTeacherQualitySnapshot({ teacherId, basePoints: newPoints });
+
+      const xpAwarded = !isCall && studentId && qualityResult?.inserted
+        ? CHAT_REACTION_STUDENT_XP
+        : 0;
+      if (xpAwarded > 0) {
+        await userCollection.updateOne(
+          { uid: studentId, role: "student" },
+          {
+            $inc: {
+              reactionXp: xpAwarded,
+              "progressXp.reactionXp": xpAwarded,
+              "progressXp.xp": xpAwarded,
+            },
+            $set: { reactionXpUpdatedAt: new Date() },
+          }
+        );
+        await databaseinmongo.collection("leaderboardSnapshots").updateOne(
+          { scope: "public", scopeId: "public", studentId },
+          {
+            $inc: { xp: xpAwarded, reactionXp: xpAwarded },
+            $set: { updatedAt: new Date() },
+          }
+        );
+      }
 
       // Only update message feedback for chat interactions
       if (!isCall && chatId && index != null) {
@@ -429,7 +454,12 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         }
       }
 
-      res.json({ success: true });
+      res.json({
+        success: true,
+        reaction: reaction || (isLike ? "liked" : "disliked"),
+        xpAwarded,
+        alreadyReacted: !qualityResult?.inserted,
+      });
     } catch (err) {
       console.error(err);
       res.status(500).send("Internal server error.");
