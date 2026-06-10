@@ -59,9 +59,31 @@ module.exports = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
     return { allowed: isTeacher || isStudent, course };
   };
 
+  const getPublicQuizAccess = async (scopeId, userId) => {
+    if (!scopeId || !userId) return { allowed: false };
+    const userDoc = await userCollection.findOne(
+      { uid: userId },
+      { projection: { uid: 1, role: 1, category: 1, type: 1 } }
+    );
+    if (!userDoc) return { allowed: false, status: 404, message: "User not found." };
+    if (userDoc.role === "teacher") return { allowed: true };
+
+    const [category, type] = String(scopeId).split(":");
+    const userCategory = userDoc.category || "school";
+    const userType = userDoc.type || "bangla_medium";
+    const matchesScope =
+      category === userCategory &&
+      (userCategory === "university" || !type || type === userType);
+
+    return matchesScope
+      ? { allowed: true }
+      : { allowed: false, status: 403, message: "These notifications are not available for this profile." };
+  };
+
   const assertScopedAccess = async ({ scope, scopeId, userId }) => {
     if (scope === "room") return getRoomAccess(scopeId, userId);
     if (scope === "course") return getCourseAccess(scopeId, userId);
+    if (scope === "public_quiz") return getPublicQuizAccess(scopeId, userId);
     return { allowed: false, status: 400, message: "Unsupported notification scope." };
   };
 

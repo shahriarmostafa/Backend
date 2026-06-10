@@ -16,7 +16,7 @@ const {
 module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, activepackages, databaseinmongo, client }) => {
   const router = Router();
   const supabaseStorage = makeSupabaseStorage();
-  const { createRoomNotification } = makeNotificationHelpers({
+  const { createNotification, createRoomNotification } = makeNotificationHelpers({
     databaseinmongo,
     userCollection,
     studyRooms,
@@ -46,6 +46,48 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   });
 
   const getRoom = async (roomId) => studyRooms.findOne({ _id: new ObjectId(roomId) });
+
+  const getPublicQuizScopeId = (quiz = {}) =>
+    `${quiz.category || "school"}:${quiz.category === "university" ? "english_medium" : quiz.type || "bangla_medium"}`;
+
+  const notifyPublicQuizPublished = async ({ quiz, actorId, quizStarted = false }) => {
+    if (!quiz) return;
+    const studentFilter = {
+      role: "student",
+      category: quiz.category || "school",
+    };
+    if (studentFilter.category !== "university") {
+      studentFilter.type = quiz.type || "bangla_medium";
+    }
+
+    const students = await userCollection
+      .find(studentFilter)
+      .project({ uid: 1 })
+      .toArray();
+    const recipients = [
+      quiz.teacherId,
+      ...students.map((student) => student.uid),
+    ].filter(Boolean);
+
+    await createNotification({
+      scope: "public_quiz",
+      scopeId: getPublicQuizScopeId(quiz),
+      type: quizStarted ? "public_quiz_started" : "public_quiz_published",
+      title: quizStarted ? "Public quiz started" : "New public quiz",
+      message: `${quiz.title || "Public quiz"} is ${quizStarted ? "open now" : "scheduled"}.`,
+      actorId,
+      actorRole: "teacher",
+      recipients,
+      metadata: {
+        quizId: quiz._id.toString(),
+        category: quiz.category || "school",
+        type: quiz.type || "bangla_medium",
+        subject: quiz.subject || "",
+        scheduledAt: quiz.scheduledAt,
+      },
+      dedupeKey: `public-quiz-${quizStarted ? "started" : "published"}:${quiz._id.toString()}`,
+    });
+  };
 
   const isRoomTeacher = (room, teacherId, subject = null) =>
     (room.teacherSessions || []).some(
@@ -770,6 +812,11 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       );
 
       const updatedQuiz = await getPublicQuiz(req.params.quizId);
+      const quizStarted = updatedQuiz.status === "open";
+      setImmediate(() => {
+        notifyPublicQuizPublished({ quiz: updatedQuiz, actorId: teacherId, quizStarted })
+          .catch((err) => console.error("Error creating public quiz notification:", err));
+      });
       res.json({ success: true, quiz: publicHelpers.publicQuiz(updatedQuiz, teacherId) });
     } catch (err) {
       console.error("Error preparing public quiz:", err);

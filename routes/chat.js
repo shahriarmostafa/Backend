@@ -3,12 +3,13 @@ const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
+const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 const { CHAT_REACTION_STUDENT_XP } = require("../utils/constants");
 
 module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo, io }) => {
   const router = Router();
 
-  const { getRoomMembership } = makeRoomHelpers({
+  const { getRoomMembership, ensureRoomChatSubscriptions } = makeRoomHelpers({
     userCollection,
     databaseinmongo,
     studyRooms,
@@ -17,6 +18,11 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   const supabaseStorage = makeSupabaseStorage();
   const { recordReactionEvent, recordFirstReplySpeedEvent, applyTeacherQualitySnapshot } =
     makeTeacherQualityHelpers({ databaseinmongo, userCollection });
+  const { createRoomNotification } = makeNotificationHelpers({
+    databaseinmongo,
+    userCollection,
+    studyRooms,
+  });
 
   const recordTeacherFirstReplyIfNeeded = async ({ chatId, teacherId }) => {
     try {
@@ -62,6 +68,30 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   };
 
   const hydrateChatListForUser = async (userId, chatCollection) => {
+    const currentUser = await userCollection.findOne(
+      { uid: userId },
+      { projection: { uid: 1, role: 1 } }
+    );
+    if (currentUser?.role === "teacher") {
+      const teacherRooms = await studyRooms
+        .find({ "teacherSessions.teacherId": userId })
+        .project({ _id: 1, memberIds: 1, chats: 1 })
+        .toArray();
+      await Promise.all(
+        teacherRooms.flatMap((room) =>
+          (room.chats || [])
+            .filter((chat) => chat.teacherId === userId)
+            .map((chat) =>
+              ensureRoomChatSubscriptions({
+                chat: { ...chat, roomId: room._id.toString() },
+                participantIds: chat.participantIds || [...(room.memberIds || []), userId],
+                roomId: room._id.toString(),
+              })
+            )
+        )
+      );
+    }
+
     const userChatDoc = await chatCollection.findOne({ _id: userId });
     if (!userChatDoc) return { chatList: [], unseenCount: 0 };
 
@@ -81,12 +111,76 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       return acc;
     }, {});
 
+    const roomChatInfos = chatInfos.filter((item) => item.roomChat || item.roomId);
+    const roomIds = [...new Set(roomChatInfos.map((item) => item.roomId).filter(Boolean))]
+      .filter((id) => ObjectId.isValid(id));
+    const rooms = roomIds.length
+      ? await studyRooms.find({ _id: { $in: roomIds.map((id) => new ObjectId(id)) } }).toArray()
+      : [];
+    const roomsById = rooms.reduce((acc, room) => {
+      acc[room._id.toString()] = room;
+      return acc;
+    }, {});
+    const roomParticipantIds = [
+      ...new Set(
+        roomChatInfos
+          .flatMap((item) => [
+            item.receiverId,
+            item.teacherId,
+            ...(Array.isArray(item.participantIds) ? item.participantIds : []),
+            ...(roomsById[item.roomId]?.memberIds || []),
+          ])
+          .filter(Boolean)
+      ),
+    ];
+    const roomParticipants = roomParticipantIds.length
+      ? await userCollection
+          .find({ uid: { $in: roomParticipantIds } })
+          .project({ uid: 1, displayName: 1, photoURL: 1, email: 1, role: 1 })
+          .toArray()
+      : [];
+    const roomParticipantsById = roomParticipants.reduce((acc, person) => {
+      acc[person.uid] = person;
+      return acc;
+    }, {});
+
+    const hydrateRoomReceiver = (item) => {
+      const room = roomsById[item.roomId] || {};
+      const receiverRole = item.receiverRole || item.yourRole || null;
+      const teacher = item.teacherId ? roomParticipantsById[item.teacherId] : null;
+      const memberIds = room.memberIds || [];
+      const members = memberIds.map((id) => roomParticipantsById[id]).filter(Boolean);
+      const participantIds = Array.isArray(item.participantIds) && item.participantIds.length
+        ? item.participantIds
+        : [...memberIds, item.teacherId].filter(Boolean);
+      const participants = participantIds.map((id) => roomParticipantsById[id]).filter(Boolean);
+      const isStudentViewingTeacherChat = receiverRole === "teacher" && teacher;
+
+      return {
+        uid: isStudentViewingTeacherChat ? teacher.uid : item.roomId || item.receiverId,
+        displayName: item.chatName || room.name || "Room chat",
+        photoURL: isStudentViewingTeacherChat ? teacher.photoURL : null,
+        email: isStudentViewingTeacherChat ? teacher.email : null,
+        role: receiverRole,
+        roomId: item.roomId || room._id?.toString() || null,
+        roomName: room.name || "",
+        roomKeyword: room.keyword || "",
+        teacherControl: room.teacherControl === true,
+        roomCreditRate: 0.7,
+        teacher,
+        members,
+        participants,
+        participantIds,
+        backTo: "/chat",
+      };
+    };
+
     const chatList = chatInfos
       .map((item) => ({
         ...item,
         receiverRole: item.receiverRole || item.yourRole || null,
-        userss: item.roomChat
-          ? { uid: item.roomId || item.receiverId, displayName: item.chatName || "Room chat" }
+        userss: item.roomChat || item.roomId
+          ? hydrateRoomReceiver(item)
           : usersById[item.receiverId] || {},
       }))
       .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
@@ -183,12 +277,14 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
           : receiverId
           ? [receiverId]
           : [];
+      let roomForNotification = null;
 
       if (!chatId || !senderId || messageReceiverIds.length === 0)
         return res.status(400).json({ error: "Missing required fields." });
 
       if (roomId) {
         const room = await studyRooms.findOne({ _id: new ObjectId(roomId) });
+        roomForNotification = room;
         const isActiveStudentMember =
           room &&
           (room.memberIds || []).includes(senderId) &&
@@ -297,7 +393,24 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       });
 
       res.json({ success: true, message });
-      setImmediate(() => recordTeacherFirstReplyIfNeeded({ chatId, teacherId: senderId }));
+      setImmediate(() => {
+        recordTeacherFirstReplyIfNeeded({ chatId, teacherId: senderId });
+        if (roomForNotification) {
+          const preview = text || (audioUrl ? "Sent a voice message" : fileUrl ? `Shared ${fileName || "a file"}` : "Shared an image");
+          createRoomNotification({
+            room: roomForNotification,
+            type: "room_chat_message",
+            title: "New room message",
+            message: String(preview || "New message").slice(0, 160),
+            actorId: senderId,
+            metadata: {
+              chatId,
+              roomId: roomForNotification._id.toString(),
+              hasAttachment: Boolean(imageUrl || audioUrl || fileUrl),
+            },
+          }).catch((err) => console.error("Error creating room chat notification:", err));
+        }
+      });
     } catch (error) {
       console.error("Error sending message:", error);
       res.status(500).json({ error: "Internal server error." });
@@ -471,6 +584,139 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
 
 // Socket.io setup — called once in index.js after io is created
 module.exports.setupSocket = ({ io, userCollection, databaseinmongo }) => {
+  const studyRooms = databaseinmongo.collection("studyRooms");
+  const activepackages = databaseinmongo.collection("activePackages");
+  const { ensureRoomChatSubscriptions } = makeRoomHelpers({
+    userCollection,
+    databaseinmongo,
+    studyRooms,
+    activepackages,
+  });
+
+  const hydrateChatListForUser = async (userId, chatCollection) => {
+    const currentUser = await userCollection.findOne(
+      { uid: userId },
+      { projection: { uid: 1, role: 1 } }
+    );
+    if (currentUser?.role === "teacher") {
+      const teacherRooms = await studyRooms
+        .find({ "teacherSessions.teacherId": userId })
+        .project({ _id: 1, memberIds: 1, chats: 1 })
+        .toArray();
+      await Promise.all(
+        teacherRooms.flatMap((room) =>
+          (room.chats || [])
+            .filter((chat) => chat.teacherId === userId)
+            .map((chat) =>
+              ensureRoomChatSubscriptions({
+                chat: { ...chat, roomId: room._id.toString() },
+                participantIds: chat.participantIds || [...(room.memberIds || []), userId],
+                roomId: room._id.toString(),
+              })
+            )
+        )
+      );
+    }
+
+    const userChatDoc = await chatCollection.findOne({ _id: userId });
+    if (!userChatDoc) return { chatList: [], unseenCount: 0 };
+
+    const chatInfos = userChatDoc.chats || [];
+    const receiverIds = [
+      ...new Set(
+        chatInfos
+          .filter((item) => !item.roomChat && item.receiverId)
+          .map((item) => item.receiverId)
+      ),
+    ];
+    const users = receiverIds.length
+      ? await userCollection.find({ uid: { $in: receiverIds } }).toArray()
+      : [];
+    const usersById = users.reduce((acc, item) => {
+      acc[item.uid] = item;
+      return acc;
+    }, {});
+
+    const roomChatInfos = chatInfos.filter((item) => item.roomChat || item.roomId);
+    const roomIds = [...new Set(roomChatInfos.map((item) => item.roomId).filter(Boolean))]
+      .filter((id) => ObjectId.isValid(id));
+    const rooms = roomIds.length
+      ? await studyRooms.find({ _id: { $in: roomIds.map((id) => new ObjectId(id)) } }).toArray()
+      : [];
+    const roomsById = rooms.reduce((acc, room) => {
+      acc[room._id.toString()] = room;
+      return acc;
+    }, {});
+    const roomParticipantIds = [
+      ...new Set(
+        roomChatInfos
+          .flatMap((item) => [
+            item.receiverId,
+            item.teacherId,
+            ...(Array.isArray(item.participantIds) ? item.participantIds : []),
+            ...(roomsById[item.roomId]?.memberIds || []),
+          ])
+          .filter(Boolean)
+      ),
+    ];
+    const roomParticipants = roomParticipantIds.length
+      ? await userCollection
+          .find({ uid: { $in: roomParticipantIds } })
+          .project({ uid: 1, displayName: 1, photoURL: 1, email: 1, role: 1 })
+          .toArray()
+      : [];
+    const roomParticipantsById = roomParticipants.reduce((acc, person) => {
+      acc[person.uid] = person;
+      return acc;
+    }, {});
+
+    const hydrateRoomReceiver = (item) => {
+      const room = roomsById[item.roomId] || {};
+      const receiverRole = item.receiverRole || item.yourRole || null;
+      const teacher = item.teacherId ? roomParticipantsById[item.teacherId] : null;
+      const memberIds = room.memberIds || [];
+      const members = memberIds.map((id) => roomParticipantsById[id]).filter(Boolean);
+      const participantIds = Array.isArray(item.participantIds) && item.participantIds.length
+        ? item.participantIds
+        : [...memberIds, item.teacherId].filter(Boolean);
+      const participants = participantIds.map((id) => roomParticipantsById[id]).filter(Boolean);
+      const isStudentViewingTeacherChat = receiverRole === "teacher" && teacher;
+
+      return {
+        uid: isStudentViewingTeacherChat ? teacher.uid : item.roomId || item.receiverId,
+        displayName: item.chatName || room.name || "Room chat",
+        photoURL: isStudentViewingTeacherChat ? teacher.photoURL : null,
+        email: isStudentViewingTeacherChat ? teacher.email : null,
+        role: receiverRole,
+        roomId: item.roomId || room._id?.toString() || null,
+        roomName: room.name || "",
+        roomKeyword: room.keyword || "",
+        teacherControl: room.teacherControl === true,
+        roomCreditRate: 0.7,
+        teacher,
+        members,
+        participants,
+        participantIds,
+        backTo: "/chat",
+      };
+    };
+
+    const chatList = chatInfos
+      .map((item) => ({
+        ...item,
+        receiverRole: item.receiverRole || item.yourRole || null,
+        userss: item.roomChat || item.roomId
+          ? hydrateRoomReceiver(item)
+          : usersById[item.receiverId] || {},
+      }))
+      .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+
+    return {
+      chatList,
+      unseenCount: chatList.filter((chat) => chat.isSeen === false).length,
+    };
+  };
+
   io.on("connection", (socket) => {
     console.log("A user connected:", socket.id);
     const chatDB = databaseinmongo.collection("chatDB");
