@@ -494,12 +494,50 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     const { teacherId, studentId, chatId, index, isLike, feedbackType, reaction } = req.body;
 
     try {
-      if (!teacherId) return res.status(400).json({ error: "teacherId required" });
+      const isCall = feedbackType === "call";
+      const isChat = !isCall;
+
+      const updateChatMessageFeedback = async () => {
+        if (!isChat || !chatId || index == null) return null;
+        if (!ObjectId.isValid(chatId)) return null;
+        const chatDB = databaseinmongo.collection("chatDB");
+        const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+        if (!chat) return null;
+        const messages = chat.messages || [];
+        if (!messages[index]) return null;
+
+        messages[index] = {
+          ...messages[index],
+          lastMessageFeedback: reaction || (isLike ? "liked" : "disliked"),
+        };
+        await chatDB.updateOne({ _id: new ObjectId(chatId) }, { $set: { messages } });
+        const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
+        io.to(chatId).emit("chatUpdate", updatedChat);
+        return updatedChat;
+      };
+
+      if (!teacherId) {
+        if (isChat) {
+          await updateChatMessageFeedback();
+          return res.json({ success: true, reaction: reaction || (isLike ? "liked" : "disliked"), xpAwarded: 0 });
+        }
+        return res.status(400).json({ error: "teacherId required" });
+      }
 
       const teacher = await userCollection.findOne({ uid: teacherId });
-      if (!teacher) return res.status(404).json({ error: "Teacher not found" });
+      if (!teacher || teacher.role !== "teacher") {
+        if (isChat) {
+          await updateChatMessageFeedback();
+          return res.json({
+            success: true,
+            reaction: reaction || (isLike ? "liked" : "disliked"),
+            xpAwarded: 0,
+            teacherFeedbackSkipped: true,
+          });
+        }
+        return res.status(404).json({ error: "Teacher not found" });
+      }
 
-      const isCall = feedbackType === "call";
       const pointDelta = isLike ? (isCall ? 5 : 3) : (isCall ? -5 : -3);
       const newPoints = (teacher.points || 0) + pointDelta;
 
@@ -550,22 +588,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       }
 
       // Only update message feedback for chat interactions
-      if (!isCall && chatId && index != null) {
-        const chatDB = databaseinmongo.collection("chatDB");
-        const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-        if (chat) {
-          const messages = chat.messages || [];
-          if (messages[index]) {
-            messages[index] = {
-              ...messages[index],
-              lastMessageFeedback: reaction || (isLike ? "liked" : "disliked"),
-            };
-            await chatDB.updateOne({ _id: new ObjectId(chatId) }, { $set: { messages } });
-            const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-            io.to(chatId).emit("chatUpdate", updatedChat);
-          }
-        }
-      }
+      await updateChatMessageFeedback();
 
       res.json({
         success: true,
