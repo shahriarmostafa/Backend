@@ -338,7 +338,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
 
   router.get("/download-link", (req, res) => {
     res.json({
-      url: "https://github.com/shahriarmostafa/The-release/releases/download/v1.0.0/PoperLApk.apk",
+      url: "https://github.com/shahriarmostafa/The-release/releases/download/v1.0.0/PoperL.apk",
     });
   });
 
