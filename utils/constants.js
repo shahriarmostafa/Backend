@@ -49,6 +49,9 @@ module.exports = {
     course_session_rating: 20,
   },
   CHAT_REACTION_STUDENT_XP: 2,
+  // answers a student is nudged to rate per week; shown as honest progress,
+  // never enforced or used to block anything
+  CHAT_REACTION_WEEKLY_TARGET: 5,
   COURSE_PERFORMANCE_WEIGHTS: {
     classesTaken: 0.5,
     ratings: 0.2,

@@ -157,6 +157,10 @@ const createCollection = (seed = []) => {
       return { matchedCount: 0, modifiedCount: 0, upsertedCount: 0 };
     },
 
+    async countDocuments(filter = {}) {
+      return docs.filter((doc) => matches(doc, filter)).length;
+    },
+
     async insertOne(doc) {
       docs.push(clone(doc));
       return { insertedId: doc._id ?? docs.length };

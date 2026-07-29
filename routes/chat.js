@@ -4,7 +4,7 @@ const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
-const { CHAT_REACTION_STUDENT_XP } = require("../utils/constants");
+const { CHAT_REACTION_STUDENT_XP, CHAT_REACTION_WEEKLY_TARGET } = require("../utils/constants");
 const {
   getMessageCreditCost,
   getMessageTeacherPoints,
@@ -256,6 +256,37 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     );
 
     res.json({ chatId });
+  });
+
+  /**
+   * How many answers this student has rated this week, so the chat can show
+   * honest progress toward a weekly goal instead of an unexplained prompt.
+   */
+  router.get("/api/students/:studentId/reaction-progress", async (req, res) => {
+    try {
+      const { studentId } = req.params;
+      if (req.auth?.uid && req.auth.uid !== studentId)
+        return res.status(403).json({ error: "Forbidden", reason: "uid_mismatch" });
+
+      const startOfWeek = new Date();
+      startOfWeek.setUTCHours(0, 0, 0, 0);
+      startOfWeek.setUTCDate(startOfWeek.getUTCDate() - startOfWeek.getUTCDay());
+
+      const rated = await databaseinmongo.collection("teacherQualityEvents").countDocuments({
+        studentId,
+        source: "chat_reaction",
+        createdAt: { $gte: startOfWeek },
+      });
+
+      return res.json({
+        rated,
+        target: CHAT_REACTION_WEEKLY_TARGET,
+        xpPerReaction: CHAT_REACTION_STUDENT_XP,
+      });
+    } catch (err) {
+      console.error("Failed to load reaction progress:", err);
+      return res.status(500).json({ error: "Failed to load reaction progress" });
+    }
   });
 
   /**
@@ -605,7 +636,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   });
 
   router.put("/update-feedback", async (req, res) => {
-    const { teacherId, chatId, index, messageId, isLike, feedbackType, reaction } = req.body;
+    const { teacherId, chatId, index, messageId, isLike, feedbackType, reaction, reactionMs } = req.body;
     // XP is awarded to the reacting student, so trust the verified caller over
     // whatever the body claims.
     const studentId = req.auth?.uid || req.body.studentId;
@@ -719,7 +750,16 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
           : `chat_reaction:${chatId}:${messageId || index}:${studentId || "unknown"}`,
         isLike,
         reaction,
-        metadata: { chatId, index, feedbackType },
+        // reactionMs is recorded, not acted on. It exists so reflex taps can be
+        // told apart from considered ones before anyone decides whether to
+        // weight them differently in teacher quality.
+        metadata: {
+          chatId,
+          index,
+          messageId: messageId || null,
+          feedbackType,
+          reactionMs: Number.isFinite(Number(reactionMs)) ? Math.round(Number(reactionMs)) : null,
+        },
       });
       await applyTeacherQualitySnapshot({ teacherId, basePoints: newPoints });
 
