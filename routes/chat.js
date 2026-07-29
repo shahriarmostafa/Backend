@@ -496,30 +496,49 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     try {
       const isCall = feedbackType === "call";
       const isChat = !isCall;
+      const resolvedReaction = reaction || (isLike ? "liked" : "disliked");
 
-      const updateChatMessageFeedback = async () => {
-        if (!isChat || !chatId || index == null) return null;
-        if (!ObjectId.isValid(chatId)) return null;
+      // A chat reaction is write-once. The conditional $set is the lock: it only
+      // matches while the message still has no reaction, so a repeated request can
+      // never re-score the teacher or rewrite the student's choice. Targeting the
+      // single field instead of rewriting `messages` also stops a message that
+      // arrives mid-request from being clobbered.
+      const claimChatMessageReaction = async () => {
+        const messageIndex = Number(index);
+        if (!chatId || !ObjectId.isValid(chatId)) return false;
+        if (!Number.isInteger(messageIndex) || messageIndex < 0) return false;
+
         const chatDB = databaseinmongo.collection("chatDB");
-        const chat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-        if (!chat) return null;
-        const messages = chat.messages || [];
-        if (!messages[index]) return null;
+        const result = await chatDB.updateOne(
+          {
+            _id: new ObjectId(chatId),
+            // guard against $set padding the array when the index does not exist
+            [`messages.${messageIndex}`]: { $exists: true },
+            [`messages.${messageIndex}.lastMessageFeedback`]: null,
+          },
+          { $set: { [`messages.${messageIndex}.lastMessageFeedback`]: resolvedReaction } }
+        );
+        if (result.matchedCount === 0) return false;
 
-        messages[index] = {
-          ...messages[index],
-          lastMessageFeedback: reaction || (isLike ? "liked" : "disliked"),
-        };
-        await chatDB.updateOne({ _id: new ObjectId(chatId) }, { $set: { messages } });
         const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-        io.to(chatId).emit("chatUpdate", updatedChat);
-        return updatedChat;
+        if (updatedChat) io.to(chatId).emit("chatUpdate", updatedChat);
+        return true;
       };
+
+      // Claim before scoring: if the claim fails the reaction already happened
+      // (or the message is gone), so nothing downstream should run.
+      if (isChat && !(await claimChatMessageReaction())) {
+        return res.json({
+          success: true,
+          reaction: resolvedReaction,
+          xpAwarded: 0,
+          alreadyReacted: true,
+        });
+      }
 
       if (!teacherId) {
         if (isChat) {
-          await updateChatMessageFeedback();
-          return res.json({ success: true, reaction: reaction || (isLike ? "liked" : "disliked"), xpAwarded: 0 });
+          return res.json({ success: true, reaction: resolvedReaction, xpAwarded: 0 });
         }
         return res.status(400).json({ error: "teacherId required" });
       }
@@ -527,10 +546,9 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       const teacher = await userCollection.findOne({ uid: teacherId });
       if (!teacher || teacher.role !== "teacher") {
         if (isChat) {
-          await updateChatMessageFeedback();
           return res.json({
             success: true,
-            reaction: reaction || (isLike ? "liked" : "disliked"),
+            reaction: resolvedReaction,
             xpAwarded: 0,
             teacherFeedbackSkipped: true,
           });
@@ -587,12 +605,9 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         );
       }
 
-      // Only update message feedback for chat interactions
-      await updateChatMessageFeedback();
-
       res.json({
         success: true,
-        reaction: reaction || (isLike ? "liked" : "disliked"),
+        reaction: resolvedReaction,
         xpAwarded,
         alreadyReacted: !qualityResult?.inserted,
       });

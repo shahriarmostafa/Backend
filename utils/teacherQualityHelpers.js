@@ -80,6 +80,9 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
       if (remaining <= 0) return { ok: true, capped: true, delta: 0 };
     }
 
+    // `updatedAt` must NOT appear here: it is owned by the $set below, and Mongo
+    // rejects the whole update if a path shows up in both $setOnInsert and $set
+    // ("Updating the path 'updatedAt' would create a conflict at 'updatedAt'").
     const event = {
       teacherId,
       studentId,
@@ -92,7 +95,6 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
       reaction,
       metadata,
       createdAt,
-      updatedAt: new Date(),
     };
 
     const result = await qualityEvents.updateOne(
