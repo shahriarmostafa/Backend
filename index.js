@@ -7,13 +7,35 @@ const { MongoClient, ServerApiVersion } = require("mongodb");
 
 require("dotenv").config();
 
-app.use(cors());
+// ALLOWED_ORIGINS is a comma-separated list. Unset keeps the old allow-all
+// behaviour so a misconfigured deploy cannot black-hole every client.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+
+const corsOptions = allowedOrigins.length
+  ? {
+      origin: (origin, callback) => {
+        // no Origin header = server-to-server (ShurjoPay IPN, native fetch)
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error(`Origin ${origin} not allowed`));
+      },
+      credentials: true,
+    }
+  : {};
+
+if (!allowedOrigins.length) {
+  console.warn("[cors] ALLOWED_ORIGINS is unset — accepting every origin. Set it in production.");
+}
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 const server = http.createServer(app);
 const io = require("socket.io")(server, {
   cors: {
-    origin: "*",
+    origin: allowedOrigins.length ? allowedOrigins : "*",
     methods: ["GET", "POST"],
   },
 });
@@ -29,6 +51,13 @@ shurjopay.config(
 );
 
 const { database, admin } = require("./firebase.config");
+
+// Authentication must sit in front of every route, including the ones mounted
+// before Mongo connects.
+const { makeAuthMiddleware } = require("./middleware/auth");
+const auth = makeAuthMiddleware({ admin });
+app.use(auth.attachUser);
+app.use(auth.gate);
 
 // Routes that don't need DB
 app.use(require("./routes/whiteboard")());
@@ -49,6 +78,11 @@ async function run() {
     await client.connect();
 
     const db = client.db("PoperL");
+
+    // the owner gate reads from Mongo, so hand it the connection
+    auth.setDatabase(db);
+    await require("./utils/ensureIndexes").ensureIndexes(db);
+
     const collections = {
       subscriptions: db.collection("subscriptions"),
       referrals: db.collection("referrals"),
@@ -76,7 +110,7 @@ async function run() {
     app.use(require("./routes/admin")(collections));
 
     const { setupSocket } = require("./routes/chat");
-    setupSocket({ io, userCollection: collections.userCollection, databaseinmongo: db });
+    setupSocket({ io, userCollection: collections.userCollection, databaseinmongo: db, admin });
 
     console.log("All routes mounted.");
   } catch (err) {

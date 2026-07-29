@@ -23,14 +23,48 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
     }
   });
 
+  /**
+   * Mints the Firebase custom token the native shell injects into the WebView.
+   *
+   * The caller must prove who they are with an ID token; the uid is read from
+   * that token, never from the body. Accepting a body uid meant anyone could
+   * request a session for any account.
+   *
+   * ALLOW_LEGACY_UID_TOKEN re-opens the old body-uid path. It exists only so
+   * already-installed app builds keep working during a rollout, and it is an
+   * account-takeover hole for as long as it is on.
+   */
   router.post("/createCustomToken", async (req, res) => {
-    const { uid } = req.body;
+    const allowLegacy = String(process.env.ALLOW_LEGACY_UID_TOKEN || "").toLowerCase() === "true";
+    const header = req.headers.authorization || "";
+    const idToken = header.startsWith("Bearer ") ? header.slice(7).trim() : null;
+
     try {
+      let uid = null;
+
+      if (idToken) {
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        uid = decoded.uid;
+      } else if (allowLegacy && req.body?.uid) {
+        uid = req.body.uid;
+        console.warn(
+          `[auth] /createCustomToken served a legacy body uid (${uid}). ` +
+            "Update the app build and unset ALLOW_LEGACY_UID_TOKEN."
+        );
+      }
+
+      if (!uid) {
+        return res.status(401).json({
+          error: "Unauthorized",
+          reason: idToken ? "invalid_token" : "missing_id_token",
+        });
+      }
+
       const customToken = await admin.auth().createCustomToken(uid);
-      res.json({ token: customToken });
+      return res.json({ token: customToken });
     } catch (error) {
-      console.error(error);
-      res.status(500).send("Error creating token");
+      console.error("[auth] createCustomToken failed:", error?.code || error);
+      return res.status(401).json({ error: "Unauthorized", reason: "invalid_token" });
     }
   });
 

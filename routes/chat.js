@@ -491,7 +491,10 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   });
 
   router.put("/update-feedback", async (req, res) => {
-    const { teacherId, studentId, chatId, index, isLike, feedbackType, reaction } = req.body;
+    const { teacherId, chatId, index, isLike, feedbackType, reaction } = req.body;
+    // XP is awarded to the reacting student, so trust the verified caller over
+    // whatever the body claims.
+    const studentId = req.auth?.uid || req.body.studentId;
 
     try {
       const isCall = feedbackType === "call";
@@ -621,7 +624,35 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
 };
 
 // Socket.io setup — called once in index.js after io is created
-module.exports.setupSocket = ({ io, userCollection, databaseinmongo }) => {
+module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) => {
+  const socketAuthEnforced = () =>
+    String(process.env.AUTH_ENFORCE ?? "true").toLowerCase() !== "false";
+
+  // Identity comes from the verified handshake token, never from the payload a
+  // client sends. Previously any connection could claim any uid and receive
+  // that user's chat list and messages.
+  io.use(async (socket, next) => {
+    const token = socket.handshake?.auth?.token || null;
+    if (token && admin) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        socket.data.uid = decoded.uid;
+        return next();
+      } catch (err) {
+        if (socketAuthEnforced()) return next(new Error("unauthorized"));
+        console.warn(`[socket] bad token accepted (AUTH_ENFORCE=false): ${err?.code || err}`);
+        return next();
+      }
+    }
+    if (socketAuthEnforced()) return next(new Error("unauthorized"));
+    console.warn("[socket] unauthenticated connection allowed (AUTH_ENFORCE=false)");
+    return next();
+  });
+
+  // While enforcing, the client-supplied id is ignored outright.
+  const identify = (socket, requested) =>
+    socket.data.uid || (socketAuthEnforced() ? null : requested);
+
   const studyRooms = databaseinmongo.collection("studyRooms");
   const activepackages = databaseinmongo.collection("activePackages");
   const { ensureRoomChatSubscriptions } = makeRoomHelpers({
@@ -779,8 +810,29 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo }) => {
     });
 
     socket.on("joinChatRoom", async (chatId) => {
+      if (!chatId) return;
+      // joining streams every message in the chat, so confirm membership first
+      const viewerId = identify(socket, null);
+      if (viewerId) {
+        try {
+          const userChatDoc = await databaseinmongo
+            .collection("chatCollection")
+            .findOne({ _id: viewerId }, { projection: { chats: 1 } });
+          const isMember = (userChatDoc?.chats || []).some(
+            (entry) => String(entry.chatId) === String(chatId)
+          );
+          if (!isMember) {
+            socket.emit("chatError", { message: "Not a participant of this chat" });
+            return;
+          }
+        } catch (err) {
+          console.error("Error verifying chat membership:", err);
+          socket.emit("chatError", { message: "Failed to open chat" });
+          return;
+        }
+      }
+
       socket.join(chatId);
-      console.log(`User joined chat room: ${chatId}`);
       try {
         const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
         if (chatDoc) {
@@ -806,24 +858,25 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo }) => {
       socket.leave(chatId);
     });
 
-    socket.on("joinRoom", async (userId) => {
+    socket.on("joinRoom", async (requestedUserId) => {
+      const userId = identify(socket, requestedUserId);
       if (!userId) return;
       socket.join(userId);
-      console.log(`User ${userId} joined the room.`);
       await sendChatList(userId);
     });
 
-    socket.on("requestChatList", sendChatList);
+    socket.on("requestChatList", (requestedUserId) => sendChatList(identify(socket, requestedUserId)));
 
-    socket.on("leaveRoom", (userId) => {
+    socket.on("leaveRoom", (requestedUserId) => {
+      const userId = identify(socket, requestedUserId);
       if (!userId) return;
       socket.leave(userId);
-      console.log(`User ${userId} left the room.`);
     });
 
-    socket.on("register-user", ({ userId }) => {
-      socket.join(userId);
-      console.log(`✅ ${userId} joined room`);
+    socket.on("register-user", ({ userId } = {}) => {
+      const id = identify(socket, userId);
+      if (!id) return;
+      socket.join(id);
     });
   });
 };

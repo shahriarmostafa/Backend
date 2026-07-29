@@ -477,6 +477,14 @@ module.exports = ({
       if (!userId || !role)
         return res.status(400).json({ error: "Missing required fields" });
 
+      // Callers may only move their own balance. The client always sends its own
+      // uid, so this is not a behaviour change - it just stops the body being
+      // pointed at someone else's account.
+      // NOTE: a teacher can still award themselves points here. The real fix is
+      // to derive credit/points server-side while sending the message.
+      if (req.auth?.uid && userId !== req.auth.uid)
+        return res.status(403).json({ error: "Forbidden", reason: "uid_mismatch" });
+
       if (role === "teacher" && pointsToAdd > 0) {
         await userCollection.updateOne(
           { uid: userId, role: "teacher" },

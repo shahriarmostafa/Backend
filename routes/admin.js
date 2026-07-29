@@ -539,6 +539,10 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
       const { uid, bkashNumber } = req.body;
       if (!uid || !bkashNumber) return res.status(400).json({ error: "uid and bkashNumber are required" });
 
+      // a teacher may only request their own withdrawal
+      if (req.auth?.uid && uid !== req.auth.uid)
+        return res.status(403).json({ error: "Forbidden", reason: "uid_mismatch" });
+
       const teacher = await userCollection.findOne({ uid, role: "teacher" });
       if (!teacher) return res.status(404).json({ error: "Teacher not found" });
 
