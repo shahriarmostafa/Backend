@@ -5,6 +5,15 @@ const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 const { CHAT_REACTION_STUDENT_XP } = require("../utils/constants");
+const {
+  getMessageCreditCost,
+  getMessageTeacherPoints,
+  resolveMessageEconomy,
+} = require("../utils/messageEconomy");
+
+// How many messages a client receives when it opens a chat. Older pages are
+// fetched on demand from /chat-messages/:chatId.
+const MESSAGE_PAGE_SIZE = 50;
 
 module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo, io }) => {
   const router = Router();
@@ -249,6 +258,48 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     res.json({ chatId });
   });
 
+  /**
+   * Older messages, for scroll-back. `before` is the number of messages the
+   * client already holds, counted from the end of the conversation.
+   */
+  router.get("/chat-messages/:chatId", async (req, res) => {
+    try {
+      const { chatId } = req.params;
+      if (!ObjectId.isValid(chatId)) return res.status(400).json({ error: "Invalid chatId" });
+
+      const alreadyLoaded = Math.max(Number(req.query.before) || 0, 0);
+      const limit = Math.min(Math.max(Number(req.query.limit) || MESSAGE_PAGE_SIZE, 1), 100);
+      const chatDB = databaseinmongo.collection("chatDB");
+
+      const [doc] = await chatDB
+        .aggregate([
+          { $match: { _id: new ObjectId(chatId) } },
+          {
+            $project: {
+              totalMessages: { $size: { $ifNull: ["$messages", []] } },
+              messages: { $ifNull: ["$messages", []] },
+            },
+          },
+        ])
+        .toArray();
+
+      if (!doc) return res.status(404).json({ error: "Chat not found" });
+
+      const end = Math.max(doc.totalMessages - alreadyLoaded, 0);
+      const start = Math.max(end - limit, 0);
+      const messages = doc.messages.slice(start, end);
+
+      return res.json({
+        messages,
+        totalMessages: doc.totalMessages,
+        hasMoreMessages: start > 0,
+      });
+    } catch (err) {
+      console.error("Failed to load older messages:", err);
+      return res.status(500).json({ error: "Failed to load messages" });
+    }
+  });
+
   router.post("/sendMessage", async (req, res) => {
     const chatCollection = databaseinmongo.collection("chatCollection");
     const chatDB = databaseinmongo.collection("chatDB");
@@ -262,6 +313,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         imagePath,
         audioUrl,
         audioPath,
+        audioDuration,
         fileUrl,
         filePath,
         fileName,
@@ -337,7 +389,48 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
           return res.status(400).json({ error: "File size should not exceed 1MB." });
       }
 
+      // Who pays, decided from the sender's stored role and the chat itself
+      // rather than from anything the client sent.
+      const sender = await userCollection.findOne(
+        { uid: senderId },
+        { projection: { uid: 1, role: 1 } }
+      );
+      const economy = resolveMessageEconomy({
+        senderRole: sender?.role,
+        roomId,
+        chatId,
+        room: roomForNotification,
+      });
+      const messageFacts = {
+        text,
+        hasImage: Boolean(imageUrl),
+        audioDuration: audioUrl ? audioDuration : null,
+        hasFile: Boolean(fileUrl),
+      };
+      const creditCost = economy.charges ? getMessageCreditCost(messageFacts) : 0;
+
+      // Conditional deduct: the filter refuses to match without enough credit,
+      // so a message can neither be sent for free nor push a balance negative.
+      if (creditCost > 0) {
+        const paid = await activepackages.updateOne(
+          { uid: senderId, credit: { $gte: creditCost } },
+          { $inc: { credit: -creditCost } }
+        );
+        if (paid.matchedCount === 0) {
+          return res.status(402).json({ error: "Not enough credit to send this message." });
+        }
+      }
+
+      // The client mints the id so its optimistic copy and the broadcast copy
+      // are the same message - the socket event usually beats this response,
+      // and without a shared id the sender would render it twice.
+      const clientMessageId = String(req.body.messageId || "");
+      const safeMessageId = /^[A-Za-z0-9_-]{8,64}$/.test(clientMessageId)
+        ? clientMessageId
+        : new ObjectId().toString();
+
       const message = {
+        messageId: safeMessageId,
         senderId,
         ...(text && { text }),
         createdAt: new Date(),
@@ -358,8 +451,22 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         { $push: { messages: message } }
       );
 
-      if (result.modifiedCount === 0)
+      if (result.modifiedCount === 0) {
+        // refund: the student paid above but the message never landed
+        if (creditCost > 0) {
+          await activepackages.updateOne({ uid: senderId }, { $inc: { credit: creditCost } });
+        }
         return res.status(404).json({ error: "Chat not found." });
+      }
+
+      // teachers earn points for the reply they just sent
+      const pointsAwarded = economy.awardsPoints ? getMessageTeacherPoints(messageFacts) : 0;
+      if (pointsAwarded > 0) {
+        await userCollection.updateOne(
+          { uid: senderId, role: "teacher" },
+          { $inc: { points: pointsAwarded } }
+        );
+      }
 
       const userIds = [...new Set([senderId, ...messageReceiverIds])];
 
@@ -380,8 +487,10 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         )
       );
 
-      const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-      io.to(chatId).emit("chatUpdate", updatedChat);
+      // Send the one new message, not the whole conversation. Re-broadcasting
+      // the full document meant a 1,000-message chat re-sent ~200KB to every
+      // participant on every "ok", and the cost grew with the conversation.
+      io.to(chatId).emit("messageAdded", { chatId, message });
 
       const updatedChatLists = await Promise.all(
         userIds.map((id) => hydrateChatListForUser(id, chatCollection))
@@ -392,7 +501,12 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         io.to(id).emit("chatListUpdate", { chatList, unseenCount });
       });
 
-      res.json({ success: true, message });
+      const remainingCredit =
+        creditCost > 0
+          ? (await activepackages.findOne({ uid: senderId }, { projection: { credit: 1 } }))?.credit ?? null
+          : null;
+
+      res.json({ success: true, message, creditSpent: creditCost, pointsAwarded, remainingCredit });
       setImmediate(() => {
         recordTeacherFirstReplyIfNeeded({ chatId, teacherId: senderId });
         if (roomForNotification) {
@@ -491,7 +605,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   });
 
   router.put("/update-feedback", async (req, res) => {
-    const { teacherId, chatId, index, isLike, feedbackType, reaction } = req.body;
+    const { teacherId, chatId, index, messageId, isLike, feedbackType, reaction } = req.body;
     // XP is awarded to the reacting student, so trust the verified caller over
     // whatever the body claims.
     const studentId = req.auth?.uid || req.body.studentId;
@@ -501,30 +615,51 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       const isChat = !isCall;
       const resolvedReaction = reaction || (isLike ? "liked" : "disliked");
 
-      // A chat reaction is write-once. The conditional $set is the lock: it only
-      // matches while the message still has no reaction, so a repeated request can
-      // never re-score the teacher or rewrite the student's choice. Targeting the
-      // single field instead of rewriting `messages` also stops a message that
-      // arrives mid-request from being clobbered.
+      // A chat reaction is write-once. The conditional update is the lock: it
+      // only matches while the message still has no reaction, so a repeated
+      // request can never re-score the teacher or rewrite the student's choice.
+      //
+      // Prefer messageId - array position is not a stable identity and breaks
+      // as soon as the client is paginated or a message is ever removed. Fall
+      // back to index for messages written before messageId existed.
       const claimChatMessageReaction = async () => {
-        const messageIndex = Number(index);
         if (!chatId || !ObjectId.isValid(chatId)) return false;
-        if (!Number.isInteger(messageIndex) || messageIndex < 0) return false;
-
         const chatDB = databaseinmongo.collection("chatDB");
-        const result = await chatDB.updateOne(
-          {
-            _id: new ObjectId(chatId),
-            // guard against $set padding the array when the index does not exist
-            [`messages.${messageIndex}`]: { $exists: true },
-            [`messages.${messageIndex}.lastMessageFeedback`]: null,
-          },
-          { $set: { [`messages.${messageIndex}.lastMessageFeedback`]: resolvedReaction } }
-        );
-        if (result.matchedCount === 0) return false;
+        let result;
 
-        const updatedChat = await chatDB.findOne({ _id: new ObjectId(chatId) });
-        if (updatedChat) io.to(chatId).emit("chatUpdate", updatedChat);
+        if (messageId) {
+          result = await chatDB.updateOne(
+            { _id: new ObjectId(chatId) },
+            { $set: { "messages.$[target].lastMessageFeedback": resolvedReaction } },
+            {
+              arrayFilters: [
+                { "target.messageId": messageId, "target.lastMessageFeedback": null },
+              ],
+            }
+          );
+        } else {
+          const messageIndex = Number(index);
+          if (!Number.isInteger(messageIndex) || messageIndex < 0) return false;
+          result = await chatDB.updateOne(
+            {
+              _id: new ObjectId(chatId),
+              // guard against $set padding the array when the index does not exist
+              [`messages.${messageIndex}`]: { $exists: true },
+              [`messages.${messageIndex}.lastMessageFeedback`]: null,
+            },
+            { $set: { [`messages.${messageIndex}.lastMessageFeedback`]: resolvedReaction } }
+          );
+        }
+
+        if (!result.modifiedCount) return false;
+
+        // one changed field, not the whole conversation
+        io.to(chatId).emit("messageUpdated", {
+          chatId,
+          messageId: messageId || null,
+          index: messageId ? null : Number(index),
+          changes: { lastMessageFeedback: resolvedReaction },
+        });
         return true;
       };
 
@@ -574,10 +709,14 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         teacherId,
         studentId,
         source: isCall ? "call_review" : "chat_reaction",
-        sourceId: isCall ? `call:${teacherId}:${studentId || "unknown"}:${Date.now()}` : `${chatId}:${index}`,
+        // key on messageId where we have it: array position shifts under
+        // pagination, so it cannot identify a message across requests
+        sourceId: isCall
+          ? `call:${teacherId}:${studentId || "unknown"}:${Date.now()}`
+          : `${chatId}:${messageId || index}`,
         dedupeKey: isCall
           ? `call_review:${teacherId}:${studentId || "unknown"}:${Date.now()}`
-          : `chat_reaction:${chatId}:${index}:${studentId || "unknown"}`,
+          : `chat_reaction:${chatId}:${messageId || index}:${studentId || "unknown"}`,
         isLike,
         reaction,
         metadata: { chatId, index, feedbackType },
@@ -834,9 +973,25 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
 
       socket.join(chatId);
       try {
-        const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+        // Only the most recent page. Sending every message meant opening a long
+        // conversation transferred the entire history before anything rendered.
+        const [chatDoc] = await chatDB
+          .aggregate([
+            { $match: { _id: new ObjectId(chatId) } },
+            {
+              $addFields: {
+                totalMessages: { $size: { $ifNull: ["$messages", []] } },
+                messages: { $slice: [{ $ifNull: ["$messages", []] }, -MESSAGE_PAGE_SIZE] },
+              },
+            },
+          ])
+          .toArray();
+
         if (chatDoc) {
-          socket.emit("chatUpdate", chatDoc);
+          socket.emit("chatUpdate", {
+            ...chatDoc,
+            hasMoreMessages: chatDoc.totalMessages > chatDoc.messages.length,
+          });
           const lastMessageIndex = chatDoc.messages.length - 1;
           if (lastMessageIndex >= 0) {
             const mntsAgoValue = Math.floor(

@@ -112,6 +112,16 @@ async function run() {
     const { setupSocket } = require("./routes/chat");
     setupSocket({ io, userCollection: collections.userCollection, databaseinmongo: db, admin });
 
+    // Close call sessions abandoned by a dead client, so billing finalises
+    // instead of the session hanging open forever.
+    require("./utils/sessionReaper")
+      .makeSessionReaper({
+        databaseinmongo: db,
+        activepackages: collections.activepackages,
+        userCollection: collections.userCollection,
+      })
+      .start();
+
     console.log("All routes mounted.");
   } catch (err) {
     console.log(err);

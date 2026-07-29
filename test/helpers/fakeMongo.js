@@ -65,6 +65,11 @@ const isOperatorCondition = (condition) =>
 
 const matches = (doc, filter = {}) =>
   Object.entries(filter).every(([key, condition]) => {
+    // logical operators take an array of sub-filters, not a field value
+    if (key === "$or") return (condition || []).some((sub) => matches(doc, sub));
+    if (key === "$and") return (condition || []).every((sub) => matches(doc, sub));
+    if (key === "$nor") return !(condition || []).some((sub) => matches(doc, sub));
+
     const actual = getPath(doc, key);
     if (isOperatorCondition(condition)) {
       if ("$exists" in condition) return (actual !== undefined) === condition.$exists;
