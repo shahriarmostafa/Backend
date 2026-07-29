@@ -1,10 +1,15 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
-const {
-  STUDY_ROOM_TEACHER_CREDIT_RATE,
-  STUDY_ROOM_TEACHER_POINT_RATE,
-} = require("../utils/constants");
+const { STUDY_ROOM_TEACHER_POINT_RATE } = require("../utils/constants");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
+// Billing arithmetic lives in moneyHelpers so it can be unit tested without a
+// database or a transaction.
+const {
+  getGeneralCallPoints,
+  getRoomCallCreditRate,
+  getCallCreditForSeconds,
+  clampCreditRate,
+} = require("../utils/moneyHelpers");
 
 module.exports = ({ userCollection, activepackages, databaseinmongo, client, studyRooms, courses }) => {
   const router = Router();
@@ -14,29 +19,6 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
     studyRooms,
   });
 
-  const getGeneralCallPoints = (totalSeconds) => {
-    // Ignore extremely short calls
-    if (totalSeconds < 40) return 0;
-
-    // 40s - 3m
-    if (totalSeconds < 180) return 3;
-
-    // 3m - 5m
-    if (totalSeconds < 300) return 5;
-
-    // 5m - 10m
-    if (totalSeconds < 600) return 8;
-
-    // 10m - 15m
-    if (totalSeconds < 900) return 12;
-
-    // 15m - 20m
-    if (totalSeconds < 1200) return 16;
-
-    // 20m - 30m
-    if (totalSeconds < 1800) return 22;
-    return 28;
-};
 
   router.post("/start-call", async (req, res) => {
     try {
@@ -157,7 +139,7 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
           const roomCallStudentCount = new Set(
             groupSessions.map((item) => item.studentId).filter(Boolean)
           ).size;
-          const roomCreditRate = roomCallStudentCount > 1 ? STUDY_ROOM_TEACHER_CREDIT_RATE : 1;
+          const roomCreditRate = getRoomCallCreditRate(roomCallStudentCount);
 
           for (const item of groupSessions) {
             const itemSeconds = item.endTime
@@ -184,8 +166,7 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
 
             let itemCreditDeducted = Number(item.creditDeducted) || 0;
             if (!item.creditFinalized) {
-              const baseCreditToDeduct = Math.floor(itemSeconds / 10);
-              itemCreditDeducted = Math.ceil(baseCreditToDeduct * roomCreditRate);
+              itemCreditDeducted = getCallCreditForSeconds(itemSeconds, roomCreditRate);
 
               if (itemCreditDeducted > 0) {
                 await activepackages.updateOne(
@@ -370,9 +351,8 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
 
         let creditToDeduct = Number(session.creditDeducted) || 0;
         if (!session.creditFinalized && session.studentId && !session.roomId && !session.courseId) {
-          let creditRate = Math.min(Math.max(Number(session.creditRate) || 1, 0.1), 1);
-          const baseCreditToDeduct = Math.floor(seconds / 10);
-          creditToDeduct = Math.ceil(baseCreditToDeduct * creditRate);
+          let creditRate = clampCreditRate(session.creditRate);
+          creditToDeduct = getCallCreditForSeconds(seconds, creditRate);
 
           if (creditToDeduct > 0) {
             await activepackages.updateOne(

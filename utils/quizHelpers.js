@@ -13,6 +13,24 @@ const {
 } = require("./constants");
 const { makeTeacherQualityHelpers } = require("./teacherQualityHelpers");
 
+/**
+ * Splits a reward pool across winners. Three winners share it 3:2:1, any other
+ * count splits it evenly. Floor-rounding leftovers are handed back out one
+ * credit at a time from the top, so the payouts always sum to the pool exactly.
+ *
+ * Module scope so it can be unit tested without building the helper factory.
+ */
+const distributeRewards = (totalRewardPool, winnerCount) => {
+  if (winnerCount <= 0 || totalRewardPool <= 0) return [];
+  if (winnerCount === 1) return [Math.round(totalRewardPool)];
+  const weights = winnerCount === 3 ? [3, 2, 1] : Array.from({ length: winnerCount }, () => 1);
+  const weightTotal = weights.reduce((sum, weight) => sum + weight, 0);
+  const rewards = weights.map((weight) => Math.floor((totalRewardPool * weight) / weightTotal));
+  let remainder = Math.round(totalRewardPool) - rewards.reduce((sum, value) => sum + value, 0);
+  for (let i = 0; remainder > 0 && i < rewards.length; i += 1, remainder -= 1) rewards[i] += 1;
+  return rewards;
+};
+
 const makeQuizHelpers = ({
   userCollection,
   activepackages,
@@ -127,17 +145,6 @@ const makeQuizHelpers = ({
       { session }
     );
     return { ok: true, remainingCredit: credit - attendCredit };
-  };
-
-  const distributeRewards = (totalRewardPool, winnerCount) => {
-    if (winnerCount <= 0 || totalRewardPool <= 0) return [];
-    if (winnerCount === 1) return [Math.round(totalRewardPool)];
-    const weights = winnerCount === 3 ? [3, 2, 1] : Array.from({ length: winnerCount }, () => 1);
-    const weightTotal = weights.reduce((sum, weight) => sum + weight, 0);
-    const rewards = weights.map((weight) => Math.floor((totalRewardPool * weight) / weightTotal));
-    let remainder = Math.round(totalRewardPool) - rewards.reduce((sum, value) => sum + value, 0);
-    for (let i = 0; remainder > 0 && i < rewards.length; i += 1, remainder -= 1) rewards[i] += 1;
-    return rewards;
   };
 
   const settleQuiz = async (quizId, session = null, options = {}) => {
@@ -362,4 +369,9 @@ const makePublicQuizHelpers = ({ userCollection, activepackages, publicQuizzes, 
     getWinnerCount: getPublicQuizWinnerCount,
   });
 
-module.exports = { makeQuizHelpers, makePublicQuizHelpers, getPublicQuizWinnerCount };
+module.exports = {
+  makeQuizHelpers,
+  makePublicQuizHelpers,
+  getPublicQuizWinnerCount,
+  distributeRewards,
+};

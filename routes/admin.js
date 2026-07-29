@@ -3,6 +3,9 @@ const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
+// getTeacherWithdrawalBreakdown lives in utils/moneyHelpers.js so it can be
+// unit tested without building a route or connecting to Mongo.
+const { roundMoney, getTeacherWithdrawalBreakdown } = require("../utils/moneyHelpers");
 const {
   STUDY_ROOM_MAX_STUDENTS,
   STUDY_ROOM_MONTH_MS,
@@ -27,45 +30,6 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
     if (category && category !== "general") filter.category = category;
     if (type && type !== "general") filter.type = type;
     return filter;
-  };
-
-  const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
-
-  const getTeacherWithdrawalBreakdown = ({
-    points,
-    totalTeacherPoints,
-    moneyPool,
-    qualityAdjustedPoints = points,
-  }) => {
-    const safePoints = Number(points) || 0;
-    const safeQualityAdjustedPoints = Math.max(Number(qualityAdjustedPoints) || safePoints, 0);
-    const safeTotalTeacherPoints = Number(totalTeacherPoints) || 0;
-    const safeMoneyPool = Math.max(Number(moneyPool) || 0, 0);
-    const grossPointValue = safeTotalTeacherPoints > 0 ? safeMoneyPool / safeTotalTeacherPoints : 0;
-    const earningPointValue = grossPointValue * TEACHER_WITHDRAW_EARNING_RATE;
-    const profitPointValue = grossPointValue * TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE;
-    const earningsAmount = roundMoney(safePoints * earningPointValue);
-    const qualityAdjustmentPoints = roundMoney(safeQualityAdjustedPoints - safePoints);
-    const qualityAdjustmentAmount = roundMoney(qualityAdjustmentPoints * earningPointValue);
-    const adjustedEarningsAmount = roundMoney(safeQualityAdjustedPoints * earningPointValue);
-    const platformProfitAmount = roundMoney(safePoints * profitPointValue);
-    const amount = Math.max(roundMoney(adjustedEarningsAmount), 0);
-
-    return {
-      amount,
-      earningsAmount,
-      adjustedEarningsAmount,
-      qualityAdjustmentPoints,
-      qualityAdjustmentAmount,
-      platformProfitAmount,
-      grossPointValue,
-      earningPointValue,
-      profitPointValue,
-      rates: {
-        teacherEarningRate: TEACHER_WITHDRAW_EARNING_RATE,
-        platformProfitRate: TEACHER_WITHDRAW_PLATFORM_PROFIT_RATE,
-      },
-    };
   };
 
   const getSummaryId = (category, type) =>
