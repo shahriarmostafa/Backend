@@ -26,7 +26,19 @@ module.exports = {
   TEACHER_QUALITY_REPLY_FAST_MINUTES: 10,
   TEACHER_QUALITY_REPLY_OK_MINUTES: 60,
   TEACHER_QUALITY_REPLY_LATE_MINUTES: 6 * 60,
+  // Students report their own understanding rather than judging the teacher -
+  // "I'm still stuck" costs nothing socially, "your answer was confusing" does,
+  // so the negative signal actually gets sent.
+  //
+  // Historical events are unaffected by changes here: recordQualityEvent stores
+  // the computed delta on each event and getTeacherQualitySummary sums the
+  // stored values, so getReactionDelta only ever runs at write time. The old
+  // keys stay listed so any in-flight client still scores correctly.
   TEACHER_QUALITY_REACTION_DELTAS: {
+    got_it: 0.2,
+    partly: 0.05,
+    stuck: -0.25,
+    // retired keys, kept for older clients mid-deploy
     helpful: 0.2,
     clear: 0.2,
     thanks: 0.15,
