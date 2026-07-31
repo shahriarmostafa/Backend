@@ -200,11 +200,27 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     };
   };
 
+  /**
+   * Finds an existing DIRECT chat between two people.
+   *
+   * Room chats live in the same `chats` array, and a student's entry for a room
+   * *teacher* chat carries receiverId = teacherId and receiverRole = "teacher" -
+   * identical to a direct chat. Matching on receiverId alone therefore returned
+   * whichever came first in the array, so a student who filtered for a teacher
+   * they already shared a room with was dropped into the room's teacher chat.
+   *
+   * That chat is subscribed by every member of the room, so a message the
+   * student believed was private went to the whole room. Only ever match an
+   * entry with no room attached.
+   */
   router.get("/chatExist/:userId/:receiverId", async (req, res) => {
     const { userId, receiverId } = req.params;
     const userChatCollection = databaseinmongo.collection("chatCollection");
     const userChat = await userChatCollection.findOne({ _id: userId });
-    const existingChat = userChat.chats.find((chat) => chat.receiverId === receiverId);
+    // findOne returns null for anyone who has never had a chat
+    const existingChat = (userChat?.chats || []).find(
+      (chat) => chat.receiverId === receiverId && !chat.roomId && !chat.roomChat
+    );
 
     if (existingChat) {
       return res.json({ exists: true, chatId: existingChat.chatId });
