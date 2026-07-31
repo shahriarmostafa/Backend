@@ -4,11 +4,19 @@ const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeSupabaseStorage } = require("../utils/supabaseStorage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
-const { CHAT_REACTION_STUDENT_XP, CHAT_REACTION_WEEKLY_TARGET } = require("../utils/constants");
+const {
+  CHAT_REACTION_STUDENT_XP,
+  CHAT_REACTION_WEEKLY_TARGET,
+  TEACHER_CONSECUTIVE_MESSAGE_LIMIT,
+  TEACHER_REPLY_WINDOW_ROOM_MINUTES,
+  TEACHER_REPLY_WINDOW_DIRECT_MINUTES,
+} = require("../utils/constants");
 const {
   getMessageCreditCost,
   getMessageTeacherPoints,
   resolveMessageEconomy,
+  countConsecutiveTeacherMessages,
+  minutesSinceLastMessage,
 } = require("../utils/messageEconomy");
 
 // How many messages a client receives when it opens a chat. Older pages are
@@ -381,6 +389,21 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       if (!chatId || !senderId || messageReceiverIds.length === 0)
         return res.status(400).json({ error: "Missing required fields." });
 
+      // Fetched once and reused: the chat's own `type` decides billing, and its
+      // messages feed both the consecutive-message rule and the reply window.
+      // This used to be loaded only inside the teacherControl branch.
+      const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
+      if (!chatDoc) return res.status(404).json({ error: "Chat not found." });
+
+      // Needed by the rule checks below as well as by pricing, so it moved up
+      // from just above the credit block.
+      const sender = await userCollection.findOne(
+        { uid: senderId },
+        { projection: { uid: 1, role: 1 } }
+      );
+
+      let isAssignedRoomTeacher = false;
+
       if (roomId) {
         const room = await studyRooms.findOne({ _id: new ObjectId(roomId) });
         roomForNotification = room;
@@ -388,7 +411,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
           room &&
           (room.memberIds || []).includes(senderId) &&
           getRoomMembership(room, senderId).isActive;
-        const isAssignedRoomTeacher =
+        isAssignedRoomTeacher =
           room &&
           (room.teacherSessions || []).some(
             (session) => session.teacherId === senderId && session.chatId === chatId
@@ -400,20 +423,44 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
             .json({ error: "Renew this room membership before sending messages." });
 
         if (isAssignedRoomTeacher && room.teacherControl !== true) {
-          const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
-          if (!chatDoc) return res.status(404).json({ error: "Chat not found." });
-          const roomStudentIds = new Set(room.memberIds || []);
-          let consecutiveTeacherMessages = 0;
-
-          for (let index = (chatDoc.messages || []).length - 1; index >= 0; index -= 1) {
-            const messageSender = chatDoc.messages[index]?.senderId;
-            if (roomStudentIds.has(messageSender)) break;
-            if (messageSender === senderId) consecutiveTeacherMessages += 1;
-          }
-
-          if (consecutiveTeacherMessages >= 3) {
+          const consecutive = countConsecutiveTeacherMessages(chatDoc.messages, senderId);
+          if (consecutive >= TEACHER_CONSECUTIVE_MESSAGE_LIMIT) {
             return res.status(429).json({
-              error: "A room teacher can send up to 3 consecutive messages. Please wait for a student reply.",
+              error: `A room teacher can send up to ${TEACHER_CONSECUTIVE_MESSAGE_LIMIT} consecutive messages. Please wait for a student reply.`,
+            });
+          }
+        }
+      }
+
+      // The reply window and the consecutive-message rule were enforced only in
+      // the browser: the composer greyed out and this endpoint accepted the
+      // message anyway. A teacher is whoever the chat says it is, so both rules
+      // now hold for direct chats too, where the server previously enforced
+      // neither.
+      const senderIsChatTeacher = roomId
+        ? isAssignedRoomTeacher
+        : chatDoc.teacherId
+        ? chatDoc.teacherId === senderId
+        : sender?.role === "teacher";
+
+      if (senderIsChatTeacher) {
+        const idleMinutes = minutesSinceLastMessage(chatDoc.messages);
+        const windowMinutes = roomId
+          ? TEACHER_REPLY_WINDOW_ROOM_MINUTES
+          : TEACHER_REPLY_WINDOW_DIRECT_MINUTES;
+
+        if (idleMinutes !== null && idleMinutes > windowMinutes) {
+          return res.status(409).json({
+            error:
+              "The reply window for this conversation has closed. The student needs to send a new message first.",
+          });
+        }
+
+        if (!roomId) {
+          const consecutive = countConsecutiveTeacherMessages(chatDoc.messages, senderId);
+          if (consecutive >= TEACHER_CONSECUTIVE_MESSAGE_LIMIT) {
+            return res.status(429).json({
+              error: `You can send up to ${TEACHER_CONSECUTIVE_MESSAGE_LIMIT} messages in a row. Please wait for a reply.`,
             });
           }
         }
@@ -438,16 +485,24 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
 
       // Who pays, decided from the sender's stored role and the chat itself
       // rather than from anything the client sent.
-      const sender = await userCollection.findOne(
-        { uid: senderId },
-        { projection: { uid: 1, role: 1 } }
-      );
       const economy = resolveMessageEconomy({
         senderRole: sender?.role,
         roomId,
         chatId,
         room: roomForNotification,
+        chatType: chatDoc.type || null,
       });
+
+      // Three of the reasons mean a paid message was stored for free because
+      // something was missing, not because the rules say it is free. They used
+      // to be indistinguishable from a legitimate free send - 200, no log - and
+      // that is how a billing outage went unnoticed.
+      if (["unknown-sender-role", "sender-role-missing", "room-chat-not-in-teacher-sessions"].includes(economy.reason)) {
+        console.warn(
+          `[billing] not charging ${senderId} for chat ${chatId}: ${economy.reason}` +
+          (roomId ? ` (room ${roomId}, chatType ${chatDoc.type || "none"})` : "")
+        );
+      }
       const messageFacts = {
         text,
         hasImage: Boolean(imageUrl),

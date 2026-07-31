@@ -4,8 +4,16 @@ module.exports = {
   STUDY_ROOM_CREATE_CREDIT: 50,
   STUDY_ROOM_TEACHER_CREDIT_RATE: 0.7,
   STUDY_ROOM_TEACHER_POINT_RATE: 0.7,
-  STUDY_ROOM_TEACHER_SESSION_MS: 60 * 60 * 1000,
   STUDY_ROOM_MONTH_MS: 30 * 24 * 60 * 60 * 1000,
+  // How long after the last message a teacher may still reply. These were
+  // client-only: the browser greyed the composer out and /sendMessage accepted
+  // the message anyway, so the rule held only for people using the UI as
+  // intended. TEACHER_QUALITY_REPLY_LATE_MINUTES below happens to share the
+  // 6h value but is a different thing - it feeds a rating penalty, not a lock.
+  TEACHER_REPLY_WINDOW_ROOM_MINUTES: 6 * 60,
+  TEACHER_REPLY_WINDOW_DIRECT_MINUTES: 20,
+  // A teacher may send this many messages in a row before a student replies.
+  TEACHER_CONSECUTIVE_MESSAGE_LIMIT: 3,
   ROOM_QUIZ_ATTEND_CREDIT: 20,
   ROOM_QUIZ_REWARD_POOL_RATE: 0.7,
   ROOM_QUIZ_MAX_QUESTIONS: 30,
