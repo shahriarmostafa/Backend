@@ -17,6 +17,7 @@ const {
   resolveMessageEconomy,
   countConsecutiveTeacherMessages,
   minutesSinceLastMessage,
+  viewMessagesFor,
 } = require("../utils/messageEconomy");
 
 // How many messages a client receives when it opens a chat. Older pages are
@@ -348,7 +349,8 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
 
       const end = Math.max(doc.totalMessages - alreadyLoaded, 0);
       const start = Math.max(end - limit, 0);
-      const messages = doc.messages.slice(start, end);
+      // each viewer sees their own room reaction, not whoever reacted first
+      const messages = viewMessagesFor(doc.messages.slice(start, end), req.auth?.uid || req.query.userId);
 
       return res.json({
         messages,
@@ -744,7 +746,32 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         const chatDB = databaseinmongo.collection("chatDB");
         let result;
 
-        if (messageId) {
+        // In a ROOM, write-once-per-message means the first of up to ten
+        // students decides the teacher's signal for that message and the other
+        // nine can never answer. Rooms claim per student instead; a 1:1 chat
+        // keeps the scalar, where write-once is exactly right.
+        const chatDoc = await chatDB.findOne(
+          { _id: new ObjectId(chatId) },
+          { projection: { roomChat: 1, roomId: 1 } }
+        );
+        const isRoomChat = Boolean(chatDoc?.roomChat || chatDoc?.roomId);
+        // uids are alphanumeric, but a dot would silently nest the value
+        const claimant = String(studentId || "").replace(/[.$]/g, "_");
+
+        if (isRoomChat && messageId && claimant) {
+          result = await chatDB.updateOne(
+            { _id: new ObjectId(chatId) },
+            { $set: { [`messages.$[target].feedbackBy.${claimant}`]: resolvedReaction } },
+            {
+              arrayFilters: [
+                {
+                  "target.messageId": messageId,
+                  [`target.feedbackBy.${claimant}`]: { $exists: false },
+                },
+              ],
+            }
+          );
+        } else if (messageId) {
           result = await chatDB.updateOne(
             { _id: new ObjectId(chatId) },
             { $set: { "messages.$[target].lastMessageFeedback": resolvedReaction } },
@@ -770,13 +797,18 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
 
         if (!result.modifiedCount) return false;
 
-        // one changed field, not the whole conversation
-        io.to(chatId).emit("messageUpdated", {
+        // One changed field, not the whole conversation. In a room the
+        // reaction is that one student's, so it goes to them alone - broadcast
+        // to the chat it would show nine other students a choice they did not
+        // make and mark the message spent for them.
+        const payload = {
           chatId,
           messageId: messageId || null,
           index: messageId ? null : Number(index),
           changes: { lastMessageFeedback: resolvedReaction },
-        });
+        };
+        if (isRoomChat && claimant) io.to(studentId).emit("messageUpdated", payload);
+        else io.to(chatId).emit("messageUpdated", payload);
         return true;
       };
 
@@ -1116,6 +1148,8 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
         if (chatDoc) {
           socket.emit("chatUpdate", {
             ...chatDoc,
+            // each viewer sees their own room reaction, not whoever reacted first
+            messages: viewMessagesFor(chatDoc.messages, viewerId),
             hasMoreMessages: chatDoc.totalMessages > chatDoc.messages.length,
           });
           const lastMessageIndex = chatDoc.messages.length - 1;

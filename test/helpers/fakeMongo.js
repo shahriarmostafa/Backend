@@ -128,6 +128,33 @@ const matches = (doc, filter = {}) =>
  * hanging off `chats`, so a positional update silently wrote nowhere and any
  * assertion about it passed against the untouched seed value.
  */
+/**
+ * Resolves a filtered positional operator, `messages.$[target].field`, against
+ * `options.arrayFilters` - the mechanism the chat reaction claim uses, and the
+ * one whose conditional `$exists` guard IS the write-once lock. It was
+ * unsupported here, so those updates silently wrote to a literal `$[target]`
+ * key and any test of the lock would have passed without exercising it.
+ */
+const resolveFiltered = (doc, path, arrayFilters = []) => {
+  const match = path.match(/^(.*?)\.\$\[([^\]]+)\]\.(.*)$/);
+  if (!match) return path;
+  const [, arrayPath, identifier, rest] = match;
+  const array = getPath(doc, arrayPath);
+  if (!Array.isArray(array)) return path;
+
+  const prefix = `${identifier}.`;
+  const conditions = arrayFilters
+    .flatMap((entry) => Object.entries(entry))
+    .filter(([key]) => key.startsWith(prefix))
+    .map(([key, condition]) => [key.slice(prefix.length), condition]);
+
+  const index = array.findIndex((item) =>
+    conditions.every(([field, condition]) => matches(item ?? {}, { [field]: condition }))
+  );
+  if (index < 0) return null; // no element qualifies - the update must not apply
+  return `${arrayPath}.${index}.${rest}`;
+};
+
 const resolvePositional = (doc, path, filter) => {
   if (!path.includes(".$.")) return path;
   const [arrayPath] = path.split(".$.");
@@ -150,29 +177,46 @@ const resolvePositional = (doc, path, filter) => {
   return path.replace(".$.", `.${index}.`);
 };
 
-const applyUpdate = (doc, update, filter = {}) => {
+const applyUpdate = (doc, update, filter = {}, arrayFilters = []) => {
   assertNoPathConflict(update);
+  // null means no array element qualified, so that field is skipped - which is
+  // how the reaction lock refuses a second claim
+  const resolve = (path) => {
+    if (path.includes(".$[")) return resolveFiltered(doc, path, arrayFilters);
+    return resolvePositional(doc, path, filter);
+  };
+  let applied = false;
+
   if (update.$set) {
     for (const [path, value] of Object.entries(update.$set)) {
-      setPath(doc, resolvePositional(doc, path, filter), value);
+      const resolved = resolve(path);
+      if (resolved === null) continue;
+      setPath(doc, resolved, value);
+      applied = true;
     }
   }
   if (update.$inc) {
     for (const [path, delta] of Object.entries(update.$inc)) {
-      const resolved = resolvePositional(doc, path, filter);
+      const resolved = resolve(path);
+      if (resolved === null) continue;
       setPath(doc, resolved, (Number(getPath(doc, resolved)) || 0) + Number(delta));
+      applied = true;
     }
   }
   if (update.$push) {
     for (const [path, value] of Object.entries(update.$push)) {
       const current = getPath(doc, path);
       setPath(doc, path, [...(Array.isArray(current) ? current : []), value]);
+      applied = true;
     }
   }
   if (update.$unset) {
-    for (const path of Object.keys(update.$unset)) setPath(doc, path, undefined);
+    for (const path of Object.keys(update.$unset)) {
+      setPath(doc, path, undefined);
+      applied = true;
+    }
   }
-  return doc;
+  return { doc, applied };
 };
 
 const createCollection = (seed = []) => {
@@ -205,8 +249,10 @@ const createCollection = (seed = []) => {
     async updateOne(filter = {}, update = {}, options = {}) {
       const target = docs.find((doc) => matches(doc, filter));
       if (target) {
-        applyUpdate(target, update, filter);
-        return { matchedCount: 1, modifiedCount: 1, upsertedCount: 0 };
+        const { applied } = applyUpdate(target, update, filter, options.arrayFilters || []);
+        // an arrayFilters update that matched no element changes nothing, which
+        // is exactly how the write-once reaction lock refuses a second claim
+        return { matchedCount: 1, modifiedCount: applied ? 1 : 0, upsertedCount: 0 };
       }
       if (options.upsert) {
         // seed from the equality parts of the filter, like Mongo does
@@ -214,10 +260,11 @@ const createCollection = (seed = []) => {
         for (const [key, value] of Object.entries(filter)) {
           if (value === null || typeof value !== "object") setPath(seedDoc, key, value);
         }
-        const created = applyUpdate(
+        const { doc: created } = applyUpdate(
           { ...seedDoc, ...clone(update.$setOnInsert || {}) },
           { ...update, $setOnInsert: undefined },
-          filter
+          filter,
+          options.arrayFilters || []
         );
         docs.push(created);
         return { matchedCount: 0, modifiedCount: 0, upsertedCount: 1 };

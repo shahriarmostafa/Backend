@@ -155,10 +155,35 @@ const minutesSinceLastMessage = (messages, now = Date.now()) => {
   return Math.max(0, Math.floor((now - at) / 60000));
 };
 
+/**
+ * Shows each viewer their OWN reaction on a message.
+ *
+ * A reaction used to be a single scalar on the message, claimed write-once
+ * globally. That is right in a 1:1 chat and wrong in a room: the first of ten
+ * students to react locked the message, the choice broadcast to everyone, and
+ * the other nine could never answer. Room reactions are stored per uid in
+ * `feedbackBy`; this maps that back onto the field the client already reads.
+ *
+ * Messages with no `feedbackBy` - every direct chat, and everything written
+ * before this existed - pass through untouched, so no migration is needed.
+ */
+const viewMessagesFor = (messages, viewerId) => {
+  if (!Array.isArray(messages)) return [];
+  return messages.map((message) => {
+    if (!message || !message.feedbackBy) return message;
+    const { feedbackBy, ...rest } = message;
+    return {
+      ...rest,
+      lastMessageFeedback: (viewerId && feedbackBy[viewerId]) || null,
+    };
+  });
+};
+
 module.exports = {
   getVoiceCreditCost,
   countConsecutiveTeacherMessages,
   minutesSinceLastMessage,
+  viewMessagesFor,
   getMessageCreditCost,
   getVoiceMessagePoints,
   getTextMessagePoints,
