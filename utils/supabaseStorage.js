@@ -60,6 +60,18 @@ const makeSupabaseStorage = () => {
     "Content-Type": "application/json",
   };
 
+  // Deleting objects needs the service role key. The config falls back through
+  // SUPABASE_ANON_KEY and VITE_SUPABASE_ANON_KEY, and with an anon key every
+  // delete comes back 4xx - which this module used to swallow, so chats and
+  // quizzes were removed from Mongo while their images, voice notes and
+  // attachments stayed in the bucket forever. Say so once, at startup.
+  if (enabled && !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.warn(
+      "[supabase] SUPABASE_SERVICE_ROLE_KEY is unset; falling back to an anon key. " +
+      "Storage deletes will be rejected and orphan every file behind a deleted chat or quiz."
+    );
+  }
+
   const listFolder = async (prefix) => {
     if (!enabled) return [];
     const cleanPrefix = normalizePath(prefix);
@@ -73,7 +85,14 @@ const makeSupabaseStorage = () => {
         sortBy: { column: "name", order: "asc" },
       }),
     });
-    if (!response.ok) return [];
+    if (!response.ok) {
+      // returning [] here reads as "the folder is empty", so a permissions
+      // failure looked identical to nothing-to-delete
+      console.warn(
+        `[supabase] list ${bucket}/${cleanPrefix} failed: ${response.status} ${response.statusText}`
+      );
+      return [];
+    }
     const items = await response.json();
     if (!Array.isArray(items)) return [];
 
@@ -87,9 +106,10 @@ const makeSupabaseStorage = () => {
   };
 
   const deletePaths = async (paths = []) => {
-    if (!enabled) return { skipped: true, deleted: 0 };
+    if (!enabled) return { skipped: true, deleted: 0, failed: 0 };
     const uniquePaths = [...new Set(paths.map(normalizePath).filter(Boolean))];
     let deleted = 0;
+    let failed = 0;
     for (let index = 0; index < uniquePaths.length; index += 100) {
       const chunk = uniquePaths.slice(index, index + 100);
       const response = await fetch(`${url}/storage/v1/object/${bucket}`, {
@@ -97,9 +117,19 @@ const makeSupabaseStorage = () => {
         headers,
         body: JSON.stringify({ prefixes: chunk }),
       });
-      if (response.ok) deleted += chunk.length;
+      if (response.ok) {
+        deleted += chunk.length;
+      } else {
+        // a rejected delete used to be indistinguishable from a successful one:
+        // the count simply did not go up, and nothing was logged
+        failed += chunk.length;
+        console.warn(
+          `[supabase] delete of ${chunk.length} object(s) failed: ` +
+          `${response.status} ${response.statusText}`
+        );
+      }
     }
-    return { skipped: false, deleted };
+    return { skipped: false, deleted, failed };
   };
 
   const deleteFolders = async (folders = []) => {
