@@ -368,6 +368,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
                 subject: chat.subject || null,
                 participantIds: uniqueParticipantIds,
                 isSeen: true,
+                unreadCount: 0,
                 updatedAt: Date.now(),
               },
             },

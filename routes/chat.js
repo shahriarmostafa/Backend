@@ -204,7 +204,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
 
     return {
       chatList,
-      unseenCount: chatList.filter((chat) => chat.isSeen === false).length,
+      unseenCount: chatList.reduce((sum, chat) => sum + (Number(chat.unreadCount) || 0), 0),
     };
   };
 
@@ -255,6 +255,10 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
             chatId,
             lastMessage: "",
             receiverId: userId,
+            // was omitted entirely: `undefined` is neither seen nor unseen,
+            // and both counters test `=== false`
+            isSeen: true,
+            unreadCount: 0,
             updatedAt: Date.now(),
           },
         },
@@ -272,6 +276,8 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
             chatId,
             lastMessage: "",
             receiverId,
+            isSeen: true,
+            unreadCount: 0,
             updatedAt: Date.now(),
           },
         },
@@ -573,20 +579,28 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       const userIds = [...new Set([senderId, ...messageReceiverIds])];
 
       await Promise.all(
-        userIds.map((id) =>
-          chatCollection.updateOne(
+        userIds.map((id) => {
+          const isSender = id === senderId;
+          return chatCollection.updateOne(
             { _id: id, "chats.chatId": chatId },
             {
               $set: {
                 "chats.$.lastMessage":
                   text || (audioUrl ? "🎙️ Voice" : fileUrl ? "📎 File" : "📷 Image"),
-                "chats.$.isSeen": id === senderId,
+                "chats.$.isSeen": isSender,
                 "chats.$.lastMessageFeedback": null,
                 "chats.$.updatedAt": Date.now(),
+                // the sender has by definition read their own message
+                ...(isSender && { "chats.$.unreadCount": 0 }),
               },
+              // A badge needs a number and messages carry no per-user read
+              // marker, so this is denormalised here rather than counted at
+              // read time - the chat-list hydrator never opens chatDB at all
+              // and doing so would add a query per chat on every render.
+              ...(!isSender && { $inc: { "chats.$.unreadCount": 1 } }),
             }
-          )
-        )
+          );
+        })
       );
 
       // Send the one new message, not the whole conversation. Re-broadcasting
@@ -692,10 +706,11 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       const chatIndex = userChatDoc.chats.findIndex((item) => item.chatId === chatId);
       if (chatIndex === -1) return res.status(404).json({ message: "Chat not found" });
 
-      userChatDoc.chats[chatIndex].isSeen = true;
+      // positional $set rather than rewriting the whole array, so a message
+      // arriving between the read and the write is not clobbered
       await chatCollection.updateOne(
-        { _id: userId },
-        { $set: { chats: userChatDoc.chats } }
+        { _id: userId, "chats.chatId": chatId },
+        { $set: { "chats.$.isSeen": true, "chats.$.unreadCount": 0 } }
       );
       const { chatList, unseenCount } = await hydrateChatListForUser(userId, chatCollection);
       io.to(userId).emit("chatListUpdate", { chatList, unseenCount });
@@ -1032,7 +1047,7 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
 
     return {
       chatList,
-      unseenCount: chatList.filter((chat) => chat.isSeen === false).length,
+      unseenCount: chatList.reduce((sum, chat) => sum + (Number(chat.unreadCount) || 0), 0),
     };
   };
 

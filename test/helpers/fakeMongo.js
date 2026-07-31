@@ -12,6 +12,33 @@ const clone = (value) => JSON.parse(JSON.stringify(value ?? null));
 const getPath = (doc, path) =>
   path.split(".").reduce((node, key) => (node == null ? undefined : node[key]), doc);
 
+/**
+ * Mongo resolves a dotted path through an array by trying every element, so
+ * `{ "chats.chatId": x }` matches a document with ANY chat carrying that id.
+ * Plain getPath returns undefined there - `doc.chats["chatId"]` on an array -
+ * which meant every `updateOne({ _id, "chats.chatId": id }, ...)` in the chat
+ * routes silently matched nothing here.
+ */
+const getPathValues = (doc, path) => {
+  const keys = path.split(".");
+  let nodes = [doc];
+  for (const key of keys) {
+    const next = [];
+    for (const node of nodes) {
+      if (node == null) continue;
+      if (Array.isArray(node)) {
+        // a numeric key indexes the array; anything else maps over it
+        if (/^\d+$/.test(key)) next.push(node[Number(key)]);
+        else for (const item of node) if (item != null) next.push(item[key]);
+      } else {
+        next.push(node[key]);
+      }
+    }
+    nodes = next;
+  }
+  return nodes;
+};
+
 const setPath = (doc, path, value) => {
   const keys = path.split(".");
   const last = keys.pop();
@@ -70,30 +97,70 @@ const matches = (doc, filter = {}) =>
     if (key === "$and") return (condition || []).every((sub) => matches(doc, sub));
     if (key === "$nor") return !(condition || []).some((sub) => matches(doc, sub));
 
-    const actual = getPath(doc, key);
+    const candidates = getPathValues(doc, key);
+    const actual = candidates.length ? candidates[0] : undefined;
+
     if (isOperatorCondition(condition)) {
-      if ("$exists" in condition) return (actual !== undefined) === condition.$exists;
-      if ("$ne" in condition) return actual !== condition.$ne;
-      if ("$in" in condition) return condition.$in.includes(actual);
-      if ("$gt" in condition) return actual > condition.$gt;
-      if ("$gte" in condition) return actual >= condition.$gte;
-      if ("$lt" in condition) return actual < condition.$lt;
-      if ("$lte" in condition) return actual <= condition.$lte;
+      if ("$exists" in condition) {
+        return candidates.some((v) => v !== undefined) === condition.$exists;
+      }
+      // $ne on an array path means NO element may equal the value
+      if ("$ne" in condition) return !candidates.some((v) => sameValue(v, condition.$ne));
+      if ("$in" in condition) return candidates.some((v) => condition.$in.includes(v));
+      if ("$gt" in condition) return candidates.some((v) => v > condition.$gt);
+      if ("$gte" in condition) return candidates.some((v) => v >= condition.$gte);
+      if ("$lt" in condition) return candidates.some((v) => v < condition.$lt);
+      if ("$lte" in condition) return candidates.some((v) => v <= condition.$lte);
       return false;
     }
     // Mongo treats a null filter as "null or missing"
     if (condition === null) return actual === null || actual === undefined;
-    return sameValue(actual, condition);
+    // any element may satisfy it
+    return candidates.some((v) => sameValue(v, condition));
   });
 
-const applyUpdate = (doc, update) => {
+/**
+ * Resolves the positional `$` in an update path against the filter, the way
+ * Mongo does: `$` is the index of the first array element that matched the
+ * query on that array.
+ *
+ * Without this, `chats.$.unreadCount` was written to a literal key named `$`
+ * hanging off `chats`, so a positional update silently wrote nowhere and any
+ * assertion about it passed against the untouched seed value.
+ */
+const resolvePositional = (doc, path, filter) => {
+  if (!path.includes(".$.")) return path;
+  const [arrayPath] = path.split(".$.");
+  const array = getPath(doc, arrayPath);
+  if (!Array.isArray(array)) return path;
+
+  // find the filter condition that targets this array, e.g. "chats.chatId"
+  const prefix = `${arrayPath}.`;
+  const conditions = Object.entries(filter || {})
+    .filter(([key]) => key.startsWith(prefix))
+    .map(([key, value]) => [key.slice(prefix.length), value]);
+
+  const index = conditions.length
+    ? array.findIndex((item) =>
+        conditions.every(([field, value]) => sameValue(item?.[field], value))
+      )
+    : 0;
+
+  if (index < 0) return path;
+  return path.replace(".$.", `.${index}.`);
+};
+
+const applyUpdate = (doc, update, filter = {}) => {
   assertNoPathConflict(update);
   if (update.$set) {
-    for (const [path, value] of Object.entries(update.$set)) setPath(doc, path, value);
+    for (const [path, value] of Object.entries(update.$set)) {
+      setPath(doc, resolvePositional(doc, path, filter), value);
+    }
   }
   if (update.$inc) {
     for (const [path, delta] of Object.entries(update.$inc)) {
-      setPath(doc, path, (Number(getPath(doc, path)) || 0) + Number(delta));
+      const resolved = resolvePositional(doc, path, filter);
+      setPath(doc, resolved, (Number(getPath(doc, resolved)) || 0) + Number(delta));
     }
   }
   if (update.$push) {
@@ -138,7 +205,7 @@ const createCollection = (seed = []) => {
     async updateOne(filter = {}, update = {}, options = {}) {
       const target = docs.find((doc) => matches(doc, filter));
       if (target) {
-        applyUpdate(target, update);
+        applyUpdate(target, update, filter);
         return { matchedCount: 1, modifiedCount: 1, upsertedCount: 0 };
       }
       if (options.upsert) {
@@ -149,7 +216,8 @@ const createCollection = (seed = []) => {
         }
         const created = applyUpdate(
           { ...seedDoc, ...clone(update.$setOnInsert || {}) },
-          { ...update, $setOnInsert: undefined }
+          { ...update, $setOnInsert: undefined },
+          filter
         );
         docs.push(created);
         return { matchedCount: 0, modifiedCount: 0, upsertedCount: 1 };
