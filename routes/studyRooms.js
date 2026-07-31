@@ -120,15 +120,13 @@ module.exports = ({
     try {
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
       if (!room) return res.status(404).json({ error: "Room not found." });
-      await Promise.all(
-        (room.chats || []).map((chat) =>
-          ensureRoomChatSubscriptions({
-            chat: { ...chat, roomId: room._id.toString() },
-            participantIds: chat.participantIds || room.memberIds || [],
-            roomId: room._id.toString(),
-          })
-        )
-      );
+      // This used to reconcile every chat subscription before responding - a GET
+      // that wrote, fired the instant a user tapped Open, so anything that
+      // prefetched the route mutated state. Every path that can change who
+      // belongs to a chat already does it: create (POST /api/study-rooms),
+      // join (POST /:roomId/join, which iterates ALL the room's chats so a
+      // student joining a room that already has teachers is subscribed to
+      // those too), and add-teacher (POST /:roomId/teachers).
       res.json({ success: true, room: await hydrateStudyRoom(room) });
     } catch (err) {
       console.error("Error fetching study room:", err);
@@ -552,6 +550,21 @@ module.exports = ({
 
       const teacherSubjects = Array.isArray(teacher.subjects) ? teacher.subjects : [];
       const selectedSubject = subject || teacherSubjects[0] || teacher.category || "General";
+
+      // The admin route has had this guard since it was written; this one never
+      // did, so two students in the same room could add the same teacher for the
+      // same subject and produce two chats with byte-identical names.
+      const alreadyAdded = (room.teacherSessions || []).some(
+        (session) =>
+          session.teacherId === teacherId &&
+          String(session.subject || "General").toLowerCase() ===
+            String(selectedSubject).toLowerCase()
+      );
+      if (alreadyAdded)
+        return res
+          .status(409)
+          .json({ error: "This teacher is already in the room for that subject." });
+
       const teacherChat = await createStudyRoomChat({
         name: `${teacher.displayName || "Teacher"} - ${selectedSubject}`,
         type: "teacher",
