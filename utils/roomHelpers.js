@@ -70,6 +70,55 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     };
   };
 
+  /**
+   * The room-list shape: exactly the ten fields a room card renders, and
+   * nothing else.
+   *
+   * `hydrateStudyRoom` below fans out four queries per room - member user docs,
+   * teacher user docs, a quiz aggregate and a call-session aggregate. The list
+   * route ran it over 50 rooms, and the Rooms page called that route twice in
+   * parallel, so opening the page cost ~400 queries to render eight strings per
+   * card. Everything those queries produced (`members`, `progress.goals[]` with
+   * their vote maps, `attendanceByStudent`, `teacherSessions[].teacher`) was
+   * shipped and then dropped on the floor by the client.
+   *
+   * This one issues no queries at all: `buildMemberStatuses` is pure, and every
+   * other field is already on the room document.
+   */
+  const hydrateStudyRoomLite = (room) => {
+    if (!room) return null;
+    return {
+      id: room._id.toString(),
+      name: room.name,
+      keyword: room.keyword,
+      category: room.category,
+      type: room.type,
+      visibility: room.visibility,
+      memberIds: room.memberIds || [],
+      memberCount: (room.memberIds || []).length,
+      memberStatuses: buildMemberStatuses(room),
+      maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
+    };
+  };
+
+  /** The projection hydrateStudyRoomLite needs - keep the two in step. */
+  const STUDY_ROOM_LIST_PROJECTION = {
+    name: 1,
+    keyword: 1,
+    category: 1,
+    type: 1,
+    visibility: 1,
+    memberIds: 1,
+    maxStudents: 1,
+    memberStatuses: 1,
+    // getRoomMembership reads these three too - drop any of them and isActive
+    // silently computes differently from the full hydrator
+    freeAccess: 1,
+    creditExpenseEnabled: 1,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
   const hydrateStudyRoom = async (room) => {
     if (!room) return null;
     const roomId = room._id.toString();
@@ -397,6 +446,8 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     buildMemberStatuses,
     hydrateRoomProgress,
     hydrateStudyRoom,
+    hydrateStudyRoomLite,
+    STUDY_ROOM_LIST_PROJECTION,
     hydrateTeacherRoomChat,
     createStudyRoomChat,
     ensureRoomChatSubscriptions,

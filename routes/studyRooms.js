@@ -29,6 +29,8 @@ module.exports = ({
   const {
     getRoomMembership,
     hydrateStudyRoom,
+    hydrateStudyRoomLite,
+    STUDY_ROOM_LIST_PROJECTION,
     hydrateTeacherRoomChat,
     createStudyRoomChat,
     getUniqueRoomKeyword,
@@ -37,29 +39,63 @@ module.exports = ({
     ensureRoomChatSubscriptions,
   } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes });
 
+  /**
+   * The room list.
+   *
+   * This used to run the full `hydrateStudyRoom` over every result, which fans
+   * out four queries per room, and the Rooms page called the route twice in
+   * parallel - once for public rooms, once with memberOnly=true - so a single
+   * page load cost roughly 400 queries and shipped member and teacher user
+   * documents the card never reads.
+   *
+   * Now: one projected query, no fan-out, and both slices in one response.
+   * `?memberOnly=true` is still honoured for older app builds in the wild.
+   */
   router.get("/api/study-rooms", async (req, res) => {
     try {
       const { category, type, userId, memberOnly } = req.query;
-      const filter =
-        userId && memberOnly === "true"
-          ? { memberIds: userId }
-          : userId
-          ? { $or: [{ visibility: "public" }, { memberIds: userId }] }
-          : { visibility: "public" };
+      const legacyMemberOnly = memberOnly === "true";
 
-      if (category) filter.category = category;
-      if (type) filter.type = type;
+      const filter = userId
+        ? legacyMemberOnly
+          ? { memberIds: userId }
+          : { $or: [{ visibility: "public" }, { memberIds: userId }] }
+        : { visibility: "public" };
+
+      // A room the user has joined stays in their list whatever their current
+      // study profile says, so the category/type filter only narrows the public
+      // side. It used to narrow both, which quietly hid your own rooms when you
+      // changed profile.
+      if (category || type) {
+        const scope = {};
+        if (category) scope.category = category;
+        if (type) scope.type = type;
+        if (userId && !legacyMemberOnly) {
+          filter.$or = [{ visibility: "public", ...scope }, { memberIds: userId }];
+        } else {
+          Object.assign(filter, scope);
+        }
+      }
 
       const rooms = await studyRooms
-        .find(filter)
+        .find(filter, { projection: STUDY_ROOM_LIST_PROJECTION })
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(50)
         .toArray();
-      const hydratedRooms = await Promise.all(rooms.map(hydrateStudyRoom));
+
+      const hydratedRooms = rooms.map(hydrateStudyRoomLite);
+      const joined = userId
+        ? hydratedRooms.filter((room) => room.memberIds.includes(userId))
+        : [];
+      const available = userId
+        ? hydratedRooms.filter((room) => !room.memberIds.includes(userId))
+        : hydratedRooms;
 
       res.json({
         success: true,
-        rooms: hydratedRooms,
+        rooms: hydratedRooms, // kept for older builds that read a flat list
+        joined,
+        available,
         costs: { join: STUDY_ROOM_JOIN_CREDIT, create: STUDY_ROOM_CREATE_CREDIT },
       });
     } catch (err) {

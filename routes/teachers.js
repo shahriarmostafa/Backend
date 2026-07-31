@@ -1,5 +1,22 @@
 const { Router } = require("express");
 
+// The tutor list card reads uid, displayName, photoURL, rating, experience,
+// category, type and subjects. `{ id, ...doc }` shipped whole user documents -
+// email, points, totalPoints, approval flags, everything - to every student
+// browsing tutors.
+const TEACHER_LIST_PROJECTION = {
+  uid: 1,
+  displayName: 1,
+  photoURL: 1,
+  rating: 1,
+  experience: 1,
+  category: 1,
+  type: 1,
+  subjects: 1,
+  isActive: 1,
+  role: 1,
+};
+
 module.exports = ({ userCollection }) => {
   const router = Router();
 
@@ -11,7 +28,10 @@ module.exports = ({ userCollection }) => {
       if (subject) filter.subjects = subject;
       if (type) filter.type = type;
 
-      const result = await userCollection.find(filter).toArray();
+      const result = await userCollection
+        .find(filter, { projection: TEACHER_LIST_PROJECTION })
+        .limit(200)
+        .toArray();
       const teacherList = result.map((doc) => ({ id: doc._id, ...doc }));
       res.status(200).send({ success: true, teachers: teacherList });
     } catch (error) {
