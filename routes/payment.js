@@ -1,5 +1,6 @@
 const { Router } = require("express");
 const { makeReferralHelpers } = require("../utils/referralHelpers");
+const { getSubscriptionStatus } = require("../utils/subscriptionStatus");
 
 module.exports = ({
   activepackages,
@@ -459,11 +460,10 @@ module.exports = ({
     const { userId } = req.params;
     try {
       const sub = await activepackages.findOne({ uid: userId });
-      if (!sub) return res.json({ subscription: null });
-
-      const isValid =
-        new Date(sub.expiryDate) > new Date() && sub.credit > 0 && sub.isActive === true;
-      res.json({ isSubscribed: isValid, subscription: sub });
+      const { isSubscribed, outOfCredit } = getSubscriptionStatus(sub);
+      // the no-subscription branch used to return `{ subscription: null }` with
+      // no isSubscribed key at all, so the client set its flag to undefined
+      res.json({ isSubscribed, outOfCredit, subscription: sub || null });
     } catch (err) {
       res.status(500).json({ error: "Server error" });
     }
