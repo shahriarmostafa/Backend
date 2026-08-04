@@ -1,15 +1,58 @@
 const { Router } = require("express");
+const { ObjectId } = require("mongodb");
 const { makeReferralHelpers } = require("../utils/referralHelpers");
 const { getSubscriptionStatus } = require("../utils/subscriptionStatus");
+const {
+  priceCataloguePackage,
+  priceCreditPack,
+  priceExtension,
+} = require("../utils/purchasePricing");
 
 module.exports = ({
   activepackages,
   subscriptions,
   userCollection,
   referrals,
+  packages,
+  creditPrices,
   shurjopay,
 }) => {
   const router = Router();
+
+  /**
+   * Turns "what do you want to buy" into "what it costs".
+   *
+   * The caller supplies a packageId and, for the two computed kinds, how much
+   * credit and how many hours they want. Every figure with money attached is
+   * looked up or derived here - the body's `amount`, `price`, `credit` and
+   * `durationDays` are ignored entirely. They used to BE the price, and a
+   * request claiming `amount: 1` was granted outright.
+   */
+  const resolvePurchase = async ({ packageId, uid, requestedCredit, requestedHours }) => {
+    if (packageId === "credit-pack") {
+      const sub = await activepackages.findOne({ uid });
+      const category = sub?.category || null;
+      const type = sub?.type || null;
+      const priceDoc = await creditPrices.findOne({ category, type });
+      return priceCreditPack({
+        requestedCredit,
+        pricePerCredit: priceDoc?.pricePerCredit,
+        category,
+        type,
+      });
+    }
+
+    if (packageId === "custom-extension") {
+      const sub = await activepackages.findOne({ uid });
+      return priceExtension({ requestedCredit, requestedHours, subscription: sub });
+    }
+
+    if (!packageId || !ObjectId.isValid(packageId)) {
+      return { error: "Unknown package." };
+    }
+    const packageDoc = await packages.findOne({ _id: new ObjectId(packageId) });
+    return priceCataloguePackage(packageDoc);
+  };
 
   const { awardReferralCredit } = makeReferralHelpers({
     userCollection,
@@ -20,28 +63,35 @@ module.exports = ({
 
   router.post("/pay-poperl", async (req, res) => {
     const {
-      amount,
       order_id,
       customer_name,
       customer_phone,
-      uid,
       displayName,
-      packageName,
-      price,
-      durationDays,
       customer_city,
       currency,
       customer_address,
-      credit,
-      category,
-      type,
-      isUnlimited,
+      packageId,
+      requestedCredit,
+      requestedHours,
     } = req.body;
 
-    if (amount < 10) {
+    // the buyer is the verified caller, not whoever the body names
+    const uid = req.auth?.uid || req.body.uid;
+    if (!uid) return res.status(401).json({ error: "Sign in to buy a package." });
+
+    const priced = await resolvePurchase({ packageId, uid, requestedCredit, requestedHours });
+    if (priced.error) return res.status(400).json({ error: priced.error });
+
+    const { amount, credit, durationHours, packageName, category, type, isUnlimited } = priced;
+
+    // Only a package the ADMIN priced at zero is granted outright. This used to
+    // trigger on `amount < 10` with the amount taken from the request body, so
+    // posting `{ amount: 1, credit: 999999 }` bought an unlimited subscription
+    // for nothing.
+    if (amount === 0) {
       const startDate = new Date();
       const expiryDate = new Date(startDate);
-      expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
+      expiryDate.setHours(expiryDate.getHours() + durationHours);
 
       await activepackages.updateOne(
         { uid },
@@ -51,7 +101,7 @@ module.exports = ({
             packageName,
             startDate: startDate.toISOString(),
             expiryDate: expiryDate.toISOString(),
-            credit: Number(credit),
+            credit,
             totalCredit: credit,
             isActive: true,
             paymentStatus: "approved",
@@ -59,13 +109,13 @@ module.exports = ({
             category,
             type,
             isUnlimited: Boolean(isUnlimited),
-            price: Number(price),
+            price: 0,
           },
         },
         { upsert: true }
       );
 
-      return res.json({ checkout_url: "poperl://webview" });
+      return res.json({ checkout_url: "poperl://webview", amount: 0, credit });
     }
 
     const metadata = {
@@ -74,8 +124,8 @@ module.exports = ({
       uid,
       displayName,
       packageName,
-      price,
-      durationDays,
+      price: amount,
+      durationDays: durationHours,
       credit,
       category,
       type,
@@ -107,25 +157,29 @@ module.exports = ({
 
   router.post("/extend-package", async (req, res) => {
     const {
-      amount,
       order_id,
       customer_name,
       customer_phone,
-      uid,
       displayName,
-      packageName,
-      price,
-      durationDays,
       customer_city,
       currency,
       customer_address,
-      credit,
-      category,
-      type,
-      isUnlimited,
+      packageId,
+      requestedCredit,
+      requestedHours,
     } = req.body;
 
-    if (Number(amount) < 10) {
+    const uid = req.auth?.uid || req.body.uid;
+    if (!uid) return res.status(401).json({ error: "Sign in to extend your package." });
+
+    // Same shape as /pay-poperl: the extension is priced against what this
+    // buyer originally paid per credit, never against numbers they send.
+    const priced = await resolvePurchase({ packageId, uid, requestedCredit, requestedHours });
+    if (priced.error) return res.status(400).json({ error: priced.error });
+
+    const { amount, credit, durationHours, packageName, category, type, isUnlimited } = priced;
+
+    if (amount === 0) {
       try {
         const existingPackage = await activepackages.findOne({ uid });
         if (!existingPackage)
@@ -136,10 +190,10 @@ module.exports = ({
           existingPackage.expiryDate && new Date(existingPackage.expiryDate) > now
             ? new Date(existingPackage.expiryDate)
             : new Date(now);
-        expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
+        expiryDate.setHours(expiryDate.getHours() + durationHours);
 
-        const updatedCredit = Number(existingPackage.credit || 0) + Number(credit);
-        const updatedTotalCredit = Number(existingPackage.totalCredit || 0) + Number(credit);
+        const updatedCredit = Number(existingPackage.credit || 0) + credit;
+        const updatedTotalCredit = Number(existingPackage.totalCredit || 0) + credit;
 
         await activepackages.updateOne(
           { uid },
@@ -148,7 +202,7 @@ module.exports = ({
               expiryDate: expiryDate.toISOString(),
               credit: updatedCredit,
               totalCredit: updatedTotalCredit,
-              price: (existingPackage.price || 0) + Number(price),
+              price: (existingPackage.price || 0) + amount,
               isUnlimited:
                 Boolean(isUnlimited) || Boolean(existingPackage.isUnlimited),
               updatedAt: new Date(),
@@ -160,9 +214,9 @@ module.exports = ({
           uid,
           name: displayName,
           packageName,
-          credit: Number(credit),
-          price: Number(price),
-          durationDays: Number(durationDays),
+          credit,
+          price: amount,
+          durationDays: durationHours,
           category,
           type,
           packageType: "extension",
@@ -188,8 +242,8 @@ module.exports = ({
       uid,
       displayName,
       packageName,
-      price,
-      durationDays,
+      price: amount,
+      durationDays: durationHours,
       credit,
       category,
       type,
@@ -301,7 +355,7 @@ module.exports = ({
                     expiryDate: expiryDate.toISOString(),
                     credit: updatedCredit,
                     totalCredit: updatedTotalCredit,
-                    price: (existingPackage.price || 0) + Number(price),
+                    price: (existingPackage.price || 0) + amount,
                     isUnlimited:
                       Boolean(isUnlimited) || Boolean(existingPackage.isUnlimited),
                     updatedAt: new Date(),

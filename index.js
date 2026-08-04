@@ -93,6 +93,10 @@ async function run() {
       courses: db.collection("courses"),
       roomQuizzes: db.collection("roomQuizzes"),
       publicQuizzes: db.collection("publicQuizzes"),
+      // the payment routes price purchases from these rather than from the
+      // request body
+      packages: db.collection("packages"),
+      creditPrices: db.collection("creditPrices"),
       databaseinmongo: db,
       client,
     };
