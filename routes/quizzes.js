@@ -3,7 +3,7 @@ const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeQuizHelpers, makePublicQuizHelpers } = require("../utils/quizHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
-const { makeSupabaseStorage } = require("../utils/supabaseStorage");
+const { makeR2Storage } = require("../utils/r2Storage");
 const {
   ROOM_QUIZ_ATTEND_CREDIT,
   ROOM_QUIZ_MAX_QUESTIONS,
@@ -15,7 +15,7 @@ const {
 
 module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, activepackages, databaseinmongo, client }) => {
   const router = Router();
-  const supabaseStorage = makeSupabaseStorage();
+  const r2Storage = makeR2Storage();
   const { createNotification, createRoomNotification } = makeNotificationHelpers({
     databaseinmongo,
     userCollection,
@@ -634,8 +634,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       });
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
 
-      await supabaseStorage.deletePaths(supabaseStorage.collectQuizStoragePaths(quiz));
-      await supabaseStorage.deleteFolders([`rooms/${req.params.roomId}/quizzes/${quiz._id.toString()}`]);
+      await r2Storage.deletePaths(r2Storage.collectQuizStoragePaths(quiz));
+      await r2Storage.deleteFolders([`rooms/${req.params.roomId}/quizzes/${quiz._id.toString()}`]);
       await roomQuizzes.deleteOne({ _id: quiz._id });
       await createRoomNotification({
         room,
@@ -708,8 +708,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       if (!canDelete)
         return res.status(403).json({ error: "Only the quiz teacher or room creator can delete this quiz." });
 
-      await supabaseStorage.deletePaths(supabaseStorage.collectQuizStoragePaths(quiz));
-      await supabaseStorage.deleteFolders([`rooms/${req.params.roomId}/quizzes/${quiz._id.toString()}`]);
+      await r2Storage.deletePaths(r2Storage.collectQuizStoragePaths(quiz));
+      await r2Storage.deleteFolders([`rooms/${req.params.roomId}/quizzes/${quiz._id.toString()}`]);
       await roomQuizzes.deleteOne({ _id: quiz._id });
       res.json({ success: true });
     } catch (err) {

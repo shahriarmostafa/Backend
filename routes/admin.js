@@ -1,7 +1,7 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
-const { makeSupabaseStorage } = require("../utils/supabaseStorage");
+const { makeR2Storage } = require("../utils/r2Storage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 // getTeacherWithdrawalBreakdown lives in utils/moneyHelpers.js so it can be
 // unit tested without building a route or connecting to Mongo.
@@ -22,7 +22,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
     ensureRoomChatSubscriptions,
     getUniqueRoomKeyword,
   } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes });
-  const supabaseStorage = makeSupabaseStorage();
+  const r2Storage = makeR2Storage();
   const { getTeacherQualitySummary } = makeTeacherQualityHelpers({ databaseinmongo, userCollection });
 
   const getScopedFilter = (category, type) => {
@@ -1034,8 +1034,8 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
     try {
       const quiz = await publicQuizzes.findOne({ _id: new ObjectId(req.params.quizId) });
       if (!quiz) return res.status(404).json({ success: false, error: "Quiz not found." });
-      await supabaseStorage.deletePaths(supabaseStorage.collectQuizStoragePaths(quiz));
-      await supabaseStorage.deleteFolders([`public-quizzes/${quiz._id.toString()}`]);
+      await r2Storage.deletePaths(r2Storage.collectQuizStoragePaths(quiz));
+      await r2Storage.deleteFolders([`public-quizzes/${quiz._id.toString()}`]);
       await publicQuizzes.deleteOne({ _id: quiz._id });
       res.json({ success: true });
     } catch (err) {
@@ -1264,10 +1264,10 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
         ? await databaseinmongo.collection("chatDB").find({ _id: { $in: objectIds } }).toArray()
         : [];
       const chatStoragePaths = chatDocs.flatMap((chat) =>
-        supabaseStorage.collectMessageStoragePaths(chat.messages || [])
+        r2Storage.collectMessageStoragePaths(chat.messages || [])
       );
-      const storageResult = await supabaseStorage.deletePaths(chatStoragePaths);
-      const folderStorageResult = await supabaseStorage.deleteFolders([
+      const storageResult = await r2Storage.deletePaths(chatStoragePaths);
+      const folderStorageResult = await r2Storage.deleteFolders([
         `rooms/${roomId}`,
         ...chatIds.map((chatId) => `chats/${chatId}`),
       ]);
@@ -1390,8 +1390,8 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
       const { chatId } = req.params;
       const chatObjectId = ObjectId.isValid(chatId) ? new ObjectId(chatId) : null;
       const chatDoc = chatObjectId ? await databaseinmongo.collection("chatDB").findOne({ _id: chatObjectId }) : null;
-      await supabaseStorage.deletePaths(supabaseStorage.collectMessageStoragePaths(chatDoc?.messages || []));
-      await supabaseStorage.deleteFolders([`chats/${chatId}`]);
+      await r2Storage.deletePaths(r2Storage.collectMessageStoragePaths(chatDoc?.messages || []));
+      await r2Storage.deleteFolders([`chats/${chatId}`]);
       await studyRooms.updateOne(
         { _id: room._id },
         {

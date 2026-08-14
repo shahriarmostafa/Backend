@@ -61,6 +61,92 @@ module.exports = ({
     subscriptions,
   });
 
+  const getGatewayAmount = (amount) => {
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    return String(Math.round(value));
+  };
+
+  const startGatewayCheckout = ({
+    res,
+    orderId,
+    amount,
+    clientAmount,
+    customer_name,
+    customer_phone,
+    customer_city,
+    currency,
+    customer_address,
+    metadata,
+    context,
+  }) => {
+    const gatewayAmount = getGatewayAmount(amount);
+    if (!gatewayAmount) {
+      return res.status(400).json({
+        error: "Could not calculate a valid payment amount for this purchase.",
+      });
+    }
+
+    const clientValue = Number(clientAmount);
+    if (Number.isFinite(clientValue) && Math.round(clientValue) !== Number(gatewayAmount)) {
+      console.warn("Client quoted amount differs from server amount:", {
+        context,
+        orderId,
+        clientAmount: clientValue,
+        serverAmount: Number(gatewayAmount),
+      });
+    }
+
+    const checkoutPayload = {
+      amount: gatewayAmount,
+      order_id: orderId,
+      customer_name,
+      customer_phone,
+      client_ip: reqIpSafe(metadata.reqIp),
+      customer_city,
+      currency,
+      customer_address,
+      value1: JSON.stringify(metadata.value),
+    };
+
+    console.info("Starting ShurjoPay checkout:", {
+      context,
+      orderId,
+      amount: checkoutPayload.amount,
+      hasCustomerName: Boolean(customer_name),
+      hasCustomerPhone: Boolean(customer_phone),
+      currency,
+    });
+
+    shurjopay.makePayment(
+      checkoutPayload,
+      async (resp) => {
+        if (!resp?.checkout_url) {
+          console.error("Payment gateway rejected checkout:", {
+            context,
+            orderId,
+            amount: gatewayAmount,
+            payloadKeys: Object.keys(checkoutPayload),
+            response: resp,
+          });
+          return res.status(502).json({
+            error: "Payment gateway rejected checkout.",
+            details: resp,
+          });
+        }
+
+        res.json({ checkout_url: resp.checkout_url });
+      },
+      (err) => {
+        const details = err.response?.data || err.message;
+        console.error("Payment error:", details);
+        res.status(500).json({ error: err.message, details });
+      }
+    );
+  };
+
+  const reqIpSafe = (ip) => ip || "127.0.0.1";
+
   router.post("/pay-poperl", async (req, res) => {
     const {
       order_id,
@@ -73,6 +159,7 @@ module.exports = ({
       packageId,
       requestedCredit,
       requestedHours,
+      amount: clientAmount,
     } = req.body;
 
     // the buyer is the verified caller, not whoever the body names
@@ -132,27 +219,19 @@ module.exports = ({
       isUnlimited: Boolean(isUnlimited),
     };
 
-    shurjopay.makePayment(
-      {
-        amount,
-        order_id,
-        customer_name,
-        customer_phone,
-        client_ip: req.ip || "127.0.0.1",
-        customer_city,
-        currency,
-        customer_address,
-        value1: JSON.stringify(metadata),
-      },
-      async (resp) => {
-        console.log(resp);
-        res.json({ checkout_url: resp.checkout_url });
-      },
-      (err) => {
-        console.error("Payment error:", err);
-        res.status(500).json({ error: err.message });
-      }
-    );
+    return startGatewayCheckout({
+      res,
+      orderId: order_id,
+      amount,
+      clientAmount,
+      customer_name,
+      customer_phone,
+      customer_city,
+      currency,
+      customer_address,
+      metadata: { reqIp: req.ip, value: metadata },
+      context: "new-package",
+    });
   });
 
   router.post("/extend-package", async (req, res) => {
@@ -167,6 +246,7 @@ module.exports = ({
       packageId,
       requestedCredit,
       requestedHours,
+      amount: clientAmount,
     } = req.body;
 
     const uid = req.auth?.uid || req.body.uid;
@@ -250,27 +330,19 @@ module.exports = ({
       isUnlimited: Boolean(isUnlimited),
     };
 
-    shurjopay.makePayment(
-      {
-        amount,
-        order_id,
-        customer_name,
-        customer_phone,
-        client_ip: req.ip || "127.0.0.1",
-        customer_city,
-        currency,
-        customer_address,
-        value1: JSON.stringify(metadata),
-      },
-      async (resp) => {
-        console.log(resp);
-        res.json({ checkout_url: resp.checkout_url });
-      },
-      (err) => {
-        console.error("Payment error:", err);
-        res.status(500).json({ error: err.message });
-      }
-    );
+    return startGatewayCheckout({
+      res,
+      orderId: order_id,
+      amount,
+      clientAmount,
+      customer_name,
+      customer_phone,
+      customer_city,
+      currency,
+      customer_address,
+      metadata: { reqIp: req.ip, value: metadata },
+      context: "extension",
+    });
   });
 
   router.get("/ipn", async (req, res) => {
@@ -355,7 +427,7 @@ module.exports = ({
                     expiryDate: expiryDate.toISOString(),
                     credit: updatedCredit,
                     totalCredit: updatedTotalCredit,
-                    price: (existingPackage.price || 0) + amount,
+                    price: Number(existingPackage.price || 0) + Number(price || 0),
                     isUnlimited:
                       Boolean(isUnlimited) || Boolean(existingPackage.isUnlimited),
                     updatedAt: new Date(),

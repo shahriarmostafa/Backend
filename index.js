@@ -105,6 +105,7 @@ async function run() {
     app.use(require("./routes/teachers")(collections));
     app.use(require("./routes/studyRooms")({ ...collections, admin }));
     app.use(require("./routes/courses")(collections));
+    app.use(require("./routes/storage")());
     app.use(require("./routes/quizzes")(collections));
     app.use(require("./routes/progress")(collections));
     app.use(require("./routes/notificationFeed")(collections));

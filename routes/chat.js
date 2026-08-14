@@ -1,7 +1,7 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
-const { makeSupabaseStorage } = require("../utils/supabaseStorage");
+const { makeR2Storage } = require("../utils/r2Storage");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 const {
@@ -33,7 +33,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     studyRooms,
     activepackages,
   });
-  const supabaseStorage = makeSupabaseStorage();
+  const r2Storage = makeR2Storage();
   const { recordReactionEvent, recordFirstReplySpeedEvent, applyTeacherQualitySnapshot } =
     makeTeacherQualityHelpers({ databaseinmongo, userCollection });
   const { createRoomNotification } = makeNotificationHelpers({
@@ -670,9 +670,9 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         .toArray();
       const participantIds = participants.map((item) => item._id);
       const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
-      const storagePaths = supabaseStorage.collectMessageStoragePaths(chatDoc?.messages || []);
-      const storageResult = await supabaseStorage.deletePaths(storagePaths);
-      const folderStorageResult = await supabaseStorage.deleteFolders([`chats/${chatId}`]);
+      const storagePaths = r2Storage.collectMessageStoragePaths(chatDoc?.messages || []);
+      const storageResult = await r2Storage.deletePaths(storagePaths);
+      const folderStorageResult = await r2Storage.deleteFolders([`chats/${chatId}`]);
 
       await chatDB.deleteOne({ _id: new ObjectId(chatId) });
       await chatCollection.updateMany({}, { $pull: { chats: { chatId } } });
