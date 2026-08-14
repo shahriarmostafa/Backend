@@ -13,6 +13,13 @@ module.exports = () => {
   const router = Router();
   const r2Storage = makeR2Storage();
 
+  const parseBase64File = (data = "") => {
+    const value = String(data || "");
+    const commaIndex = value.indexOf(",");
+    const base64 = commaIndex >= 0 ? value.slice(commaIndex + 1) : value;
+    return Buffer.from(base64, "base64");
+  };
+
   router.post("/api/storage/upload-url", async (req, res) => {
     try {
       const { path, contentType = "application/octet-stream", size = 0 } = req.body || {};
@@ -28,6 +35,27 @@ module.exports = () => {
     } catch (err) {
       console.error("Error creating R2 upload URL:", err);
       res.status(500).json({ error: "Failed to prepare upload." });
+    }
+  });
+
+  router.post("/api/storage/upload", async (req, res) => {
+    try {
+      const { path, contentType = "application/octet-stream", data = "", size = 0 } = req.body || {};
+      const cleanPath = normalizePath(path);
+      if (!isAllowedPath(cleanPath)) return res.status(400).json({ error: "Invalid storage path." });
+      if (!data) return res.status(400).json({ error: "File data is required." });
+      if (Number(size) > MAX_UPLOAD_SIZE) return res.status(400).json({ error: "File is too large." });
+      if (!r2Storage.enabled) return res.status(503).json({ error: "R2 storage is not configured." });
+
+      const buffer = parseBase64File(data);
+      if (!buffer.length) return res.status(400).json({ error: "File data is empty." });
+      if (buffer.length > MAX_UPLOAD_SIZE) return res.status(400).json({ error: "File is too large." });
+
+      const uploaded = await r2Storage.putObject({ path: cleanPath, body: buffer, contentType });
+      res.json({ success: true, ...uploaded });
+    } catch (err) {
+      console.error("Error uploading to R2:", err);
+      res.status(500).json({ error: "Failed to upload file." });
     }
   });
 

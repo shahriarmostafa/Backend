@@ -30,7 +30,7 @@ if (!allowedOrigins.length) {
 }
 
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: "35mb" }));
 
 const server = http.createServer(app);
 const io = require("socket.io")(server, {

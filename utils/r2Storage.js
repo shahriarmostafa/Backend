@@ -276,6 +276,32 @@ const makeR2Storage = () => {
     return { path: cleanPath, uploadUrl: url, url: getPublicUrl(cleanPath), contentType };
   };
 
+  const putObject = async ({ path, body, contentType = "application/octet-stream" }) => {
+    const cleanPath = normalizePath(path);
+    if (!enabled) throw new Error("R2 storage is not configured.");
+    if (!cleanPath) throw new Error("Storage path is required.");
+
+    const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body || "");
+    const response = await signedFetch({
+      method: "PUT",
+      key: cleanPath,
+      headers: {
+        "content-type": contentType || "application/octet-stream",
+        "content-length": String(buffer.length),
+      },
+      body: buffer,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      throw new Error(
+        `[r2] upload ${config.bucket}/${cleanPath} failed: ${response.status} ${response.statusText} ${errorText.slice(0, 300)}`
+      );
+    }
+
+    return { path: cleanPath, url: getPublicUrl(cleanPath), contentType, size: buffer.length };
+  };
+
   const listFolder = async (prefix) => {
     if (!enabled) return [];
     const cleanPrefix = normalizePath(prefix);
@@ -333,6 +359,7 @@ const makeR2Storage = () => {
     config,
     getPublicUrl,
     getUploadUrl,
+    putObject,
     listFolder,
     collectMessageStoragePaths,
     collectQuizStoragePaths,
