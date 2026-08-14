@@ -6,7 +6,7 @@ const MAX_UPLOAD_SIZE = 25 * 1024 * 1024;
 const isAllowedPath = (path = "") => {
   const cleanPath = normalizePath(path);
   if (!cleanPath || cleanPath.includes("..")) return false;
-  return /^(chats|rooms|public-quizzes|announcements|courses|whiteboard-images)\//.test(cleanPath);
+  return /^(chat|chats|rooms|public-quizzes|announcements|courses|whiteboard-images)\//.test(cleanPath);
 };
 
 module.exports = () => {
