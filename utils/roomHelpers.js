@@ -405,13 +405,16 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
   };
 
   const spendStudentCredit = async (studentId, amount) => {
+    const creditToSpend = Math.max(0, Number(amount) || 0);
+    if (creditToSpend === 0) return { ok: true, credit: null };
+
     const { credit, isValid } = await getStudentCreditPackage(studentId);
     if (!isValid)
       return { ok: false, status: 403, message: "No active package found for this student." };
-    if (credit < amount)
-      return { ok: false, status: 402, message: `At least ${amount} credit is required.` };
-    await activepackages.updateOne({ uid: studentId }, { $inc: { credit: -amount } });
-    return { ok: true, credit: credit - amount };
+    if (credit < creditToSpend)
+      return { ok: false, status: 402, message: `At least ${creditToSpend} credit is required.` };
+    await activepackages.updateOne({ uid: studentId }, { $inc: { credit: -creditToSpend } });
+    return { ok: true, credit: credit - creditToSpend };
   };
 
   const renewRoomMembership = async (room, userId) => {
