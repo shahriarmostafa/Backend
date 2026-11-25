@@ -6,6 +6,7 @@ const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
 // getTeacherWithdrawalBreakdown lives in utils/moneyHelpers.js so it can be
 // unit tested without building a route or connecting to Mongo.
 const { roundMoney, getTeacherWithdrawalBreakdown } = require("../utils/moneyHelpers");
+const { resolveActor } = require("../utils/actor");
 const {
   STUDY_ROOM_MAX_STUDENTS,
   STUDY_ROOM_MONTH_MS,
@@ -436,7 +437,8 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
 
   router.get("/api/teachers/:uid/earnings", async (req, res) => {
     try {
-      const { uid } = req.params;
+      const uid = await resolveActor(req, res, req.params.uid);
+      if (!uid) return;
       const { category, type } = req.query;
       const teacher = await userCollection.findOne({ uid, role: "teacher" });
       if (!teacher) return res.status(404).json({ error: "Teacher not found" });
@@ -500,12 +502,13 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
   router.post("/api/teachers/withdraw", async (req, res) => {
     const mongoSession = client.startSession();
     try {
-      const { uid, bkashNumber } = req.body;
-      if (!uid || !bkashNumber) return res.status(400).json({ error: "uid and bkashNumber are required" });
+      const bkashNumber = String(req.body?.bkashNumber || "").replace(/[\s-]/g, "").replace(/^\+?88/, "");
+      if (!/^01[3-9]\d{8}$/.test(bkashNumber))
+        return res.status(400).json({ error: "Enter a valid 11-digit bKash number (01XXXXXXXXX)." });
 
       // a teacher may only request their own withdrawal
-      if (req.auth?.uid && uid !== req.auth.uid)
-        return res.status(403).json({ error: "Forbidden", reason: "uid_mismatch" });
+      const uid = await resolveActor(req, res, req.body?.uid);
+      if (!uid) return;
 
       const teacher = await userCollection.findOne({ uid, role: "teacher" });
       if (!teacher) return res.status(404).json({ error: "Teacher not found" });
@@ -590,17 +593,33 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
 
   router.post("/complain", async (req, res) => {
     try {
+      const uid = await resolveActor(req, res, req.body?.uid);
+      if (!uid) return;
+      const text = (value, max) => (typeof value === "string" ? value.trim().slice(0, max) : "");
+      const description = text(req.body?.description, 4000);
+      if (!description) return res.status(400).json({ error: "Please describe the problem." });
+
       const complains = databaseinmongo.collection("complains");
-      await complains.insertOne(req.body);
+      await complains.insertOne({
+        uid,
+        name: text(req.body?.name, 80),
+        title: text(req.body?.title, 150),
+        description,
+        whatsapp: text(String(req.body?.whatsapp ?? ""), 20),
+        status: "open",
+        createdAt: new Date(),
+      });
       res.status(200).json({ success: true });
     } catch (err) {
       console.log(err);
+      res.status(500).json({ error: "Could not submit the complaint." });
     }
   });
 
   router.get("/complain/:id", async (req, res) => {
     try {
-      const uid = req.params.id;
+      const uid = await resolveActor(req, res, req.params.id);
+      if (!uid) return;
       const complains = databaseinmongo.collection("complains");
       const result = await complains.find({ uid }).toArray();
       res.status(200).json({ success: true, data: result });
@@ -1129,7 +1148,8 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
         ];
       }
       const rooms = await studyRooms.find(filter).sort({ updatedAt: -1, createdAt: -1 }).limit(120).toArray();
-      const hydrated = await Promise.all(rooms.map(hydrateStudyRoom));
+      // admin screens show member contact details
+      const hydrated = await Promise.all(rooms.map((room) => hydrateStudyRoom(room, { includeContact: true })));
       res.json({ success: true, rooms: hydrated });
     } catch (err) {
       console.error("Error fetching admin study rooms:", err);
@@ -1212,7 +1232,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
         roomId: result.insertedId.toString(),
       });
       const room = await studyRooms.findOne({ _id: result.insertedId });
-      res.status(201).json({ success: true, room: await hydrateStudyRoom(room) });
+      res.status(201).json({ success: true, room: await hydrateStudyRoom(room, { includeContact: true }) });
     } catch (err) {
       console.error("Error creating admin study room:", err);
       res.status(500).json({ success: false, error: "Failed to create study room." });
@@ -1246,7 +1266,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
         );
       }
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
-      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom, { includeContact: true }) });
     } catch (err) {
       console.error("Error updating admin study room:", err);
       res.status(500).json({ success: false, error: "Failed to update study room." });
@@ -1301,7 +1321,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
 
       await addStudentsToRoom(room, [student], room.freeAccess !== false);
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
-      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom, { includeContact: true }) });
     } catch (err) {
       console.error("Error adding student to admin room:", err);
       res.status(500).json({ success: false, error: "Failed to add student." });
@@ -1329,7 +1349,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
         { $pull: { chats: { roomId: room._id.toString() } } }
       );
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
-      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom, { includeContact: true }) });
     } catch (err) {
       console.error("Error removing student from admin room:", err);
       res.status(500).json({ success: false, error: "Failed to remove student." });
@@ -1376,7 +1396,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
         roomId: room._id.toString(),
       });
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
-      res.status(201).json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      res.status(201).json({ success: true, room: await hydrateStudyRoom(updatedRoom, { includeContact: true }) });
     } catch (err) {
       console.error("Error adding teacher to admin room:", err);
       res.status(500).json({ success: false, error: "Failed to add teacher." });
@@ -1405,7 +1425,7 @@ module.exports = ({ userCollection, subscriptions, activepackages, publicQuizzes
         { $pull: { chats: { chatId } } }
       );
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
-      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom) });
+      res.json({ success: true, room: await hydrateStudyRoom(updatedRoom, { includeContact: true }) });
     } catch (err) {
       console.error("Error removing teacher from admin room:", err);
       res.status(500).json({ success: false, error: "Failed to remove teacher." });

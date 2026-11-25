@@ -207,7 +207,31 @@ const collectMessageStoragePaths = (messages = []) => {
   return [...new Set(paths.map(normalizePath).filter(Boolean))];
 };
 
+/** True when `path` is a file under `folder` (both normalised, no `..` games). */
+const isStoragePathWithin = (path, folder) => {
+  const cleanPath = normalizePath(path);
+  const cleanFolder = normalizePath(folder);
+  if (!cleanPath || !cleanFolder || cleanPath.split("/").includes("..")) return false;
+  return cleanPath.startsWith(`${cleanFolder}/`);
+};
+
+/** The folder a quiz's uploads live in - room and public quizzes differ. */
+const getQuizStorageFolder = (quiz = {}) => {
+  const quizId = quiz?._id ? String(quiz._id) : "";
+  if (!quizId) return "";
+  return quiz.roomId ? `rooms/${quiz.roomId}/quizzes/${quizId}` : `public-quizzes/${quizId}`;
+};
+
+/**
+ * Every stored file a quiz references, for deletion with the quiz.
+ *
+ * Answer paths and URLs come from students, so anything outside this quiz's
+ * own folder is ignored: a submitted `storagePath` pointing at someone else's
+ * chat upload used to be deleted along with the quiz.
+ */
 const collectQuizStoragePaths = (quiz = {}) => {
+  const folder = getQuizStorageFolder(quiz);
+  if (!folder) return [];
   const paths = [];
   (quiz.questions || []).forEach((question) => {
     if (question.storagePath) paths.push(question.storagePath);
@@ -221,7 +245,9 @@ const collectQuizStoragePaths = (quiz = {}) => {
       if (imagePath) paths.push(imagePath);
     });
   });
-  return [...new Set(paths.map(normalizePath).filter(Boolean))];
+  return [
+    ...new Set(paths.map(normalizePath).filter((path) => isStoragePathWithin(path, folder))),
+  ];
 };
 
 const parseListObjectsXml = (xml = "") => {
@@ -372,6 +398,8 @@ module.exports = {
   makeR2Storage,
   collectMessageStoragePaths,
   collectQuizStoragePaths,
+  getQuizStorageFolder,
+  isStoragePathWithin,
   extractStoragePath,
   normalizePath,
 };

@@ -11,7 +11,13 @@
  * well past any plausible network hiccup, and bills using the last heartbeat
  * rather than "now" so a student is not charged for hours they were absent.
  */
-const { getGeneralCallPoints, getCallCreditForSeconds, clampCreditRate } = require("./moneyHelpers");
+const {
+  getGeneralCallPoints,
+  getCallCreditForSeconds,
+  getBillableCallSeconds,
+  getRoomCallCreditRate,
+  clampCreditRate,
+} = require("./moneyHelpers");
 
 const DEFAULT_STALE_AFTER_MS = 10 * 60 * 1000; // silent for ten minutes
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
@@ -67,19 +73,51 @@ const makeSessionReaper = ({
       // another process (or a late /end-call) got there first
       if (closed.modifiedCount === 0) continue;
 
-      if (session.studentId && !session.creditFinalized) {
-        const rate = session.roomId ? Number(session.creditRate) || 1 : clampCreditRate(session.creditRate);
-        const credit = getCallCreditForSeconds(seconds, rate);
+      const isDirectCall = Boolean(session.studentId && session.teacherId && !session.roomId && !session.courseId);
+
+      if (session.studentId && !session.creditFinalized && !session.courseId) {
+        // A room class abandoned by the teacher is still a group class: bill
+        // it at the group rate, not each student at the solo rate.
+        let rate = clampCreditRate(session.creditRate);
+        if (session.roomId && session.roomCallId) {
+          const groupSessions = await callSession
+            .find({ roomId: session.roomId, roomCallId: session.roomCallId })
+            .toArray();
+          const groupSize = new Set(groupSessions.map((item) => item.studentId).filter(Boolean)).size;
+          rate = getRoomCallCreditRate(groupSize);
+        }
+        // Bill what the balance covers. This used to charge nothing at all when
+        // the student was short, yet record the full amount as deducted.
+        const pkg = activepackages
+          ? await activepackages.findOne({ uid: session.studentId }, { projection: { credit: 1 } })
+          : null;
+        const billableSeconds = getBillableCallSeconds(seconds, pkg?.credit, rate);
+        const credit = getCallCreditForSeconds(billableSeconds, rate);
+        let deducted = 0;
         if (credit > 0 && activepackages) {
-          await activepackages.updateOne(
+          const paid = await activepackages.updateOne(
             { uid: session.studentId, credit: { $gte: credit } },
             { $inc: { credit: -credit } }
           );
+          if (paid.modifiedCount > 0) deducted = credit;
         }
         await callSession.updateOne(
           { sessionId: session.sessionId },
-          { $set: { creditDeducted: credit, creditFinalized: true } }
+          { $set: { creditDeducted: deducted, billedSeconds: billableSeconds, creditFinalized: true } }
         );
+
+        // /end-call pays the teacher of a direct class; when neither side got
+        // to call it, the teacher used to earn nothing for the class.
+        if (isDirectCall && !session.teacherPointsFinalized && userCollection) {
+          const teacherPoints = deducted > 0 ? getGeneralCallPoints(billableSeconds) : 0;
+          if (teacherPoints > 0) {
+            await userCollection.updateOne({ uid: session.teacherId, role: "teacher" }, { $inc: { points: teacherPoints } });
+          }
+          await callSession.updateOne(
+            { sessionId: session.sessionId },
+            { $set: { teacherPointsAdded: teacherPoints, teacherPointsFinalized: true, teacherPointsFinalizedAt: new Date() } }
+          );
+        }
       }
 
       reaped += 1;

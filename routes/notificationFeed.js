@@ -1,35 +1,10 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
-const { makeNotificationHelpers } = require("../utils/notificationHelpers");
-
-const ALLOWED_ANNOUNCEMENT_FILE_TYPES = new Set([
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/gif",
-  "application/pdf",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-]);
-
-const sanitizeAnnouncementAttachments = (attachments = []) => {
-  if (!Array.isArray(attachments)) return [];
-  return attachments
-    .slice(0, 5)
-    .map((attachment) => ({
-      name: String(attachment?.name || "Attachment").trim().slice(0, 120),
-      url: String(attachment?.url || "").trim(),
-      path: String(attachment?.path || "").trim(),
-      type: String(attachment?.type || "").trim(),
-      size: Math.max(0, Number(attachment?.size) || 0),
-    }))
-    .filter((attachment) => {
-      if (!attachment.url || !attachment.path) return false;
-      if (ALLOWED_ANNOUNCEMENT_FILE_TYPES.has(attachment.type)) return true;
-      const name = attachment.name.toLowerCase();
-      return /\.(jpe?g|png|webp|gif|pdf|docx|pptx)$/.test(name);
-    });
-};
+const {
+  makeNotificationHelpers,
+  sanitizeAnnouncementAttachments,
+} = require("../utils/notificationHelpers");
+const { resolveActor } = require("../utils/actor");
 
 module.exports = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
   const router = Router();
@@ -87,9 +62,13 @@ module.exports = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
     return { allowed: false, status: 400, message: "Unsupported notification scope." };
   };
 
+  // Every route below reads or marks "my" notifications, so the uid is the
+  // token's; a claimed uid is only honoured for owners (utils/actor.js).
   router.get("/api/notifications", async (req, res) => {
     try {
-      const { scope = "room", scopeId, userId, limit } = req.query;
+      const { scope = "room", scopeId, limit } = req.query;
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       const access = await assertScopedAccess({ scope, scopeId, userId });
       if (!access.allowed)
         return res.status(access.status || 403).json({ error: access.message || "Not allowed." });
@@ -105,7 +84,9 @@ module.exports = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
 
   router.get("/api/notifications/unread-count", async (req, res) => {
     try {
-      const { scope = "room", scopeId, userId } = req.query;
+      const { scope = "room", scopeId } = req.query;
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       const access = await assertScopedAccess({ scope, scopeId, userId });
       if (!access.allowed)
         return res.status(access.status || 403).json({ error: access.message || "Not allowed." });
@@ -120,7 +101,9 @@ module.exports = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
 
   router.patch("/api/notifications/read", async (req, res) => {
     try {
-      const { scope = "room", scopeId, userId, notificationIds = [] } = req.body;
+      const { scope = "room", scopeId, notificationIds = [] } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const access = await assertScopedAccess({ scope, scopeId, userId });
       if (!access.allowed)
         return res.status(access.status || 403).json({ error: access.message || "Not allowed." });
@@ -139,20 +122,32 @@ module.exports = ({ databaseinmongo, userCollection, studyRooms, courses }) => {
       const {
         scope = "room",
         scopeId,
-        actorId,
-        actorRole = "",
         title = "Announcement",
         message,
         attachments = [],
       } = req.body;
+      const actorId = await resolveActor(req, res, req.body?.actorId);
+      if (!actorId) return;
+      // announcements only exist for rooms and courses; public quiz scope would
+      // otherwise fall through to createRoomNotification with no room
+      if (!["room", "course"].includes(scope))
+        return res.status(400).json({ error: "Announcements can be posted to rooms and courses only." });
       const access = await assertScopedAccess({ scope, scopeId, userId: actorId });
       if (!access.allowed)
         return res.status(access.status || 403).json({ error: access.message || "Not allowed." });
       if (scope === "course" && access.course?.teacherId !== actorId)
         return res.status(403).json({ error: "Only the course teacher can post course announcements." });
+      // the role shown on the announcement is derived, not taken from the body
+      const isRoomTeacherActor =
+        scope === "room" &&
+        (access.room?.teacherSessions || []).some((session) => session.teacherId === actorId);
+      const actorRole = scope === "course" || isRoomTeacherActor ? "teacher" : "student";
 
       const cleanMessage = String(message || "").trim();
-      const cleanAttachments = sanitizeAnnouncementAttachments(attachments);
+      const cleanAttachments = sanitizeAnnouncementAttachments(attachments, { scope, scopeId });
+      // say so instead of quietly posting without the rejected files
+      if (Array.isArray(attachments) && cleanAttachments.length < Math.min(attachments.length, 5))
+        return res.status(400).json({ error: "One or more files are not valid uploads for this announcement." });
       if (!cleanMessage && !cleanAttachments.length)
         return res.status(400).json({ error: "Announcement message or file is required." });
 

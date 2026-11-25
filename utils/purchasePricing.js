@@ -142,7 +142,9 @@ const priceExtension = ({ requestedCredit, requestedHours, subscription }) => {
     Math.min(MAX_EXTENSION_HOURS, Math.floor(Number(requestedHours) || 0))
   );
   const extraHours = Math.max(0, askedHours - generatedHours);
-  const amount = Math.max(0, Math.round(credit * perCredit + getExtraHourPrice(extraHours)));
+  // At least 1: a package bought at under half a taka per credit used to round
+  // small extensions to 0, and a zero-price extension is granted for free.
+  const amount = Math.max(1, Math.round(credit * perCredit + getExtraHourPrice(extraHours)));
 
   return {
     amount,

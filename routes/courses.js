@@ -2,6 +2,12 @@ const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeCourseHelpers } = require("../utils/courseHelpers");
 const { makeTeacherQualityHelpers } = require("../utils/teacherQualityHelpers");
+const { resolveActor } = require("../utils/actor");
+const { COURSE_MONTH_MS } = require("../utils/constants");
+
+// A single class can be bought until its join window closes (the course page
+// offers "Join class" up to 2 hours after the start).
+const SESSION_PURCHASE_CUTOFF_MS = 2 * 60 * 60 * 1000;
 
 module.exports = ({ userCollection, activepackages, databaseinmongo, courses, client }) => {
   const router = Router();
@@ -27,7 +33,10 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
 
   router.get("/api/courses", async (req, res) => {
     try {
-      const { userId, teacherId, mine, status } = req.query;
+      const { teacherId, mine, status } = req.query;
+      // decides whose enrollment comes back, so it is the token's uid
+      const userId = req.query.userId ? await resolveActor(req, res, req.query.userId) : "";
+      if (req.query.userId && !userId) return;
       const viewer = userId ? await userCollection.findOne({ uid: userId }) : null;
       const filter = {};
 
@@ -60,13 +69,18 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
 
   router.get("/api/courses/:courseId", async (req, res) => {
     try {
-      const { userId } = req.query;
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       const course = await getCourse(req.params.courseId);
       if (!course) return res.status(404).json({ error: "Course not found." });
-      const viewer = userId ? await userCollection.findOne({ uid: userId }) : null;
-      if (userId && !canAccessCourse(course, viewer))
+      const viewer = await userCollection.findOne({ uid: userId });
+      const isOwner = !canAccessCourse(course, viewer) && Boolean(await req.isOwner?.());
+      if (!canAccessCourse(course, viewer) && !isOwner)
         return res.status(403).json({ error: "This course is not available for you." });
-      res.json({ success: true, course: await helpers.hydrateCourse(course, userId) });
+      res.json({
+        success: true,
+        course: await helpers.hydrateCourse(course, userId, { includeEnrollments: isOwner }),
+      });
     } catch (err) {
       console.error("Error fetching course:", err);
       res.status(500).json({ error: "Failed to fetch course." });
@@ -76,7 +90,6 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
   router.post("/api/courses", async (req, res) => {
     try {
       const {
-        teacherId,
         title,
         subject = "",
         category = "school",
@@ -95,7 +108,12 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
         certificateEnabled = false,
         quizEnabled = true,
         quizExpenseEnabled = true,
+        // the creating device's offset from UTC in minutes (east positive); the
+        // schedule time is wall clock there. Platform zone when absent.
+        utcOffsetMinutes,
       } = req.body;
+      const teacherId = await resolveActor(req, res, req.body?.teacherId);
+      if (!teacherId) return;
       const teacher = await userCollection.findOne({ uid: teacherId, role: "teacher" });
       if (!teacher) return res.status(403).json({ error: "Only teachers can create courses." });
       const cleanTitle = String(title || "").trim();
@@ -105,13 +123,16 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
       const cleanType = audience === "everyone" ? "everyone" : helpers.normalizeType(type);
       const now = new Date();
       const months = Math.max(1, Number(durationMonths) || 1);
-      const start = startsAt ? new Date(startsAt) : now;
+      const parsedStart = startsAt ? new Date(startsAt) : now;
+      const start = Number.isNaN(parsedStart.getTime()) ? now : parsedStart;
       const sessions = helpers.buildScheduleSessions({
-        startsAt: start,
+        // passed through raw so a date-only value stays a calendar day
+        startsAt: startsAt && !Number.isNaN(parsedStart.getTime()) ? startsAt : start,
         months,
         days: Array.isArray(scheduleDays) ? scheduleDays : [],
         time: scheduleTime,
         totalClasses,
+        utcOffsetMinutes,
       });
 
       const doc = {
@@ -160,7 +181,8 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
 
   router.patch("/api/courses/:courseId", async (req, res) => {
     try {
-      const { teacherId } = req.body;
+      const teacherId = await resolveActor(req, res, req.body?.teacherId);
+      if (!teacherId) return;
       const course = await getCourse(req.params.courseId);
       if (!course) return res.status(404).json({ error: "Course not found." });
       if (course.teacherId !== teacherId) return res.status(403).json({ error: "Only the course teacher can edit it." });
@@ -201,10 +223,22 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
     }
   });
 
+  /**
+   * Buying a plan. A student can hold several enrollments - a second single
+   * class, or a new month after the last one lapsed - so "already enrolled" now
+   * means "already covered for what you are buying". It used to mean "has any
+   * enrollment", which left a student who bought one class unable to buy
+   * another, and a lapsed monthly student unable to renew.
+   *
+   * Runs in a transaction: two concurrent purchases both write the course doc,
+   * so one is retried, sees the other's enrollment, and is not charged.
+   */
   router.post("/api/courses/:courseId/enroll", async (req, res) => {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
     const session = client.startSession();
     try {
-      const { userId, paymentPlan = "monthly", sessionId = "" } = req.body;
+      const { paymentPlan = "monthly", sessionId = "" } = req.body;
       let responsePayload = null;
       await session.withTransaction(async () => {
         const course = await getCourse(req.params.courseId, session);
@@ -221,16 +255,40 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
           responsePayload = { status: 403, body: { error: "Only students can buy courses." } };
           return;
         }
-        const alreadyEnrolled = (course.enrollments || []).some((item) => item.studentId === userId && item.status !== "cancelled");
-        if (alreadyEnrolled) {
+        const now = new Date();
+        const plan = helpers.normalizePaymentPlan(paymentPlan);
+        const access = helpers.getCourseAccessSummary(course, userId, now);
+        const targetSessionId = plan === "session" ? String(sessionId || "").trim() : "";
+        if (plan === "session") {
+          const targetSession = (course.sessions || []).find((item) => String(item.id) === targetSessionId);
+          if (!targetSession) {
+            responsePayload = { status: 400, body: { error: "Choose the class you want to buy." } };
+            return;
+          }
+          const startsAt = targetSession.scheduledAt ? new Date(targetSession.scheduledAt).getTime() : 0;
+          if (startsAt && startsAt + SESSION_PURCHASE_CUTOFF_MS < now.getTime()) {
+            responsePayload = { status: 409, body: { error: "This class has already finished." } };
+            return;
+          }
+        }
+        const alreadyCovered =
+          plan === "full"
+            ? access.full
+            : plan === "monthly"
+              ? access.coversAll
+              : helpers.hasCourseSessionAccess(course, userId, targetSessionId, now);
+        if (alreadyCovered) {
           responsePayload = { status: 200, body: { success: true, course: await helpers.hydrateCourse(course, userId), alreadyEnrolled: true } };
           return;
         }
-        if ((course.enrollments || []).filter((item) => item.status !== "cancelled").length >= (course.capacity || 30)) {
+        // seats are students, not purchases: a returning student keeps theirs
+        const seatedStudents = new Set(
+          (course.enrollments || []).filter((item) => item.status !== "cancelled").map((item) => item.studentId)
+        );
+        if (!access.enrolled && seatedStudents.size >= (course.capacity || 30)) {
           responsePayload = { status: 409, body: { error: "This course is full." } };
           return;
         }
-        const plan = helpers.normalizePaymentPlan(paymentPlan);
         const creditCost = Math.ceil(Number(course.pricing?.[plan]) || 0);
         if (creditCost <= 0) {
           responsePayload = { status: 409, body: { error: "This payment option is not available yet." } };
@@ -242,16 +300,15 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
           return;
         }
 
-        const now = new Date();
         const enrollment = {
           studentId: userId,
           student,
           paymentPlan: plan,
-          sessionId: plan === "session" ? sessionId : "",
+          sessionId: targetSessionId,
           creditPaid: creditCost,
           status: "active",
           enrolledAt: now,
-          validUntil: plan === "monthly" ? new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000) : null,
+          validUntil: plan === "monthly" ? new Date(now.getTime() + COURSE_MONTH_MS) : null,
         };
         const payment = {
           courseId: course._id.toString(),
@@ -294,13 +351,18 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
 
   router.post("/api/courses/:courseId/sessions/:sessionId/rate", async (req, res) => {
     try {
-      const { userId, rating, note = "" } = req.body;
+      const { rating, note = "" } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const course = await getCourse(req.params.courseId);
       if (!course) return res.status(404).json({ error: "Course not found." });
       if (!(course.enrollments || []).some((item) => item.studentId === userId && item.status !== "cancelled"))
         return res.status(403).json({ error: "Enroll before rating course sessions." });
       const session = (course.sessions || []).find((item) => item.id === req.params.sessionId);
       if (!session) return res.status(404).json({ error: "Class session not found." });
+      // the page only offers rating after attending; ratings move teacher quality
+      if (!session.studentAttendance?.[userId])
+        return res.status(403).json({ error: "Attend this class before rating it." });
       if ((session.ratings || []).some((item) => item.studentId === userId))
         return res.status(409).json({ error: "You already rated this session." });
       const review = {
@@ -340,11 +402,17 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
 
   router.patch("/api/courses/:courseId/sessions/:sessionId/reschedule", async (req, res) => {
     try {
-      const { teacherId, scheduledAt, time = "" } = req.body;
+      // scheduledAt is an ISO instant from the app (built from the teacher's
+      // local datetime-local value), so no server-timezone guessing here
+      const { scheduledAt, time = "" } = req.body;
+      const teacherId = await resolveActor(req, res, req.body?.teacherId);
+      if (!teacherId) return;
       const course = await getCourse(req.params.courseId);
       if (!course) return res.status(404).json({ error: "Course not found." });
       if (course.teacherId !== teacherId)
         return res.status(403).json({ error: "Only the course teacher can reschedule classes." });
+      if (!(course.sessions || []).some((item) => item.id === req.params.sessionId))
+        return res.status(404).json({ error: "Class session not found." });
       const nextScheduledAt = scheduledAt ? new Date(scheduledAt) : null;
       if (!nextScheduledAt || Number.isNaN(nextScheduledAt.getTime()))
         return res.status(400).json({ error: "Valid class time is required." });
@@ -361,7 +429,9 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
         }
       );
       const updated = await courseCollection.findOne({ _id: course._id });
-      res.json({ success: true, course: await helpers.hydrateCourse(updated, userId) });
+      // was `userId`, which this handler never declared: the reschedule saved
+      // and then the response threw a ReferenceError (500)
+      res.json({ success: true, course: await helpers.hydrateCourse(updated, teacherId) });
     } catch (err) {
       console.error("Error rescheduling course session:", err);
       res.status(500).json({ error: "Failed to reschedule class." });
@@ -382,7 +452,7 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
       if (req.query.type) filter.type = req.query.type;
       const list = await courseCollection.find(filter).sort({ updatedAt: -1 }).limit(120).toArray();
       const courses = await Promise.all(list.map(async (course) => ({
-        ...(await helpers.hydrateCourse(course)),
+        ...(await helpers.hydrateCourse(course, "", { includeEnrollments: true })),
         earnings: await helpers.calculateCourseEarnings(course),
       })));
       res.json({ success: true, courses });
@@ -415,7 +485,7 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, courses, cl
         }
       );
       const updated = await courseCollection.findOne({ _id: course._id });
-      res.json({ success: true, course: await helpers.hydrateCourse(updated) });
+      res.json({ success: true, course: await helpers.hydrateCourse(updated, "", { includeEnrollments: true }) });
     } catch (err) {
       console.error("Error approving course:", err);
       res.status(500).json({ error: "Failed to approve course." });

@@ -95,4 +95,22 @@ module.exports = {
   ],
   REFERRAL_REWARD_CREDIT: 50,
   REFERRAL_REWARD_DURATION_HOURS: 1,
+  // Quiz answers are still accepted this long after a quiz (or an attempt's own
+  // time limit) ends, so a phone on a slow network does not lose a finished
+  // attempt. Anything later is rejected.
+  QUIZ_SUBMIT_GRACE_MS: 2 * 60 * 1000,
+  // Users are in Bangladesh (Asia/Dhaka, UTC+6, no DST). Wall-clock values that
+  // arrive without an offset - a course's "8:00 PM" schedule time - are read in
+  // this zone unless the client sends its own offset.
+  PLATFORM_UTC_OFFSET_MINUTES: 360,
+  COURSE_MONTH_MS: 30 * 24 * 60 * 60 * 1000,
+  // Room goal XP. Goals are student-created and self-voted, so uncapped they
+  // were free leaderboard XP. A goal now earns XP only when it is confirmed -
+  // at least ROOM_GOAL_XP_MIN_YES_VOTES current members marked it done, or a
+  // room teacher set it in a teacher-controlled room - and each student earns
+  // XP for at most ROOM_GOAL_XP_DAILY_CAP goals per room per day (by the day
+  // the goal was created, platform time).
+  ROOM_GOAL_XP: 35,
+  ROOM_GOAL_XP_MIN_YES_VOTES: 2,
+  ROOM_GOAL_XP_DAILY_CAP: 3,
 };

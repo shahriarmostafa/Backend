@@ -1,3 +1,54 @@
+const {
+  PLATFORM_UTC_OFFSET_MINUTES,
+  ROOM_GOAL_XP,
+  ROOM_GOAL_XP_MIN_YES_VOTES,
+  ROOM_GOAL_XP_DAILY_CAP,
+} = require("./constants");
+
+/** Calendar day in the platform zone, for the per-day goal XP cap. */
+const platformDayKey = (value) => {
+  const time = value ? new Date(value).getTime() : NaN;
+  if (!Number.isFinite(time)) return "undated";
+  return new Date(time + PLATFORM_UTC_OFFSET_MINUTES * 60 * 1000).toISOString().slice(0, 10);
+};
+
+/**
+ * How many of a room's goals earn `studentId` goal XP.
+ *
+ * Any active student can create a goal and mark it done alone, and each one was
+ * worth 35 XP, so the leaderboard could be farmed with empty goals. A goal now
+ * counts only if the student marked it done AND it is confirmed: either at
+ * least ROOM_GOAL_XP_MIN_YES_VOTES current members marked it done, or a room
+ * teacher set it in a teacher-controlled room. Confirmed goals are then capped
+ * at ROOM_GOAL_XP_DAILY_CAP per room per creation day (platform time).
+ *
+ * The plain "goals done" counts shown on progress pages are unchanged.
+ */
+const countXpEligibleGoals = (room = {}, studentId) => {
+  const memberIds = new Set(room.memberIds || []);
+  const teacherIds = new Set((room.teacherSessions || []).map((session) => session.teacherId));
+  const perDay = {};
+  let count = 0;
+  const goals = [...(room.progress?.goals || [])].sort(
+    (a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)
+  );
+  for (const goal of goals) {
+    if (goal?.votes?.[studentId] !== true) continue;
+    const memberYesVotes = Object.entries(goal.votes || {}).filter(
+      ([uid, done]) => done === true && memberIds.has(uid)
+    ).length;
+    const teacherSet =
+      room.teacherControl === true &&
+      (goal.createdByRole === "teacher" || teacherIds.has(goal.createdBy));
+    if (!teacherSet && memberYesVotes < ROOM_GOAL_XP_MIN_YES_VOTES) continue;
+    const day = platformDayKey(goal.createdAt);
+    perDay[day] = (perDay[day] || 0) + 1;
+    if (perDay[day] > ROOM_GOAL_XP_DAILY_CAP) continue;
+    count += 1;
+  }
+  return count;
+};
+
 const buildMetric = ({ id, label, value, suffix = "", progress = 0 }) => ({
   id,
   label,
@@ -140,6 +191,17 @@ const makeStudentProgressHelpers = ({
     const roomQuizStats = await getQuizStats(roomQuizzes, studentId, { roomId: { $in: roomIds } });
     const roomCallStats = await getCallStats(studentId, true);
 
+    const roomSummaries = rooms.map((room) => ({
+      id: room._id.toString(),
+      name: room.name,
+      keyword: room.keyword,
+      category: room.category,
+      type: room.type,
+      goalsDone: (room.progress?.goals || []).filter((goal) => goal.votes?.[studentId] === true).length,
+      totalGoals: (room.progress?.goals || []).length,
+      xpGoals: countXpEligibleGoals(room, studentId),
+    }));
+
     return {
       joinedRooms: rooms.length,
       activeRooms: rooms.filter((room) => {
@@ -148,18 +210,11 @@ const makeStudentProgressHelpers = ({
       }).length,
       totalGoals: goals.length,
       completedGoals,
+      xpGoals: roomSummaries.reduce((sum, room) => sum + room.xpGoals, 0),
       goalCompletionRate: safePercent(completedGoals, goals.length),
       quizzes: roomQuizStats,
       classes: roomCallStats,
-      rooms: rooms.map((room) => ({
-        id: room._id.toString(),
-        name: room.name,
-        keyword: room.keyword,
-        category: room.category,
-        type: room.type,
-        goalsDone: (room.progress?.goals || []).filter((goal) => goal.votes?.[studentId] === true).length,
-        totalGoals: (room.progress?.goals || []).length,
-      })),
+      rooms: roomSummaries,
     };
   };
 
@@ -200,6 +255,7 @@ const makeStudentProgressHelpers = ({
       joinedRooms: roomStats.joinedRooms,
       activeRooms: roomStats.activeRooms,
       completedRoomGoals: roomStats.completedGoals,
+      xpRoomGoals: roomStats.xpGoals,
       totalRewards: publicQuizzesStats.totalRewards + roomStats.quizzes.totalRewards,
       reactionXp,
     };
@@ -258,6 +314,8 @@ const makeStudentProgressHelpers = ({
     const roomInfo = roomId ? (progress.breakdowns?.rooms?.rooms || []).find((room) => room.id === roomId) : null;
     const learningMinutes = roomId ? Number(roomCallStats?.learningMinutes) || 0 : Number(progress.summary.totalMinutes) || 0;
     const completedGoals = roomId ? Number(roomInfo?.goalsDone) || 0 : Number(progress.summary.completedRoomGoals) || 0;
+    // XP uses the confirmed, capped count - see countXpEligibleGoals
+    const xpGoals = roomId ? Number(roomInfo?.xpGoals) || 0 : Number(progress.summary.xpRoomGoals) || 0;
     const classes = roomId ? Number(roomCallStats?.classes) || 0 : Number(progress.summary.totalClasses) || 0;
     const rewards = roomId
       ? scopedQuizResults.reduce((sum, quiz) => sum + (Number(quiz.rewardCredit) || 0), 0)
@@ -267,7 +325,7 @@ const makeStudentProgressHelpers = ({
       quizSubmitted * 60 +
       Math.round(quizAverage * 2) +
       Math.round(learningMinutes * 1.5) +
-      completedGoals * 35 +
+      xpGoals * ROOM_GOAL_XP +
       classes * 45 +
       rewards +
       reactionXp;
@@ -278,6 +336,7 @@ const makeStudentProgressHelpers = ({
       quizSubmitted,
       learningMinutes,
       completedGoals,
+      xpGoals,
       classes,
       rewards,
       reactionXp,
@@ -398,4 +457,4 @@ const makeStudentProgressHelpers = ({
   return { getStudentProgress, refreshStudentXp, refreshStudentXpInBackground, getLeaderboard };
 };
 
-module.exports = { makeStudentProgressHelpers };
+module.exports = { makeStudentProgressHelpers, countXpEligibleGoals };

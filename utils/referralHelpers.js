@@ -10,16 +10,32 @@ const makeReferralHelpers = ({ userCollection, referrals, activepackages, subscr
     if (!referrerUid || referrerUid === referredUid)
       return { awarded: false, reason: "no-valid-referrer" };
 
-    const alreadyAwarded = await referrals.findOne({
-      referredUid,
-      rewardStatus: "awarded",
-    });
-    if (alreadyAwarded) return { awarded: false, reason: "already-awarded" };
-
     const referrerUser = await userCollection.findOne({ uid: referrerUid });
     if (!referrerUser) return { awarded: false, reason: "referrer-not-found" };
 
     const now = new Date();
+
+    // Claim the reward before paying it. Checking "already awarded" and then
+    // writing later let two payment callbacks both pay the referrer.
+    await referrals.updateOne(
+      { referredUid },
+      { $setOnInsert: { referrerUid, referredUid, rewardStatus: "pending", createdAt: now } },
+      { upsert: true }
+    );
+    const claim = await referrals.updateOne(
+      { referredUid, rewardStatus: { $ne: "awarded" } },
+      {
+        $set: {
+          referrerUid,
+          qualifyingOrderId,
+          rewardCredit: REFERRAL_REWARD_CREDIT,
+          rewardDurationHours: REFERRAL_REWARD_DURATION_HOURS,
+          rewardStatus: "awarded",
+          awardedAt: now,
+        },
+      }
+    );
+    if (!claim.modifiedCount) return { awarded: false, reason: "already-awarded" };
     const existingPackage = await activepackages.findOne({ uid: referrerUid });
     const hasActiveDuration =
       existingPackage?.isUnlimited ||
@@ -39,10 +55,10 @@ const makeReferralHelpers = ({ userCollection, referrals, activepackages, subscr
         {
           $set: {
             ...(existingPackage.isUnlimited ? {} : { expiryDate: expiryDate.toISOString() }),
-            credit: Number(existingPackage.credit || 0) + REFERRAL_REWARD_CREDIT,
-            totalCredit: Number(existingPackage.totalCredit || 0) + REFERRAL_REWARD_CREDIT,
             updatedAt: now,
           },
+          // $inc: a $set from the earlier read lost any spend in between
+          $inc: { credit: REFERRAL_REWARD_CREDIT, totalCredit: REFERRAL_REWARD_CREDIT },
         }
       );
     } else {
@@ -73,23 +89,6 @@ const makeReferralHelpers = ({ userCollection, referrals, activepackages, subscr
         { upsert: true }
       );
     }
-
-    await referrals.updateOne(
-      { referredUid },
-      {
-        $set: {
-          referrerUid,
-          referredUid,
-          qualifyingOrderId,
-          rewardCredit: REFERRAL_REWARD_CREDIT,
-          rewardDurationHours: REFERRAL_REWARD_DURATION_HOURS,
-          rewardStatus: "awarded",
-          awardedAt: now,
-        },
-        $setOnInsert: { createdAt: now },
-      },
-      { upsert: true }
-    );
 
     await userCollection.updateOne(
       { uid: referredUid },

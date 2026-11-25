@@ -4,6 +4,7 @@ const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeQuizHelpers, makePublicQuizHelpers } = require("../utils/quizHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
 const { makeR2Storage } = require("../utils/r2Storage");
+const { resolveActor, requireParty } = require("../utils/actor");
 const {
   ROOM_QUIZ_ATTEND_CREDIT,
   ROOM_QUIZ_MAX_QUESTIONS,
@@ -33,6 +34,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
     getQuizStatus,
     getAttempt,
     spendQuizCredit,
+    checkSubmissionWindow,
+    getAnswerStorageFolder,
     settleQuiz,
     applyQuizRating,
     isAttemptFullyMarked,
@@ -99,21 +102,62 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   const assertActiveStudent = (room, userId) =>
     userId && (room.memberIds || []).includes(userId) && getRoomMembership(room, userId).isActive;
 
-  const publicRoomQuiz = (quiz, viewerId, room) =>
+  const isRoomParticipant = (room, userId) =>
+    Boolean(userId) &&
+    ((room.memberIds || []).includes(userId) ||
+      (room.teacherSessions || []).some((session) => session.teacherId === userId));
+
+  // `viewerId` is always a verified uid here (resolveActor/requireParty); the
+  // answer-revealing logic in publicQuiz trusts it.
+  const publicRoomQuiz = (quiz, viewerId, room, options = {}) =>
     publicQuiz(
       quiz && room ? { ...quiz, quizExpenseEnabled: room.quizExpenseEnabled !== false } : quiz,
-      viewerId
+      viewerId,
+      options
     );
+
+  /**
+   * Teacher marking for open/image answers, shared by room and public quizzes.
+   * Unmarked manual answers count as 0 instead of turning the score into NaN.
+   */
+  const applyManualMarks = (quiz, marks, teacherId) =>
+    (quiz.attempts || []).map((attempt) => {
+      if (!attempt.submittedAt) return attempt;
+      let score = 0;
+      const answers = { ...(attempt.answers || {}) };
+      (quiz.questions || []).forEach((question) => {
+        const answer = answers[question.id] || {};
+        if (question.type === "mcq") {
+          if (answer.isCorrect) score += 1;
+          return;
+        }
+        const rawScore = marks?.[attempt.studentId]?.[question.id];
+        if (rawScore === undefined || rawScore === "") {
+          score += Number(answer.manualScore) || 0;
+          return;
+        }
+        const manualScore = Math.min(Math.max(Number(rawScore) || 0, 0), 1);
+        answers[question.id] = { ...answer, manualScore, markedAt: new Date(), markedBy: teacherId };
+        score += manualScore;
+      });
+      return {
+        ...attempt,
+        answers,
+        score,
+        maxScore: (quiz.questions || []).length,
+        manuallyMarkedAt: new Date(),
+      };
+    });
 
   router.get("/api/study-rooms/:roomId/quizzes", async (req, res) => {
     try {
-      const { userId } = req.query;
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       const room = await getRoom(req.params.roomId);
       if (!room) return res.status(404).json({ error: "Room not found." });
-      const isAllowed =
-        (room.memberIds || []).includes(userId) ||
-        (room.teacherSessions || []).some((session) => session.teacherId === userId);
-      if (!isAllowed) return res.status(403).json({ error: "Join this room to view quizzes." });
+      const isOwner = !isRoomParticipant(room, userId) && Boolean(await req.isOwner?.());
+      if (!isRoomParticipant(room, userId) && !isOwner)
+        return res.status(403).json({ error: "Join this room to view quizzes." });
       const quizEconomyEnabled = room.quizExpenseEnabled !== false;
 
       const quizzes = await roomQuizzes
@@ -128,7 +172,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
       res.json({
         success: true,
-        quizzes: visibleQuizzes.map((quiz) => publicRoomQuiz(quiz, userId, room)),
+        quizzes: visibleQuizzes.map((quiz) => publicRoomQuiz(quiz, userId, room, { isOwner })),
         constants: {
           attendCredit: quizEconomyEnabled ? ROOM_QUIZ_ATTEND_CREDIT : 0,
           rewardRate: quizEconomyEnabled ? ROOM_QUIZ_REWARD_POOL_RATE : 0,
@@ -144,15 +188,22 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.get("/api/study-rooms/:roomId/quizzes/:quizId", async (req, res) => {
     try {
-      const { userId } = req.query;
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       const room = await getRoom(req.params.roomId);
       if (!room) return res.status(404).json({ error: "Room not found." });
+      // this route had no membership check at all
+      const isOwner = !isRoomParticipant(room, userId) && Boolean(await req.isOwner?.());
+      if (!isRoomParticipant(room, userId) && !isOwner)
+        return res.status(403).json({ error: "Join this room to view quizzes." });
       const quiz = await roomQuizzes.findOne({
         _id: new ObjectId(req.params.quizId),
         roomId: req.params.roomId,
       });
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
-      res.json({ success: true, quiz: publicRoomQuiz(quiz, userId, room) });
+      if (quiz.status === "draft" && quiz.teacherId !== userId && !isOwner)
+        return res.status(404).json({ error: "Quiz not found." });
+      res.json({ success: true, quiz: publicRoomQuiz(quiz, userId, room, { isOwner }) });
     } catch (err) {
       console.error("Error fetching room quiz:", err);
       res.status(500).json({ error: "Failed to fetch quiz." });
@@ -180,7 +231,9 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.post("/api/study-rooms/:roomId/quiz-requests", async (req, res) => {
     try {
-      const { userId, teacherId, subject, title = "" } = req.body;
+      const { teacherId, subject, title = "" } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const room = await getRoom(req.params.roomId);
       if (!room) return res.status(404).json({ error: "Room not found." });
       if (!assertActiveStudent(room, userId))
@@ -224,7 +277,9 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.post("/api/study-rooms/:roomId/quizzes", async (req, res) => {
     try {
-      const { teacherId, subject, title = "" } = req.body;
+      const { subject, title = "" } = req.body;
+      const teacherId = await resolveActor(req, res, req.body?.teacherId);
+      if (!teacherId) return;
       const room = await getRoom(req.params.roomId);
       if (!room) return res.status(404).json({ error: "Room not found." });
       if (room.teacherControl !== true)
@@ -262,13 +317,14 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   router.patch("/api/study-rooms/:roomId/quizzes/:quizId", async (req, res) => {
     try {
       const {
-        teacherId,
         title,
         subject,
         scheduledAt,
         timeLimitMinutes,
         questions = [],
       } = req.body;
+      const teacherId = await resolveActor(req, res, req.body?.teacherId);
+      if (!teacherId) return;
       const room = await getRoom(req.params.roomId);
       if (!room) return res.status(404).json({ error: "Room not found." });
       const quiz = await roomQuizzes.findOne({
@@ -278,6 +334,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
       if (quiz.teacherId !== teacherId || !isRoomTeacher(room, teacherId, subject || quiz.subject))
         return res.status(403).json({ error: "Only this room teacher can prepare the quiz." });
+      if (quiz.status === "completed")
+        return res.status(409).json({ error: "Completed quizzes cannot be edited." });
 
       const { cleanQuestions, invalid } = validateQuestions(questions);
       if (!cleanQuestions.length || invalid)
@@ -330,18 +388,24 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   });
 
   router.post("/api/study-rooms/:roomId/quizzes/:quizId/attend", async (req, res) => {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
     const mongoSession = client.startSession();
     try {
-      const { userId } = req.body;
       let responsePayload = null;
       let startedNotification = null;
 
       await mongoSession.withTransaction(async () => {
+        // reset on every transaction retry
+        startedNotification = null;
         const room = await getRoom(req.params.roomId);
         if (!room) {
           responsePayload = { status: 404, body: { error: "Room not found." } };
           return;
         }
+        // Was never declared in this handler, so every first-time attend threw a
+        // ReferenceError inside the transaction and answered 500.
+        const quizEconomyEnabled = room.quizExpenseEnabled !== false;
         if (!assertActiveStudent(room, userId)) {
           responsePayload = {
             status: 403,
@@ -432,9 +496,11 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   });
 
   router.post("/api/study-rooms/:roomId/quizzes/:quizId/submit", async (req, res) => {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
     const mongoSession = client.startSession();
     try {
-      const { userId, answers = {} } = req.body;
+      const { answers = {} } = req.body;
       let responsePayload = null;
       await mongoSession.withTransaction(async () => {
         const room = await getRoom(req.params.roomId);
@@ -460,12 +526,15 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           responsePayload = { status: 409, body: { error: "Quiz already submitted." } };
           return;
         }
-        if (getQuizStatus(quiz) === "completed") {
-          responsePayload = { status: 409, body: { error: "This quiz is already completed." } };
+        const submitWindow = checkSubmissionWindow(quiz, attempt);
+        if (!submitWindow.ok) {
+          responsePayload = { status: submitWindow.status, body: { error: submitWindow.message } };
           return;
         }
 
-        const scored = scoreAnswers(quiz.questions || [], answers);
+        const scored = scoreAnswers(quiz.questions || [], answers, {
+          storageFolder: getAnswerStorageFolder(quiz, userId),
+        });
         await roomQuizzes.updateOne(
           { _id: quiz._id, "attempts.studentId": userId },
           {
@@ -494,7 +563,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.post("/api/study-rooms/:roomId/quizzes/:quizId/marks", async (req, res) => {
     try {
-      const { teacherId, marks = {} } = req.body;
+      const { marks = {} } = req.body;
       const room = await getRoom(req.params.roomId);
       if (!room) return res.status(404).json({ error: "Room not found." });
       const quiz = await roomQuizzes.findOne({
@@ -502,41 +571,24 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
         roomId: req.params.roomId,
       });
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
-      if (quiz.teacherId !== teacherId)
-        return res.status(403).json({ error: "Only the quiz teacher can submit marks." });
+      // bound to the token: the body's teacherId used to be the only check
+      const teacherId = await requireParty(req, res, [quiz.teacherId], req.body?.teacherId);
+      if (!teacherId) return;
+      if (quiz.status === "completed")
+        return res.status(409).json({ error: "This quiz is already settled." });
 
       const manualQuestionIds = new Set((quiz.questions || [])
         .filter((question) => ["open", "image"].includes(question.type))
         .map((question) => question.id));
-      const updatedAttempts = (quiz.attempts || []).map((attempt) => {
-        if (!attempt.submittedAt) return attempt;
-        let score = 0;
-        const answers = { ...(attempt.answers || {}) };
-        (quiz.questions || []).forEach((question) => {
-          const answer = answers[question.id] || {};
-          if (question.type === "mcq") {
-            if (answer.isCorrect) score += 1;
-            return;
-          }
-          const rawScore = marks?.[attempt.studentId]?.[question.id];
-          const manualScore = rawScore === undefined ? answer.manualScore : Math.min(Math.max(Number(rawScore) || 0, 0), 1);
-          answers[question.id] = { ...answer, manualScore, markedAt: new Date(), markedBy: teacherId };
-          score += manualScore;
-        });
-        return {
-          ...attempt,
-          answers,
-          score,
-          maxScore: (quiz.questions || []).length,
-          manuallyMarkedAt: new Date(),
-        };
-      });
+      const updatedAttempts = applyManualMarks(quiz, marks, teacherId);
       const allMarked = updatedAttempts
         .filter((attempt) => attempt.submittedAt)
         .every((attempt) => isAttemptFullyMarked({ ...quiz, attempts: updatedAttempts }, attempt));
 
-      await roomQuizzes.updateOne(
-        { _id: quiz._id },
+      // The attempts array is rewritten whole, so only write if nobody attended
+      // or submitted since it was read - otherwise that attempt would be lost.
+      const result = await roomQuizzes.updateOne(
+        { _id: quiz._id, updatedAt: quiz.updatedAt ?? null },
         {
           $set: {
             attempts: updatedAttempts,
@@ -547,8 +599,12 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           },
         }
       );
+      if (!result.matchedCount)
+        return res.status(409).json({ error: "A student just submitted. Reload the quiz and save marks again." });
       const updatedQuiz = await roomQuizzes.findOne({ _id: quiz._id });
-      res.json({ success: true, allMarked, quiz: publicRoomQuiz(updatedQuiz, teacherId, room) });
+      // requireParty only lets a non-party through when they are an owner
+      const isOwner = teacherId !== quiz.teacherId;
+      res.json({ success: true, allMarked, quiz: publicRoomQuiz(updatedQuiz, teacherId, room, { isOwner }) });
     } catch (err) {
       console.error("Error marking room quiz:", err);
       res.status(500).json({ error: "Failed to submit marks." });
@@ -654,9 +710,11 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   });
 
   router.post("/api/study-rooms/:roomId/quizzes/:quizId/rate", async (req, res) => {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
     const mongoSession = client.startSession();
     try {
-      const { userId, rating } = req.body;
+      const { rating } = req.body;
       let responsePayload = null;
       await mongoSession.withTransaction(async () => {
         const room = await getRoom(req.params.roomId);
@@ -692,7 +750,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.delete("/api/study-rooms/:roomId/quizzes/:quizId", async (req, res) => {
     try {
-      const { userId } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const room = await getRoom(req.params.roomId);
       if (!room) return res.status(404).json({ error: "Room not found." });
 
@@ -723,15 +782,19 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.get("/api/public-quizzes", async (req, res) => {
     try {
-      const { userId, teacherId, category, type, subject } = req.query;
+      const { teacherId, category, type, subject } = req.query;
+      // the viewer decides whose answers are revealed, so it comes from the
+      // token; `?teacherId=` for someone else is refused unless owner
+      const viewerId = await resolveActor(req, res, teacherId || req.query.userId);
+      if (!viewerId) return;
       const filter = {};
 
       if (teacherId) {
-        filter.teacherId = teacherId;
-      } else if (userId) {
-        const userDoc = await userCollection.findOne({ uid: userId });
+        filter.teacherId = viewerId;
+      } else {
+        const userDoc = await userCollection.findOne({ uid: viewerId });
         if (!userDoc) return res.status(404).json({ error: "User not found." });
-        if (userDoc.role === "teacher") filter.teacherId = userId;
+        if (userDoc.role === "teacher") filter.teacherId = viewerId;
         else {
           filter.category = category || userDoc.category || "school";
           filter.type = type || userDoc.type || "bangla_medium";
@@ -751,7 +814,7 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
       res.json({
         success: true,
-        quizzes: quizzes.map((quiz) => publicHelpers.publicQuiz(quiz, userId || teacherId)),
+        quizzes: quizzes.map((quiz) => publicHelpers.publicQuiz(quiz, viewerId)),
         constants: {
           attendCredit: PUBLIC_QUIZ_ATTEND_CREDIT,
           rewardRate: PUBLIC_QUIZ_REWARD_POOL_RATE,
@@ -766,7 +829,8 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.get("/api/public-quizzes/:quizId", async (req, res) => {
     try {
-      const { userId } = req.query;
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       const quiz = await getPublicQuiz(req.params.quizId);
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
       res.json({ success: true, quiz: publicHelpers.publicQuiz(quiz, userId) });
@@ -778,7 +842,9 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.patch("/api/public-quizzes/:quizId", async (req, res) => {
     try {
-      const { teacherId, title, scheduledAt, timeLimitMinutes, questions = [] } = req.body;
+      const { title, scheduledAt, timeLimitMinutes, questions = [] } = req.body;
+      const teacherId = await resolveActor(req, res, req.body?.teacherId);
+      if (!teacherId) return;
       const quiz = await getPublicQuiz(req.params.quizId);
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
       if (quiz.teacherId !== teacherId)
@@ -825,9 +891,10 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   });
 
   router.post("/api/public-quizzes/:quizId/attend", async (req, res) => {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
     const mongoSession = client.startSession();
     try {
-      const { userId } = req.body;
       let responsePayload = null;
 
       await mongoSession.withTransaction(async () => {
@@ -898,9 +965,11 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   });
 
   router.post("/api/public-quizzes/:quizId/submit", async (req, res) => {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
     const mongoSession = client.startSession();
     try {
-      const { userId, answers = {} } = req.body;
+      const { answers = {} } = req.body;
       let responsePayload = null;
       await mongoSession.withTransaction(async () => {
         const quiz = await getPublicQuiz(req.params.quizId, mongoSession);
@@ -917,12 +986,15 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           responsePayload = { status: 409, body: { error: "Quiz already submitted." } };
           return;
         }
-        if (publicHelpers.getQuizStatus(quiz) === "completed") {
-          responsePayload = { status: 409, body: { error: "This quiz is already completed." } };
+        const submitWindow = publicHelpers.checkSubmissionWindow(quiz, attempt);
+        if (!submitWindow.ok) {
+          responsePayload = { status: submitWindow.status, body: { error: submitWindow.message } };
           return;
         }
 
-        const scored = publicHelpers.scoreAnswers(quiz.questions || [], answers);
+        const scored = publicHelpers.scoreAnswers(quiz.questions || [], answers, {
+          storageFolder: publicHelpers.getAnswerStorageFolder(quiz, userId),
+        });
         await publicQuizzes.updateOne(
           { _id: quiz._id, "attempts.studentId": userId },
           {
@@ -988,44 +1060,25 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
 
   router.post("/api/public-quizzes/:quizId/marks", async (req, res) => {
     try {
-      const { teacherId, marks = {} } = req.body;
+      const { marks = {} } = req.body;
       const quiz = await getPublicQuiz(req.params.quizId);
       if (!quiz) return res.status(404).json({ error: "Quiz not found." });
-      if (quiz.teacherId !== teacherId)
-        return res.status(403).json({ error: "Only the assigned quiz teacher can submit marks." });
+      const teacherId = await requireParty(req, res, [quiz.teacherId], req.body?.teacherId);
+      if (!teacherId) return;
+      if (quiz.status === "completed")
+        return res.status(409).json({ error: "This quiz is already settled." });
 
       const manualQuestionIds = new Set((quiz.questions || [])
         .filter((question) => ["open", "image"].includes(question.type))
         .map((question) => question.id));
-      const updatedAttempts = (quiz.attempts || []).map((attempt) => {
-        if (!attempt.submittedAt) return attempt;
-        let score = 0;
-        const answers = { ...(attempt.answers || {}) };
-        (quiz.questions || []).forEach((question) => {
-          const answer = answers[question.id] || {};
-          if (question.type === "mcq") {
-            if (answer.isCorrect) score += 1;
-            return;
-          }
-          const rawScore = marks?.[attempt.studentId]?.[question.id];
-          const manualScore = rawScore === undefined ? answer.manualScore : Math.min(Math.max(Number(rawScore) || 0, 0), 1);
-          answers[question.id] = { ...answer, manualScore, markedAt: new Date(), markedBy: teacherId };
-          score += manualScore;
-        });
-        return {
-          ...attempt,
-          answers,
-          score,
-          maxScore: (quiz.questions || []).length,
-          manuallyMarkedAt: new Date(),
-        };
-      });
+      const updatedAttempts = applyManualMarks(quiz, marks, teacherId);
       const allMarked = updatedAttempts
         .filter((attempt) => attempt.submittedAt)
         .every((attempt) => publicHelpers.isAttemptFullyMarked({ ...quiz, attempts: updatedAttempts }, attempt));
 
-      await publicQuizzes.updateOne(
-        { _id: quiz._id },
+      // see the room marks route: never overwrite an attempt that arrived meanwhile
+      const result = await publicQuizzes.updateOne(
+        { _id: quiz._id, updatedAt: quiz.updatedAt ?? null },
         {
           $set: {
             attempts: updatedAttempts,
@@ -1036,8 +1089,11 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
           },
         }
       );
+      if (!result.matchedCount)
+        return res.status(409).json({ error: "A student just submitted. Reload the quiz and save marks again." });
       const updatedQuiz = await getPublicQuiz(req.params.quizId);
-      res.json({ success: true, allMarked, quiz: publicHelpers.publicQuiz(updatedQuiz, teacherId) });
+      const isOwner = teacherId !== quiz.teacherId;
+      res.json({ success: true, allMarked, quiz: publicHelpers.publicQuiz(updatedQuiz, teacherId, { isOwner }) });
     } catch (err) {
       console.error("Error marking public quiz:", err);
       res.status(500).json({ error: "Failed to submit marks." });
@@ -1045,9 +1101,11 @@ module.exports = ({ userCollection, studyRooms, roomQuizzes, publicQuizzes, acti
   });
 
   router.post("/api/public-quizzes/:quizId/rate", async (req, res) => {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
     const mongoSession = client.startSession();
     try {
-      const { userId, rating } = req.body;
+      const { rating } = req.body;
       let responsePayload = null;
       await mongoSession.withTransaction(async () => {
         const quiz = await getPublicQuiz(req.params.quizId, mongoSession);

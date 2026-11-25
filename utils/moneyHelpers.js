@@ -40,6 +40,24 @@ const getCallCreditForSeconds = (seconds, rate = 1) => {
 const clampCreditRate = (rate) => Math.min(Math.max(Number(rate) || 1, 0.1), 1);
 
 /**
+ * How much of a call the student's credit actually covers.
+ *
+ * The only cap used to be a timer in the app, skipped entirely at 500+ credit
+ * and re-armed with stale credit after a relaunch. The server then floored the
+ * balance at zero but still paid the teacher for the whole call, so points went
+ * out that no credit backed. Billing and teacher points both use this instead.
+ */
+const getBillableCallSeconds = (seconds, availableCredit, rate = 1) => {
+  const safeSeconds = Math.max(Number(seconds) || 0, 0);
+  const safeRate = Number(rate) || 0;
+  if (safeRate <= 0) return safeSeconds;
+  const credit = Math.max(Number(availableCredit) || 0, 0);
+  // the seconds inside a started ten-second block are not charged
+  const coveredSeconds = Math.floor(credit / safeRate) * 10 + 9;
+  return Math.min(safeSeconds, coveredSeconds);
+};
+
+/**
  * Splits a money pool across a teacher's points.
  *
  * The teacher is paid `earningRate` of the gross value of their points, the
@@ -89,6 +107,7 @@ module.exports = {
   getGeneralCallPoints,
   getRoomCallCreditRate,
   getCallCreditForSeconds,
+  getBillableCallSeconds,
   clampCreditRate,
   WITHDRAW_RATES: {
     earning: TEACHER_WITHDRAW_EARNING_RATE,

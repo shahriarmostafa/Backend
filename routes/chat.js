@@ -19,12 +19,37 @@ const {
   minutesSinceLastMessage,
   viewMessagesFor,
 } = require("../utils/messageEconomy");
+const { resolveActor } = require("../utils/actor");
+const { findChatEntry, findDirectChatEntry } = require("../utils/chatAccess");
+const { sendPush } = require("../utils/push");
+
+// Voice notes are recorded in the app; nothing legitimate is longer than this.
+const MAX_AUDIO_SECONDS = 15 * 60;
+// Mirrors the old client rule: only push a message when the chat had gone quiet.
+const MESSAGE_PUSH_IDLE_MINUTES = 10;
+// What a chat partner may see of the other person. Their whole user document -
+// email, push token, points - used to ride along in every chat-list update.
+const CHAT_PEER_FIELDS = {
+  _id: 0,
+  uid: 1,
+  displayName: 1,
+  photoURL: 1,
+  role: 1,
+  category: 1,
+  type: 1,
+  subject: 1,
+  subjects: 1,
+  rating: 1,
+  experience: 1,
+  isActive: 1,
+  isOnline: 1,
+};
 
 // How many messages a client receives when it opens a chat. Older pages are
 // fetched on demand from /chat-messages/:chatId.
 const MESSAGE_PAGE_SIZE = 50;
 
-module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo, io }) => {
+module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo, io, admin }) => {
   const router = Router();
 
   const { getRoomMembership, ensureRoomChatSubscriptions } = makeRoomHelpers({
@@ -122,7 +147,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       ),
     ];
     const users = receiverIds.length
-      ? await userCollection.find({ uid: { $in: receiverIds } }).toArray()
+      ? await userCollection.find({ uid: { $in: receiverIds } }, { projection: CHAT_PEER_FIELDS }).toArray()
       : [];
     const usersById = users.reduce((acc, item) => {
       acc[item.uid] = item;
@@ -154,7 +179,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     const roomParticipants = roomParticipantIds.length
       ? await userCollection
           .find({ uid: { $in: roomParticipantIds } })
-          .project({ uid: 1, displayName: 1, photoURL: 1, email: 1, role: 1 })
+          .project({ uid: 1, displayName: 1, photoURL: 1, role: 1 })
           .toArray()
       : [];
     const roomParticipantsById = roomParticipants.reduce((acc, person) => {
@@ -178,7 +203,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         uid: isStudentViewingTeacherChat ? teacher.uid : item.roomId || item.receiverId,
         displayName: item.chatName || room.name || "Room chat",
         photoURL: isStudentViewingTeacherChat ? teacher.photoURL : null,
-        email: isStudentViewingTeacherChat ? teacher.email : null,
+        email: null,
         role: receiverRole,
         roomId: item.roomId || room._id?.toString() || null,
         roomName: room.name || "",
@@ -223,27 +248,53 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
    * entry with no room attached.
    */
   router.get("/chatExist/:userId/:receiverId", async (req, res) => {
-    const { userId, receiverId } = req.params;
-    const userChatCollection = databaseinmongo.collection("chatCollection");
-    const userChat = await userChatCollection.findOne({ _id: userId });
-    // findOne returns null for anyone who has never had a chat
-    const existingChat = (userChat?.chats || []).find(
-      (chat) => chat.receiverId === receiverId && !chat.roomId && !chat.roomChat
-    );
+    try {
+      // Only your own chats: this used to hand anyone the chatId for any pair.
+      const userId = await resolveActor(req, res, req.params.userId);
+      if (!userId) return;
+      const existingChat = await findDirectChatEntry(databaseinmongo, userId, req.params.receiverId);
 
-    if (existingChat) {
-      return res.json({ exists: true, chatId: existingChat.chatId });
-    } else {
+      if (existingChat) {
+        return res.json({ exists: true, chatId: existingChat.chatId });
+      }
       return res.json({ exists: false });
+    } catch (err) {
+      console.error("Error checking chat:", err);
+      return res.status(500).json({ error: "Could not check chat." });
     }
   });
 
   router.post("/createChat", async (req, res) => {
-    const { userId, receiverId } = req.body;
+    try {
+    const userId = await resolveActor(req, res, req.body?.userId);
+    if (!userId) return;
+    const { receiverId } = req.body || {};
     const chatDB = databaseinmongo.collection("chatDB");
     const userChatCollection = databaseinmongo.collection("chatCollection");
 
-    const newChat = await chatDB.insertOne({ createdAt: new Date(), messages: [] });
+    // A student opens a direct chat with a teacher, never the other way round.
+    const [student, teacher] = await Promise.all([
+      userCollection.findOne({ uid: userId }, { projection: { role: 1 } }),
+      receiverId ? userCollection.findOne({ uid: receiverId }, { projection: { role: 1 } }) : null,
+    ]);
+    if (!teacher || teacher.role !== "teacher" || receiverId === userId) {
+      return res.status(400).json({ error: "You can only start a chat with a teacher." });
+    }
+    if (student?.role === "teacher") {
+      return res.status(403).json({ error: "Teachers cannot start a chat with another teacher." });
+    }
+
+    // A double tap used to create two chats with the same teacher.
+    const existing = await findDirectChatEntry(databaseinmongo, userId, receiverId);
+    if (existing) return res.json({ chatId: existing.chatId });
+
+    const newChat = await chatDB.insertOne({
+      createdAt: new Date(),
+      messages: [],
+      // lets /sendMessage tell who the teacher is without trusting the client
+      teacherId: receiverId,
+      studentId: userId,
+    });
     const chatId = newChat.insertedId.toString();
 
     await userChatCollection.updateOne(
@@ -287,6 +338,10 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     );
 
     res.json({ chatId });
+    } catch (err) {
+      console.error("Error creating chat:", err);
+      res.status(500).json({ error: "Could not start the chat." });
+    }
   });
 
   /**
@@ -329,6 +384,12 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       const { chatId } = req.params;
       if (!ObjectId.isValid(chatId)) return res.status(400).json({ error: "Invalid chatId" });
 
+      const viewerId = await resolveActor(req, res, req.query.userId);
+      if (!viewerId) return;
+      if (!(await findChatEntry(databaseinmongo, viewerId, chatId)) && !(await req.isOwner?.())) {
+        return res.status(403).json({ error: "Not a participant of this chat" });
+      }
+
       const alreadyLoaded = Math.max(Number(req.query.before) || 0, 0);
       const limit = Math.min(Math.max(Number(req.query.limit) || MESSAGE_PAGE_SIZE, 1), 100);
       const chatDB = databaseinmongo.collection("chatDB");
@@ -350,7 +411,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       const end = Math.max(doc.totalMessages - alreadyLoaded, 0);
       const start = Math.max(end - limit, 0);
       // each viewer sees their own room reaction, not whoever reacted first
-      const messages = viewMessagesFor(doc.messages.slice(start, end), req.auth?.uid || req.query.userId);
+      const messages = viewMessagesFor(doc.messages.slice(start, end), viewerId);
 
       return res.json({
         messages,
@@ -370,13 +431,11 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
     try {
       const {
         chatId,
-        senderId,
         text,
         imageUrl,
         imagePath,
         audioUrl,
         audioPath,
-        audioDuration,
         fileUrl,
         filePath,
         fileName,
@@ -384,17 +443,17 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         fileSize,
         receiverId,
         receiverIds,
-        roomId,
       } = req.body;
-      const messageReceiverIds =
-        Array.isArray(receiverIds) && receiverIds.length
-          ? receiverIds
-          : receiverId
-          ? [receiverId]
-          : [];
+      // The sender is whoever holds the token. It used to be `req.body.senderId`,
+      // so anyone could send - and be charged - as anyone else.
+      const senderId = await resolveActor(req, res, req.body.senderId);
+      if (!senderId) return;
+      const audioDuration = audioUrl
+        ? Math.min(Math.max(Number(req.body.audioDuration) || 0, 0), MAX_AUDIO_SECONDS)
+        : null;
       let roomForNotification = null;
 
-      if (!chatId || !senderId || messageReceiverIds.length === 0)
+      if (!chatId || !ObjectId.isValid(chatId))
         return res.status(400).json({ error: "Missing required fields." });
 
       // Fetched once and reused: the chat's own `type` decides billing, and its
@@ -402,6 +461,26 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       // This used to be loaded only inside the teacherControl branch.
       const chatDoc = await chatDB.findOne({ _id: new ObjectId(chatId) });
       if (!chatDoc) return res.status(404).json({ error: "Chat not found." });
+
+      // Whether this is a room chat comes from the chat itself. A client-sent
+      // roomId on a direct teacher chat used to make every message free.
+      const roomId = chatDoc.roomChat ? String(chatDoc.roomId || req.body.roomId || "") || null : null;
+      const senderEntry = await findChatEntry(databaseinmongo, senderId, chatId);
+      if (!roomId && !senderEntry) {
+        return res.status(403).json({ error: "You are not part of this chat." });
+      }
+
+      // A resend after a dropped connection carries the same messageId. If the
+      // first attempt landed, answer with it instead of storing and charging
+      // the message a second time.
+      const duplicate = req.body.messageId
+        ? (chatDoc.messages || []).find(
+            (item) => item.messageId === String(req.body.messageId) && item.senderId === senderId
+          )
+        : null;
+      if (duplicate) {
+        return res.json({ success: true, message: duplicate, creditSpent: 0, pointsAwarded: 0, remainingCredit: null, duplicate: true });
+      }
 
       // Needed by the rule checks below as well as by pricing, so it moved up
       // from just above the credit block.
@@ -413,7 +492,7 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       let isAssignedRoomTeacher = false;
 
       if (roomId) {
-        const room = await studyRooms.findOne({ _id: new ObjectId(roomId) });
+        const room = ObjectId.isValid(roomId) ? await studyRooms.findOne({ _id: new ObjectId(roomId) }) : null;
         roomForNotification = room;
         const isActiveStudentMember =
           room &&
@@ -473,6 +552,30 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
           }
         }
       }
+
+      // Recipients come from the server's records, not the client's cached
+      // copy: a student who joined a room after the chat was opened used to get
+      // no unread count or list update for the teacher's messages.
+      let messageReceiverIds;
+      if (roomForNotification) {
+        const chatTeacherIds = (roomForNotification.teacherSessions || [])
+          .filter((session) => String(session.chatId) === String(chatId))
+          .map((session) => session.teacherId);
+        messageReceiverIds = [...(roomForNotification.memberIds || []), ...chatTeacherIds];
+      } else {
+        messageReceiverIds = senderEntry?.receiverId ? [senderEntry.receiverId] : [];
+      }
+      messageReceiverIds = [...new Set(messageReceiverIds.filter((id) => id && id !== senderId))];
+      if (messageReceiverIds.length === 0) {
+        // fall back to what the client named, but only people already in the chat
+        const claimed = Array.isArray(receiverIds) && receiverIds.length ? receiverIds : receiverId ? [receiverId] : [];
+        const checks = await Promise.all(
+          claimed.map(async (id) => ((await findChatEntry(databaseinmongo, id, chatId)) ? id : null))
+        );
+        messageReceiverIds = checks.filter((id) => id && id !== senderId);
+      }
+      if (messageReceiverIds.length === 0)
+        return res.status(400).json({ error: "Missing required fields." });
 
       if (fileUrl) {
         const allowedFileTypes = ["pdf", "docx", "pptx"];
@@ -569,16 +672,21 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         return res.status(404).json({ error: "Chat not found." });
       }
 
+      // Everything from here on is bookkeeping for a message that is already
+      // stored and paid for. A failure used to surface as a 500, the app showed
+      // "Message not sent", and a resend charged the student again.
+      let pointsAwarded = 0;
+      let remainingCredit = null;
+      const userIds = [...new Set([senderId, ...messageReceiverIds])];
+      try {
       // teachers earn points for the reply they just sent
-      const pointsAwarded = economy.awardsPoints ? getMessageTeacherPoints(messageFacts) : 0;
+      pointsAwarded = economy.awardsPoints ? getMessageTeacherPoints(messageFacts) : 0;
       if (pointsAwarded > 0) {
         await userCollection.updateOne(
           { uid: senderId, role: "teacher" },
           { $inc: { points: pointsAwarded } }
         );
       }
-
-      const userIds = [...new Set([senderId, ...messageReceiverIds])];
 
       await Promise.all(
         userIds.map((id) => {
@@ -610,22 +718,60 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
       // participant on every "ok", and the cost grew with the conversation.
       io.to(chatId).emit("messageAdded", { chatId, message });
 
-      const updatedChatLists = await Promise.all(
-        userIds.map((id) => hydrateChatListForUser(id, chatCollection))
-      );
-
-      userIds.forEach((id, index) => {
-        const { chatList, unseenCount } = updatedChatLists[index];
-        io.to(id).emit("chatListUpdate", { chatList, unseenCount });
-      });
-
-      const remainingCredit =
+      remainingCredit =
         creditCost > 0
           ? (await activepackages.findOne({ uid: senderId }, { projection: { credit: 1 } }))?.credit ?? null
           : null;
+      } catch (bookkeepingError) {
+        console.error("Message stored, but follow-up updates failed:", bookkeepingError);
+      }
 
       res.json({ success: true, message, creditSpent: creditCost, pointsAwarded, remainingCredit });
-      setImmediate(() => {
+      setImmediate(async () => {
+        // Rebuilding every participant's chat list is 4-6 queries each; it ran
+        // before the response, so sends got slower as rooms grew.
+        await Promise.all(
+          userIds.map(async (id) => {
+            const { chatList, unseenCount } = await hydrateChatListForUser(id, chatCollection);
+            io.to(id).emit("chatListUpdate", { chatList, unseenCount });
+          })
+        ).catch((err) => console.error("Error refreshing chat lists:", err));
+
+        // Direct chats push the other person. In a room, a student's message in
+        // a teacher chat pushes that chat's teacher; the room's own in-app
+        // notifications cover everything else.
+        const roomChatTeacherIds = roomForNotification
+          ? (roomForNotification.teacherSessions || [])
+              .filter((session) => String(session.chatId) === String(chatId))
+              .map((session) => session.teacherId)
+          : [];
+        const pushRecipientIds = !roomForNotification
+          ? messageReceiverIds
+          : roomChatTeacherIds.includes(senderId)
+          ? []
+          : roomChatTeacherIds;
+        if (pushRecipientIds.length && admin) {
+          const idleMinutes = minutesSinceLastMessage(chatDoc.messages);
+          if (idleMinutes === null || idleMinutes > MESSAGE_PUSH_IDLE_MINUTES) {
+            const [senderProfile, ...receivers] = await Promise.all([
+              userCollection.findOne({ uid: senderId }, { projection: { displayName: 1 } }),
+              ...pushRecipientIds.map((id) =>
+                userCollection.findOne({ uid: id }, { projection: { FCMToken: 1 } })
+              ),
+            ]).catch(() => []);
+            const preview = text || (audioUrl ? "Sent a voice message" : fileUrl ? "Sent a file" : "Sent an image");
+            receivers
+              .filter((receiver) => receiver?.FCMToken)
+              .forEach((receiver) =>
+                sendPush(admin, receiver.FCMToken, {
+                  title: senderProfile?.displayName || "New message",
+                  body: String(preview).slice(0, 160),
+                  data: { type: "chat_message", chatId, path: "/chat" },
+                })
+              );
+          }
+        }
+
         recordTeacherFirstReplyIfNeeded({ chatId, teacherId: senderId });
         if (roomForNotification) {
           const preview = text || (audioUrl ? "Sent a voice message" : fileUrl ? `Shared ${fileName || "a file"}` : "Shared an image");
@@ -652,9 +798,10 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   router.delete("/api/chats/:chatId", async (req, res) => {
     try {
       const { chatId } = req.params;
-      const { userId } = req.body || {};
       if (!ObjectId.isValid(chatId)) return res.status(400).json({ error: "Invalid chatId." });
-      if (!userId) return res.status(400).json({ error: "userId is required." });
+      // only a participant can delete a chat (it used to be whoever the body named)
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
 
       const chatCollection = databaseinmongo.collection("chatCollection");
       const chatDB = databaseinmongo.collection("chatDB");
@@ -694,13 +841,14 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   });
 
   router.put("/mark-chat-as-seen", async (req, res) => {
-    const { userId, chatId } = req.body;
+    const { chatId } = req.body;
     const chatCollection = databaseinmongo.collection("chatCollection");
 
-    if (!userId || !chatId)
-      return res.status(400).json({ message: "userId and chatId are required" });
-
     try {
+      const userId = await resolveActor(req, res, req.body.userId);
+      if (!userId) return;
+      if (!chatId) return res.status(400).json({ message: "userId and chatId are required" });
+
       const userChatDoc = await chatCollection.findOne({ _id: userId });
       if (!userChatDoc)
         return res.status(404).json({ message: "User chat document not found" });
@@ -724,15 +872,54 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
   });
 
   router.put("/update-feedback", async (req, res) => {
-    const { teacherId, chatId, index, messageId, isLike, feedbackType, reaction, reactionMs } = req.body;
-    // XP is awarded to the reacting student, so trust the verified caller over
-    // whatever the body claims.
-    const studentId = req.auth?.uid || req.body.studentId;
+    const { chatId, messageId, isLike, feedbackType, reaction, reactionMs, sessionId } = req.body;
+    let { teacherId, index } = req.body;
 
     try {
+      // XP is awarded to the reacting student and points move on the teacher,
+      // so the reacting student is the verified caller.
+      const studentId = await resolveActor(req, res, req.body.studentId);
+      if (!studentId) return;
+
       const isCall = feedbackType === "call";
       const isChat = !isCall;
       const resolvedReaction = reaction || (isLike ? "liked" : "disliked");
+
+      // Who is being rated comes from the record, not the request. Anyone could
+      // previously name any teacher and move their points, or like their own
+      // messages for +3 each.
+      if (isCall) {
+        if (!sessionId) return res.status(400).json({ error: "sessionId is required" });
+        const callRecord = await databaseinmongo
+          .collection("callSession")
+          .findOne({ sessionId: String(sessionId) }, { projection: { studentId: 1, teacherId: 1 } });
+        if (!callRecord || callRecord.studentId !== studentId || !callRecord.teacherId) {
+          return res.status(403).json({ error: "You can only review a class you attended." });
+        }
+        teacherId = callRecord.teacherId;
+      } else {
+        if (!chatId || !ObjectId.isValid(chatId)) return res.status(400).json({ error: "Invalid chatId" });
+        if (!(await findChatEntry(databaseinmongo, studentId, chatId))) {
+          return res.status(403).json({ error: "Not a participant of this chat" });
+        }
+        const { messages = [] } =
+          (await databaseinmongo
+            .collection("chatDB")
+            .findOne({ _id: new ObjectId(chatId) }, { projection: { "messages.messageId": 1, "messages.senderId": 1 } })) || {};
+        // The client holds only the latest page, so a bare array index points
+        // at the wrong message once a chat passes 50 messages. Counting from
+        // the end is stable.
+        if (!messageId && Number.isInteger(Number(req.body.indexFromEnd))) {
+          index = messages.length - Number(req.body.indexFromEnd);
+        }
+        const target = messageId
+          ? messages.find((item) => item.messageId === messageId)
+          : messages[Number(index)];
+        if (!target || !target.senderId || target.senderId === studentId) {
+          return res.status(400).json({ error: "You can only react to a teacher's message." });
+        }
+        teacherId = target.senderId;
+      }
 
       // A chat reaction is write-once. The conditional update is the lock: it
       // only matches while the message still has no reaction, so a repeated
@@ -843,42 +1030,53 @@ module.exports = ({ userCollection, studyRooms, activepackages, databaseinmongo,
         return res.status(404).json({ error: "Teacher not found" });
       }
 
-      const pointDelta = isLike ? (isCall ? 5 : 3) : (isCall ? -5 : -3);
-      const newPoints = (teacher.points || 0) + pointDelta;
-
-      const { rating = 0 } = teacher;
-      const ratingDelta = isLike ? (5 - rating) / 10 : -((5 - rating) / 10);
-
-      await userCollection.updateOne(
-        { uid: teacherId },
-        { $set: { points: newPoints }, $inc: { rating: ratingDelta } }
-      );
-
       const qualityResult = await recordReactionEvent({
         teacherId,
         studentId,
         source: isCall ? "call_review" : "chat_reaction",
-        // key on messageId where we have it: array position shifts under
-        // pagination, so it cannot identify a message across requests
         sourceId: isCall
-          ? `call:${teacherId}:${studentId || "unknown"}:${Date.now()}`
+          ? `call:${sessionId || "legacy"}:${teacherId}:${studentId || "unknown"}`
           : `${chatId}:${messageId || index}`,
         dedupeKey: isCall
-          ? `call_review:${teacherId}:${studentId || "unknown"}:${Date.now()}`
+          ? `call_review:${sessionId || "legacy"}:${teacherId}:${studentId || "unknown"}`
           : `chat_reaction:${chatId}:${messageId || index}:${studentId || "unknown"}`,
         isLike,
         reaction,
-        // reactionMs is recorded, not acted on. It exists so reflex taps can be
-        // told apart from considered ones before anyone decides whether to
-        // weight them differently in teacher quality.
         metadata: {
           chatId,
           index,
           messageId: messageId || null,
           feedbackType,
+          sessionId: sessionId || null,
           reactionMs: Number.isFinite(Number(reactionMs)) ? Math.round(Number(reactionMs)) : null,
         },
       });
+
+      // Call reviews do not have a chat-message claim, so the quality event is
+      // their idempotency boundary. Claim it before changing points or rating.
+      if (isCall && qualityResult?.ok && qualityResult.inserted === false) {
+        return res.json({
+          success: true,
+          reaction: resolvedReaction,
+          xpAwarded: 0,
+          alreadyReacted: true,
+        });
+      }
+
+      const pointDelta = isLike ? (isCall ? 5 : 3) : (isCall ? -5 : -3);
+
+      const { rating = 0 } = teacher;
+      const ratingDelta = isLike ? (5 - rating) / 10 : -((5 - rating) / 10);
+
+      // $inc, not $set of a value computed from an earlier read: points earned
+      // by a message sent in between used to be overwritten.
+      const updatedTeacher = await userCollection.findOneAndUpdate(
+        { uid: teacherId },
+        { $inc: { points: pointDelta, rating: ratingDelta } },
+        { returnDocument: "after", projection: { points: 1 } }
+      );
+      const newPoints = Number(updatedTeacher?.points ?? updatedTeacher?.value?.points) || 0;
+
       await applyTeacherQualitySnapshot({ teacherId, basePoints: newPoints });
 
       const xpAwarded = !isCall && studentId && qualityResult?.inserted
@@ -996,7 +1194,7 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
       ),
     ];
     const users = receiverIds.length
-      ? await userCollection.find({ uid: { $in: receiverIds } }).toArray()
+      ? await userCollection.find({ uid: { $in: receiverIds } }, { projection: CHAT_PEER_FIELDS }).toArray()
       : [];
     const usersById = users.reduce((acc, item) => {
       acc[item.uid] = item;
@@ -1028,7 +1226,7 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
     const roomParticipants = roomParticipantIds.length
       ? await userCollection
           .find({ uid: { $in: roomParticipantIds } })
-          .project({ uid: 1, displayName: 1, photoURL: 1, email: 1, role: 1 })
+          .project({ uid: 1, displayName: 1, photoURL: 1, role: 1 })
           .toArray()
       : [];
     const roomParticipantsById = roomParticipants.reduce((acc, person) => {
@@ -1052,7 +1250,7 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
         uid: isStudentViewingTeacherChat ? teacher.uid : item.roomId || item.receiverId,
         displayName: item.chatName || room.name || "Room chat",
         photoURL: isStudentViewingTeacherChat ? teacher.photoURL : null,
-        email: isStudentViewingTeacherChat ? teacher.email : null,
+        email: null,
         role: receiverRole,
         roomId: item.roomId || room._id?.toString() || null,
         roomName: room.name || "",
@@ -1098,16 +1296,33 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
       }
     };
 
+    // Only relay typing for a chat this socket actually joined (membership is
+    // checked at join), and say which chat it is so an open chat can ignore
+    // events meant for another.
     socket.on("typing", (chatId) => {
-      socket.to(chatId).emit("userTyping", { userId: socket.id });
+      if (!chatId || !socket.rooms.has(chatId)) return;
+      socket.to(chatId).emit("userTyping", { userId: socket.id, chatId });
     });
 
     socket.on("stopTyping", (chatId) => {
-      socket.to(chatId).emit("userStopTyping", { userId: socket.id });
+      if (!chatId || !socket.rooms.has(chatId)) return;
+      socket.to(chatId).emit("userStopTyping", { userId: socket.id, chatId });
     });
 
+    // A join awaits a membership query. If the user backs out of the chat in
+    // that window, the leave ran first as a no-op and the join landed anyway,
+    // leaving the socket subscribed to a chat it had left. Each join/leave bumps
+    // a counter; a join that is no longer the latest event is dropped.
+    const chatRoomEvents = new Map();
+    const bumpChatRoomEvent = (chatId) => {
+      const next = (chatRoomEvents.get(chatId) || 0) + 1;
+      chatRoomEvents.set(chatId, next);
+      return next;
+    };
+
     socket.on("joinChatRoom", async (chatId) => {
-      if (!chatId) return;
+      if (!chatId || !ObjectId.isValid(chatId)) return;
+      const joinEvent = bumpChatRoomEvent(chatId);
       // joining streams every message in the chat, so confirm membership first
       const viewerId = identify(socket, null);
       if (viewerId) {
@@ -1129,6 +1344,7 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
         }
       }
 
+      if (chatRoomEvents.get(chatId) !== joinEvent) return;
       socket.join(chatId);
       try {
         // Only the most recent page. Sending every message meant opening a long
@@ -1148,6 +1364,7 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
         if (chatDoc) {
           socket.emit("chatUpdate", {
             ...chatDoc,
+            chatId: String(chatId),
             // each viewer sees their own room reaction, not whoever reacted first
             messages: viewMessagesFor(chatDoc.messages, viewerId),
             hasMoreMessages: chatDoc.totalMessages > chatDoc.messages.length,
@@ -1170,6 +1387,7 @@ module.exports.setupSocket = ({ io, userCollection, databaseinmongo, admin }) =>
 
     socket.on("leaveChatRoom", (chatId) => {
       if (!chatId) return;
+      bumpChatRoomEvent(chatId);
       socket.leave(chatId);
     });
 

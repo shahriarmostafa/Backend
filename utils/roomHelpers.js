@@ -6,6 +6,30 @@ const {
   STUDY_ROOM_TEACHER_CREDIT_RATE,
 } = require("./constants");
 
+/**
+ * What a room payload may say about the people in it. Room pages, room chats
+ * (sender names/avatars) and the quiz/goal panels read only these. The full
+ * user documents used to go out - email, FCMToken, points, credit fields - to
+ * anyone who could open the room, which includes non-members via room search.
+ */
+const ROOM_MEMBER_PROJECTION = { _id: 0, uid: 1, displayName: 1, photoURL: 1, role: 1 };
+const ROOM_TEACHER_PROJECTION = {
+  _id: 0,
+  uid: 1,
+  displayName: 1,
+  photoURL: 1,
+  role: 1,
+  rating: 1,
+  experience: 1,
+  subjects: 1,
+  category: 1,
+  type: 1,
+};
+
+/** Rooms with free access, or with credit expense switched off, cost nothing. */
+const isFreeRoom = (room) => room?.freeAccess === true || room?.creditExpenseEnabled === false;
+const getRoomJoinCost = (room) => (isFreeRoom(room) ? 0 : STUDY_ROOM_JOIN_CREDIT);
+
 const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes = null }) => {
   const getRoomMembership = (room, userId) => {
     const rawStatus = room?.memberStatuses?.[userId];
@@ -98,6 +122,10 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       memberCount: (room.memberIds || []).length,
       memberStatuses: buildMemberStatuses(room),
       maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
+      // so the join prompt can say "free" instead of the default price
+      freeAccess: room.freeAccess === true,
+      creditExpenseEnabled: room.creditExpenseEnabled !== false,
+      joinCost: getRoomJoinCost(room),
     };
   };
 
@@ -119,14 +147,28 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     updatedAt: 1,
   };
 
-  const hydrateStudyRoom = async (room) => {
+  /**
+   * `options.includeContact` adds member/teacher email for the owner's admin
+   * screens. It is an object check on purpose: admin.js calls this through
+   * `rooms.map(hydrateStudyRoom)`, which passes the array index here.
+   */
+  const hydrateStudyRoom = async (room, options = {}) => {
     if (!room) return null;
+    const includeContact = Boolean(options && typeof options === "object" && options.includeContact);
     const roomId = room._id.toString();
     const callSession = databaseinmongo.collection("callSession");
     const [members, teachers] = await Promise.all([
-      userCollection.find({ uid: { $in: room.memberIds || [] } }).toArray(),
       userCollection
-        .find({ uid: { $in: (room.teacherSessions || []).map((s) => s.teacherId) } })
+        .find(
+          { uid: { $in: room.memberIds || [] } },
+          { projection: includeContact ? { ...ROOM_MEMBER_PROJECTION, email: 1 } : ROOM_MEMBER_PROJECTION }
+        )
+        .toArray(),
+      userCollection
+        .find(
+          { uid: { $in: (room.teacherSessions || []).map((s) => s.teacherId) } },
+          { projection: includeContact ? { ...ROOM_TEACHER_PROJECTION, email: 1 } : ROOM_TEACHER_PROJECTION }
+        )
         .toArray(),
     ]);
     const quizSummary = roomQuizzes
@@ -267,6 +309,7 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
       maxStudents: room.maxStudents || STUDY_ROOM_MAX_STUDENTS,
       teacherControl: room.teacherControl === true,
       quizExpenseEnabled: room.quizExpenseEnabled !== false,
+      joinCost: getRoomJoinCost(room),
       members,
       progress,
       teacherSessions: (room.teacherSessions || []).map((session) => ({
@@ -404,37 +447,112 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     return { activePackage, credit: Number(activePackage.credit) || 0, isValid };
   };
 
+  /**
+   * Conditional decrement, like spendCourseCredit: the balance check and the
+   * spend are one operation, so two requests racing on the same balance cannot
+   * both pass a stale `credit >= cost` read.
+   */
   const spendStudentCredit = async (studentId, amount) => {
     const creditToSpend = Math.max(0, Number(amount) || 0);
     if (creditToSpend === 0) return { ok: true, credit: null };
 
-    const { credit, isValid } = await getStudentCreditPackage(studentId);
+    const { isValid } = await getStudentCreditPackage(studentId);
     if (!isValid)
       return { ok: false, status: 403, message: "No active package found for this student." };
-    if (credit < creditToSpend)
+    const result = await activepackages.findOneAndUpdate(
+      { uid: studentId, credit: { $gte: creditToSpend } },
+      { $inc: { credit: -creditToSpend } },
+      { returnDocument: "after" }
+    );
+    const doc = result && Object.prototype.hasOwnProperty.call(result, "value") ? result.value : result;
+    if (!doc)
       return { ok: false, status: 402, message: `At least ${creditToSpend} credit is required.` };
-    await activepackages.updateOne({ uid: studentId }, { $inc: { credit: -creditToSpend } });
-    return { ok: true, credit: credit - creditToSpend };
+    return { ok: true, credit: Number(doc.credit) || 0 };
   };
 
+  /**
+   * Adds a student to the room in ONE conditional update: only if they are not
+   * already a member and a seat is free (`memberIds.<limit-1>` must not exist).
+   * The route used to `$set` memberIds and chats from the copy it read, so two
+   * joins at once each wrote their own array and one student vanished - after
+   * being charged - and a teacher chat added meanwhile could be dropped too.
+   *
+   * Returns true when this call added the student.
+   */
+  const claimRoomSeat = async (room, userId, membership) => {
+    const seatLimit = Math.max(1, Number(room.maxStudents) || STUDY_ROOM_MAX_STUDENTS);
+    const update = {
+      $addToSet: { memberIds: userId },
+      $set: { [`memberStatuses.${userId}`]: membership, updatedAt: Date.now() },
+    };
+    // every room chat (students + teacher chats) includes every member
+    if (Array.isArray(room.chats) && room.chats.length) {
+      update.$addToSet["chats.$[].participantIds"] = userId;
+    }
+    const result = await studyRooms.updateOne(
+      {
+        _id: room._id,
+        memberIds: { $ne: userId },
+        [`memberIds.${seatLimit - 1}`]: { $exists: false },
+      },
+      update
+    );
+    return Boolean(result?.modifiedCount);
+  };
+
+  /** Undoes claimRoomSeat when the join charge fails. */
+  const releaseRoomSeat = async (room, userId) => {
+    const update = {
+      $pull: { memberIds: userId },
+      $unset: { [`memberStatuses.${userId}`]: "" },
+      $set: { updatedAt: Date.now() },
+    };
+    if (Array.isArray(room.chats) && room.chats.length) {
+      update.$pull["chats.$[].participantIds"] = userId;
+    }
+    await studyRooms.updateOne({ _id: room._id }, update);
+  };
+
+  /**
+   * Paid renewal. Refused while the membership is still active - the UI only
+   * offers Renew once it lapses, so an active one means a double tap or a
+   * replay, and each used to charge another month from *now*, wasting the
+   * remaining days.
+   *
+   * The membership is claimed first with a conditional write keyed on the
+   * nextBillingAt that was read, so of two concurrent renewals only one gets
+   * past this point and only that one is charged. If the charge then fails the
+   * claim is put back.
+   */
   const renewRoomMembership = async (room, userId) => {
     if (!(room.memberIds || []).includes(userId))
       return { ok: false, status: 404, message: "Student is not a member of this room." };
 
-    const creditResult = await spendStudentCredit(userId, STUDY_ROOM_JOIN_CREDIT);
-    if (!creditResult.ok) return creditResult;
+    const current = getRoomMembership(room, userId);
+    if (current.isActive)
+      return {
+        ok: false,
+        status: 409,
+        alreadyActive: true,
+        message: "Your room membership is already active.",
+      };
 
+    const rawStatus = room.memberStatuses?.[userId];
     const now = new Date();
     const nextBillingAt = new Date(now.getTime() + STUDY_ROOM_MONTH_MS);
     const membership = {
-      joinedAt: getRoomMembership(room, userId).joinedAt,
+      joinedAt: current.joinedAt,
       lastPaymentAt: now,
       nextBillingAt,
       isActive: true,
     };
 
-    await studyRooms.updateOne(
-      { _id: room._id },
+    const claim = await studyRooms.updateOne(
+      {
+        _id: room._id,
+        memberIds: userId,
+        [`memberStatuses.${userId}.nextBillingAt`]: rawStatus?.nextBillingAt ?? null,
+      },
       {
         $set: {
           [`memberStatuses.${userId}`]: membership,
@@ -442,6 +560,24 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
         },
       }
     );
+    if (!claim?.modifiedCount)
+      return {
+        ok: false,
+        status: 409,
+        alreadyActive: true,
+        message: "This membership was just renewed.",
+      };
+
+    const creditResult = await spendStudentCredit(userId, STUDY_ROOM_JOIN_CREDIT);
+    if (!creditResult.ok) {
+      await studyRooms.updateOne(
+        { _id: room._id, [`memberStatuses.${userId}.nextBillingAt`]: nextBillingAt },
+        rawStatus
+          ? { $set: { [`memberStatuses.${userId}`]: rawStatus } }
+          : { $unset: { [`memberStatuses.${userId}`]: "" } }
+      );
+      return creditResult;
+    }
     return { ok: true, membership, credit: creditResult.credit };
   };
 
@@ -459,8 +595,18 @@ const makeRoomHelpers = ({ userCollection, databaseinmongo, studyRooms, activepa
     getUniqueRoomKeyword,
     getStudentCreditPackage,
     spendStudentCredit,
+    claimRoomSeat,
+    releaseRoomSeat,
     renewRoomMembership,
+    getRoomJoinCost,
+    isFreeRoom,
   };
 };
 
-module.exports = { makeRoomHelpers };
+module.exports = {
+  makeRoomHelpers,
+  getRoomJoinCost,
+  isFreeRoom,
+  ROOM_MEMBER_PROJECTION,
+  ROOM_TEACHER_PROJECTION,
+};

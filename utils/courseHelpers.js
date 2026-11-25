@@ -3,11 +3,116 @@ const {
   COURSE_MARKETPLACE_COMMISSION_RATE,
   COURSE_TEACHER_POOL_RATE,
   COURSE_PERFORMANCE_WEIGHTS,
+  PLATFORM_UTC_OFFSET_MINUTES,
 } = require("./constants");
 
 const COURSE_CATEGORIES = ["school", "college", "university", "everyone"];
 const COURSE_TYPES = ["bangla_medium", "english_medium", "everyone"];
 const PAYMENT_PLANS = ["session", "monthly", "full"];
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_SCHEDULE_SESSIONS = 500;
+const MAX_SCHEDULE_SPAN_DAYS = 5 * 366;
+const WEEKDAY_INDEX = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
+/**
+ * Whether a student's enrollment covers one class session of a course:
+ *   full    -> every session
+ *   monthly -> any session while validUntil has not passed
+ *   session -> only the session that was bought
+ * Cancelled enrollments and sessions the course does not have never count.
+ * A student may hold several enrollments (one bought class, then another; a
+ * lapsed month, then a new one) - any one covering the session is enough.
+ *
+ * Used by the course routes and by /start-call in routes/calls.js.
+ */
+const hasCourseSessionAccess = (course, studentId, sessionId, now = new Date()) => {
+  if (!course || !studentId || sessionId == null || sessionId === "") return false;
+  const targetSessionId = String(sessionId);
+  if (!(course.sessions || []).some((session) => String(session?.id) === targetSessionId)) return false;
+  const nowMs = new Date(now).getTime();
+  return (course.enrollments || []).some((enrollment) => {
+    if (!enrollment || enrollment.studentId !== studentId || enrollment.status === "cancelled") return false;
+    if (enrollment.paymentPlan === "full") return true;
+    if (enrollment.paymentPlan === "monthly") {
+      const validUntil = enrollment.validUntil ? new Date(enrollment.validUntil).getTime() : NaN;
+      return Number.isFinite(validUntil) && validUntil >= nowMs;
+    }
+    if (enrollment.paymentPlan === "session") return String(enrollment.sessionId || "") === targetSessionId;
+    return false;
+  });
+};
+
+/** A student's standing in a course, for the course page and the enroll route. */
+const getCourseAccessSummary = (course, studentId, now = new Date()) => {
+  const nowMs = new Date(now).getTime();
+  const mine = (course?.enrollments || []).filter(
+    (enrollment) => enrollment?.studentId === studentId && enrollment.status !== "cancelled"
+  );
+  const full = mine.some((enrollment) => enrollment.paymentPlan === "full");
+  const monthlyValidUntil = mine
+    .filter((enrollment) => enrollment.paymentPlan === "monthly" && enrollment.validUntil)
+    .map((enrollment) => new Date(enrollment.validUntil).getTime())
+    .filter(Number.isFinite)
+    .reduce((latest, value) => Math.max(latest, value), 0);
+  const sessionIds = [
+    ...new Set(
+      mine
+        .filter((enrollment) => enrollment.paymentPlan === "session" && enrollment.sessionId)
+        .map((enrollment) => String(enrollment.sessionId))
+    ),
+  ];
+  const monthlyActive = monthlyValidUntil >= nowMs;
+  return {
+    enrolled: mine.length > 0,
+    full,
+    monthlyActive,
+    monthlyValidUntil: monthlyValidUntil ? new Date(monthlyValidUntil) : null,
+    sessionIds,
+    // every current and future class is covered
+    coversAll: full || monthlyActive,
+  };
+};
+
+/** Minutes east of UTC; the platform zone unless the client sent a sane one. */
+const normalizeUtcOffset = (value) => {
+  const offset = Number(value);
+  if (value === null || value === undefined || value === "" || !Number.isFinite(offset)) {
+    return PLATFORM_UTC_OFFSET_MINUTES;
+  }
+  return offset >= -12 * 60 && offset <= 14 * 60 ? Math.round(offset) : PLATFORM_UTC_OFFSET_MINUTES;
+};
+
+/** "Mon, Wed" / ["Monday", "wed"] -> sorted weekday numbers (0 = Sunday). */
+const parseScheduleDays = (days = []) => {
+  const list = Array.isArray(days) ? days : String(days || "").split(",");
+  return [
+    ...new Set(
+      list
+        .map((day) => WEEKDAY_INDEX[String(day || "").trim().toLowerCase().slice(0, 3)])
+        .filter((day) => day !== undefined)
+    ),
+  ].sort((a, b) => a - b);
+};
+
+/** "8:00 PM", "8 pm", "20:00", "20.30" -> minutes after midnight, or null. */
+const parseScheduleTime = (value) => {
+  const match = String(value || "")
+    .trim()
+    .toLowerCase()
+    .match(/^(\d{1,2})(?:[:.](\d{2}))?\s*(a\.?\s?m\.?|p\.?\s?m\.?)?$/);
+  if (!match) return null;
+  let hours = Number(match[1]);
+  const minutes = Number(match[2] || 0);
+  if (minutes > 59) return null;
+  if (match[3]) {
+    if (hours < 1 || hours > 12) return null;
+    hours = (hours % 12) + (match[3].startsWith("p") ? 12 : 0);
+  } else if (hours > 23) {
+    return null;
+  }
+  return hours * 60 + minutes;
+};
 
 const asId = (value) => (value && value.toString ? value.toString() : String(value || ""));
 
@@ -83,40 +188,125 @@ const makeCourseHelpers = ({ userCollection, activepackages, databaseinmongo, co
     return Number(packageAgg[0]?.pricePerCredit) || 1;
   };
 
-  const buildScheduleSessions = ({ startsAt, months = 1, days = [], time = "", totalClasses = 0 }) => {
+  /**
+   * The class routine: one session per chosen weekday at `time`, read as wall
+   * clock in `utcOffsetMinutes` (the platform zone, Asia/Dhaka, unless the
+   * client sent its own). It used to ignore days and time entirely and emit one
+   * session a week at UTC midnight - 6 AM in Bangladesh.
+   *
+   * A date-only `startsAt` ("2026-11-02") is that calendar day in the zone; a
+   * full timestamp is converted into it. Unparseable days fall back to the
+   * start date's weekday (weekly), an unparseable time to midnight - the
+   * teacher can reschedule single sessions.
+   */
+  const buildScheduleSessions = ({
+    startsAt,
+    months = 1,
+    days = [],
+    time = "",
+    totalClasses = 0,
+    utcOffsetMinutes = PLATFORM_UTC_OFFSET_MINUTES,
+  }) => {
+    const offsetMs = normalizeUtcOffset(utcOffsetMinutes) * 60 * 1000;
+    const dateOnly = typeof startsAt === "string" && /^\d{4}-\d{2}-\d{2}$/.test(startsAt.trim());
     const start = parseDate(startsAt, new Date());
-    const count = Math.max(1, Number(totalClasses) || Math.max(4, Number(months) * Math.max(days.length || 1, 4)));
-    return Array.from({ length: count }, (_, index) => ({
-      id: new ObjectId().toString(),
-      title: `Class ${index + 1}`,
-      scheduledAt: new Date(start.getTime() + index * 7 * 24 * 60 * 60 * 1000),
-      time,
-      status: "scheduled",
-      teacherAttendance: false,
-      studentAttendance: {},
-      ratings: [],
-    }));
+    let firstDayStart;
+    if (dateOnly) {
+      const [year, month, day] = startsAt.trim().split("-").map(Number);
+      firstDayStart = Date.UTC(year, month - 1, day) - offsetMs;
+    } else {
+      const local = new Date(start.getTime() + offsetMs);
+      firstDayStart = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) - offsetMs;
+    }
+    const notBefore = dateOnly ? firstDayStart : start.getTime();
+    const weekdays = parseScheduleDays(days);
+    const activeDays = weekdays.length ? weekdays : [new Date(firstDayStart + offsetMs).getUTCDay()];
+    const minutesOfDay = parseScheduleTime(time) ?? 0;
+    const dayCount = Array.isArray(days) ? days.length : 0;
+    const count = Math.min(
+      MAX_SCHEDULE_SESSIONS,
+      Math.max(1, Number(totalClasses) || Math.max(4, Number(months) * Math.max(dayCount || 1, 4)))
+    );
+
+    const sessions = [];
+    for (let dayIndex = 0; sessions.length < count && dayIndex < MAX_SCHEDULE_SPAN_DAYS; dayIndex += 1) {
+      const dayStart = firstDayStart + dayIndex * DAY_MS;
+      if (!activeDays.includes(new Date(dayStart + offsetMs).getUTCDay())) continue;
+      const scheduledAt = new Date(dayStart + minutesOfDay * 60 * 1000);
+      if (scheduledAt.getTime() < notBefore) continue;
+      sessions.push({
+        id: new ObjectId().toString(),
+        title: `Class ${sessions.length + 1}`,
+        scheduledAt,
+        time,
+        status: "scheduled",
+        teacherAttendance: false,
+        studentAttendance: {},
+        ratings: [],
+      });
+    }
+    return sessions;
   };
 
-  const hydrateCourse = async (course, viewerId = "") => {
+  /**
+   * The client-facing course. `viewerId` must be the verified caller.
+   *
+   * The roster (`enrollments`, each with the student's email) and the payout
+   * records go only to the course teacher, or to admin screens that pass
+   * `includeEnrollments`. A student gets their own enrollment, a summary of
+   * what it covers, and per-session `myAccess` flags; per-session attendance
+   * and ratings are cut down to their own entries.
+   */
+  const hydrateCourse = async (course, viewerId = "", options = {}) => {
     if (!course) return null;
-    const teacher = course.teacher || (course.teacherId ? await getTeacherSnapshot(course.teacherId) : null);
+    const now = new Date();
+    const isCourseTeacher = Boolean(viewerId && viewerId === course.teacherId);
+    const showRoster = isCourseTeacher || Boolean(options && options.includeEnrollments);
+    const storedTeacher = course.teacher || (course.teacherId ? await getTeacherSnapshot(course.teacherId) : null);
+    const { email: teacherEmail, ...publicTeacher } = storedTeacher || {};
+    const teacher = storedTeacher ? (showRoster ? { ...publicTeacher, email: teacherEmail } : publicTeacher) : null;
     const enrollments = Array.isArray(course.enrollments) ? course.enrollments : [];
     const activeEnrollments = enrollments.filter((item) => item.status !== "cancelled");
-    const myEnrollment = viewerId ? enrollments.find((item) => item.studentId === viewerId) : null;
+    const studentCount = new Set(activeEnrollments.map((item) => item.studentId)).size;
+    const isStudentViewer = Boolean(viewerId && !isCourseTeacher);
+    const myEnrollments = isStudentViewer ? activeEnrollments.filter((item) => item.studentId === viewerId) : [];
+    // newest first, the shape the page has always read
+    const myEnrollment = myEnrollments.length
+      ? [...myEnrollments].sort((a, b) => new Date(b.enrolledAt || 0) - new Date(a.enrolledAt || 0))[0]
+      : null;
+    const myAccess = isStudentViewer ? getCourseAccessSummary(course, viewerId, now) : null;
     const ratings = (course.sessions || []).flatMap((session) => session.ratings || []);
     const averageRating = ratings.length
       ? Math.round((ratings.reduce((sum, item) => sum + (Number(item.rating) || 0), 0) / ratings.length) * 10) / 10
       : Number(course.averageRating) || 0;
+    const sessions = (course.sessions || []).map((session) => {
+      if (showRoster) return session;
+      const ownAttendance = viewerId && session.studentAttendance?.[viewerId];
+      return {
+        ...session,
+        studentAttendance: ownAttendance ? { [viewerId]: ownAttendance } : {},
+        ratings: (session.ratings || []).filter((item) => item.studentId === viewerId),
+        myAccess: isStudentViewer ? hasCourseSessionAccess(course, viewerId, session.id, now) : false,
+      };
+    });
+    const {
+      enrollments: _enrollments,
+      teacherPayments: _teacherPayments,
+      ...courseFields
+    } = course;
 
     return {
-      ...course,
+      ...courseFields,
+      ...(showRoster ? { enrollments, teacherPayments: course.teacherPayments } : {}),
+      sessions,
       id: asId(course._id),
       slug: course.slug || makeSlug(course.title),
       teacher,
-      studentCount: activeEnrollments.length,
-      seatsTaken: activeEnrollments.length,
-      myEnrollment: myEnrollment || null,
+      studentCount,
+      seatsTaken: studentCount,
+      myEnrollment,
+      myEnrollments,
+      myAccess,
       averageRating,
       ratingCount: ratings.length || Number(course.ratingCount) || 0,
       pricing: {
@@ -222,6 +412,8 @@ const makeCourseHelpers = ({ userCollection, activepackages, databaseinmongo, co
     spendCourseCredit,
     calculateCourseEarnings,
     buildScheduleSessions,
+    hasCourseSessionAccess,
+    getCourseAccessSummary,
     makeSlug,
     normalizeCategory,
     normalizeType,
@@ -229,4 +421,14 @@ const makeCourseHelpers = ({ userCollection, activepackages, databaseinmongo, co
   };
 };
 
-module.exports = { makeCourseHelpers, COURSE_CATEGORIES, COURSE_TYPES, PAYMENT_PLANS };
+module.exports = {
+  makeCourseHelpers,
+  hasCourseSessionAccess,
+  getCourseAccessSummary,
+  parseScheduleDays,
+  parseScheduleTime,
+  normalizeUtcOffset,
+  COURSE_CATEGORIES,
+  COURSE_TYPES,
+  PAYMENT_PLANS,
+};

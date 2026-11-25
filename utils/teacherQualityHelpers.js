@@ -64,6 +64,8 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
     const normalizedDelta = roundQuality(delta);
     const cap = Math.abs(Number(TEACHER_QUALITY_SOURCE_CAPS[source]) || 0);
     const uniqueKey = dedupeKey || `${source}:${sourceId}:${studentId || "system"}`;
+    let appliedDelta = normalizedDelta;
+    let capped = false;
 
     if (cap > 0) {
       const existing = await qualityEvents
@@ -77,7 +79,12 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
         .toArray();
       const sourceTotal = Number(existing[0]?.total) || 0;
       const remaining = normalizedDelta >= 0 ? cap - sourceTotal : cap + sourceTotal;
-      if (remaining <= 0) return { ok: true, capped: true, delta: 0 };
+      if (remaining <= 0) {
+        // Still insert a zero-value event. The unique key is also the atomic
+        // claim that prevents a capped review from being submitted repeatedly.
+        appliedDelta = 0;
+        capped = true;
+      }
     }
 
     // `updatedAt` must NOT appear here: it is owned by the $set below, and Mongo
@@ -90,7 +97,7 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
       sourceId: String(sourceId),
       dedupeKey: uniqueKey,
       monthKey,
-      delta: normalizedDelta,
+      delta: appliedDelta,
       rating,
       reaction,
       metadata,
@@ -106,7 +113,7 @@ const makeTeacherQualityHelpers = ({ databaseinmongo, userCollection } = {}) => 
       { upsert: true, session }
     );
 
-    return { ok: true, delta: normalizedDelta, monthKey, inserted: result.upsertedCount > 0 };
+    return { ok: true, delta: appliedDelta, monthKey, capped, inserted: result.upsertedCount > 0 };
   };
 
   const recordRatingEvent = (payload = {}) =>

@@ -8,11 +8,30 @@ const {
   getGeneralCallPoints,
   getRoomCallCreditRate,
   getCallCreditForSeconds,
+  getBillableCallSeconds,
   clampCreditRate,
 } = require("../utils/moneyHelpers");
+const { requireParty, resolveActor } = require("../utils/actor");
+const { findDirectChatEntry } = require("../utils/chatAccess");
+const { sendPush } = require("../utils/push");
+const courseHelpersModule = require("../utils/courseHelpers");
 
-module.exports = ({ userCollection, activepackages, databaseinmongo, client, studyRooms, courses }) => {
+// One ring per student and teacher in this window; a stuck button or a retry
+// loop should not buzz the teacher's phone over and over.
+const RING_THROTTLE_MS = 15 * 1000;
+
+module.exports = ({ userCollection, activepackages, databaseinmongo, client, studyRooms, courses, admin }) => {
   const router = Router();
+
+  // Whether a student's enrollment covers this course class.
+  const courseHelpers = courseHelpersModule.makeCourseHelpers({ userCollection, activepackages, databaseinmongo, courses });
+  const hasCourseAccess = (course, studentId, courseSessionId) => {
+    const check = courseHelpersModule.hasCourseSessionAccess || courseHelpers.hasCourseSessionAccess;
+    if (typeof check === "function") return check(course, studentId, courseSessionId);
+    return (course.enrollments || []).some(
+      (enrollment) => (enrollment.studentId || enrollment.student?.uid) === studentId
+    );
+  };
   const { createRoomNotification } = makeNotificationHelpers({
     databaseinmongo,
     userCollection,
@@ -20,6 +39,12 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
   });
 
 
+  /**
+   * Both sides of a call post this once it is accepted; the first creates the
+   * session. Who the student and teacher are, and the rate, used to be taken
+   * as sent: a student could bill someone else or send `creditRate: 0.1`, and a
+   * teacher could open sessions with no student and collect call points.
+   */
   router.post("/start-call", async (req, res) => {
     try {
       const {
@@ -27,7 +52,6 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
         studentId,
         teacherId,
         roomId,
-        creditRate,
         roomCallId,
         parentSessionId,
         participantName,
@@ -36,25 +60,73 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
         courseSessionId,
         teacherStarted = false,
       } = req.body;
-      const callSession = databaseinmongo.collection("callSession");
-      const normalizedCreditRate = Math.min(Math.max(Number(creditRate) || 1, 0.1), 1);
-      const sharedRoomCallId = roomId ? roomCallId || parentSessionId || sessionId : null;
-      const studentProfile = studentId ? await userCollection.findOne({ uid: studentId }) : null;
-      const startTime = Date.now();
+      if (!sessionId || typeof sessionId !== "string" || sessionId.length > 120) {
+        return res.status(400).json({ success: false, message: "sessionId is required" });
+      }
+      if (!teacherId) return res.status(400).json({ success: false, message: "teacherId is required" });
 
-      if (roomId && teacherStarted) {
-        if (!ObjectId.isValid(roomId)) {
-          return res.status(400).json({ success: false, message: "Invalid roomId" });
-        }
-        const room = await studyRooms.findOne({ _id: new ObjectId(roomId) });
+      const callSession = databaseinmongo.collection("callSession");
+      // A second /start-call for the same session (the other side) must name the
+      // same people; it can't re-point a session at someone else.
+      const existing = await callSession.findOne({ sessionId }, { projection: { studentId: 1, teacherId: 1 } });
+      if (existing) {
+        const caller = await requireParty(req, res, [existing.studentId, existing.teacherId], req.body.callerId);
+        if (!caller) return;
+        return res.status(200).json({ success: false, message: "Call session already exists" });
+      }
+
+      const caller = await requireParty(req, res, [studentId, teacherId], req.body.callerId);
+      if (!caller) return;
+
+      const teacher = await userCollection.findOne({ uid: teacherId }, { projection: { role: 1 } });
+      if (teacher?.role !== "teacher") {
+        return res.status(400).json({ success: false, message: "That account is not a teacher." });
+      }
+
+      let normalizedCreditRate = 1;
+      let room = null;
+      if (roomId) {
+        room = ObjectId.isValid(roomId) ? await studyRooms.findOne({ _id: new ObjectId(roomId) }) : null;
         const isRoomTeacher = room?.teacherSessions?.some((session) => session.teacherId === teacherId);
-        if (!room || room.teacherControl !== true || !isRoomTeacher) {
+        if (!room || !isRoomTeacher) {
+          return res.status(403).json({ success: false, message: "That teacher is not part of this room." });
+        }
+        if (studentId && !(room.memberIds || []).includes(studentId)) {
+          return res.status(403).json({ success: false, message: "Join this room before joining its classes." });
+        }
+        if (teacherStarted && room.teacherControl !== true) {
           return res.status(403).json({
             success: false,
             message: "Teacher-started classes are available only in teacher-controlled rooms.",
           });
         }
+        // the room rate is settled for the whole group when the teacher ends
+        normalizedCreditRate = clampCreditRate(1);
+      } else if (courseId) {
+        const course = ObjectId.isValid(courseId) ? await courses.findOne({ _id: new ObjectId(courseId) }) : null;
+        if (!course || course.teacherId !== teacherId) {
+          return res.status(403).json({ success: false, message: "That teacher does not run this course." });
+        }
+        if (studentId && !hasCourseAccess(course, studentId, courseSessionId)) {
+          return res.status(403).json({ success: false, message: "Your course plan does not include this class." });
+        }
+      } else {
+        // A 1:1 class needs a real student who already has a chat with this teacher.
+        if (!studentId || studentId === teacherId) {
+          return res.status(400).json({ success: false, message: "A class needs a student." });
+        }
+        const [student, chatEntry] = await Promise.all([
+          userCollection.findOne({ uid: studentId }, { projection: { role: 1 } }),
+          findDirectChatEntry(databaseinmongo, studentId, teacherId),
+        ]);
+        if (student?.role !== "student" || !chatEntry) {
+          return res.status(403).json({ success: false, message: "Start a chat with this teacher first." });
+        }
       }
+
+      const sharedRoomCallId = roomId ? roomCallId || parentSessionId || sessionId : null;
+      const studentProfile = studentId ? await userCollection.findOne({ uid: studentId }) : null;
+      const startTime = Date.now();
 
       const result = await callSession.updateOne(
         { sessionId },
@@ -68,8 +140,8 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
             courseId: courseId || null,
             courseSessionId: courseSessionId || null,
             creditRate: normalizedCreditRate,
-            participantName: participantName || studentProfile?.displayName || null,
-            participantPhotoURL: participantPhotoURL || studentProfile?.photoURL || null,
+            participantName: studentProfile?.displayName || participantName || null,
+            participantPhotoURL: studentProfile?.photoURL || participantPhotoURL || null,
             lastHeartbeatAt: startTime,
           },
         },
@@ -103,7 +175,7 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
     const mongoSession = client.startSession();
 
     try {
-      const { sessionId, endRoomCall = false } = req.body;
+      const { sessionId } = req.body;
       const endTime = Date.now();
 
       if (!sessionId)
@@ -112,6 +184,14 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
       const callSession = databaseinmongo.collection("callSession");
       const callRoomAwards = databaseinmongo.collection("callRoomAwards");
       let responsePayload = null;
+
+      // Only someone on the call can end it, and only its teacher can close a
+      // whole room class (any student could send endRoomCall before).
+      const parties = await callSession.findOne({ sessionId }, { projection: { studentId: 1, teacherId: 1 } });
+      if (!parties) return res.status(404).json({ success: false, message: "Session not found" });
+      const caller = await requireParty(req, res, [parties.studentId, parties.teacherId], req.body.callerId);
+      if (!caller) return;
+      const endRoomCall = req.body.endRoomCall === true && caller === parties.teacherId;
 
       await mongoSession.withTransaction(async () => {
         let session = await callSession.findOne({ sessionId }, { session: mongoSession });
@@ -324,9 +404,22 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
           );
         }
 
+        // A direct class is billed, and the teacher paid, only for the part the
+        // student's credit covered.
+        const isDirectCall = Boolean(session.studentId && session.teacherId && !session.roomId && !session.courseId);
+        const directRate = clampCreditRate(session.creditRate);
+        let billableSeconds = seconds;
+        if (isDirectCall && !session.creditFinalized) {
+          const pkg = await activepackages.findOne(
+            { uid: session.studentId },
+            { projection: { credit: 1 }, session: mongoSession }
+          );
+          billableSeconds = getBillableCallSeconds(seconds, pkg?.credit, directRate);
+        }
+
         let teacherPointsToAdd = Number(session.teacherPointsAdded) || 0;
-        if (!session.teacherPointsFinalized && session.teacherId && !session.roomId && !session.courseId) {
-          teacherPointsToAdd = generalCallPoints;
+        if (!session.teacherPointsFinalized && isDirectCall) {
+          teacherPointsToAdd = getGeneralCallPoints(billableSeconds);
 
           if (teacherPointsToAdd > 0) {
             await userCollection.updateOne(
@@ -350,9 +443,8 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
         }
 
         let creditToDeduct = Number(session.creditDeducted) || 0;
-        if (!session.creditFinalized && session.studentId && !session.roomId && !session.courseId) {
-          let creditRate = clampCreditRate(session.creditRate);
-          creditToDeduct = getCallCreditForSeconds(seconds, creditRate);
+        if (!session.creditFinalized && isDirectCall) {
+          creditToDeduct = getCallCreditForSeconds(billableSeconds, directRate);
 
           if (creditToDeduct > 0) {
             await activepackages.updateOne(
@@ -378,6 +470,7 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
             {
               $set: {
                 creditDeducted: creditToDeduct,
+                billedSeconds: billableSeconds,
                 creditFinalized: true,
                 creditFinalizedAt: new Date(),
               },
@@ -403,6 +496,53 @@ module.exports = ({ userCollection, activepackages, databaseinmongo, client, stu
       return res.status(500).json({ success: false, message: "Internal server error" });
     } finally {
       await mongoSession.endSession();
+    }
+  });
+
+  /**
+   * Rings the teacher's phone for a 1:1 class.
+   *
+   * The ring itself is the Firestore `calls/{teacherId}` doc, which only an
+   * open, foregrounded app is listening to. The client's own push call was
+   * disabled (`sendCallNotification` returned on its first line), so a teacher
+   * with the app in the background or closed never knew a student was calling.
+   */
+  router.post("/api/calls/ring", async (req, res) => {
+    try {
+      const { sessionId, teacherId } = req.body || {};
+      if (!sessionId || !teacherId) return res.status(400).json({ error: "sessionId and teacherId are required" });
+
+      const studentId = await resolveActor(req, res, req.body.studentId);
+      if (!studentId) return;
+      if (!(await findDirectChatEntry(databaseinmongo, studentId, teacherId))) {
+        return res.status(403).json({ error: "Start a chat with this teacher first." });
+      }
+
+      const rings = databaseinmongo.collection("callRings");
+      const recent = await rings.findOne({
+        studentId,
+        teacherId,
+        createdAt: { $gt: new Date(Date.now() - RING_THROTTLE_MS) },
+      });
+      if (recent) return res.json({ success: true, sent: false, throttled: true });
+      await rings.insertOne({ studentId, teacherId, sessionId: String(sessionId), createdAt: new Date() });
+
+      const [student, teacher] = await Promise.all([
+        userCollection.findOne({ uid: studentId }, { projection: { displayName: 1 } }),
+        userCollection.findOne({ uid: teacherId }, { projection: { FCMToken: 1, role: 1 } }),
+      ]);
+      if (teacher?.role !== "teacher" || !teacher.FCMToken) return res.json({ success: true, sent: false });
+
+      const studentName = student?.displayName || "A student";
+      const sent = await sendPush(admin, teacher.FCMToken, {
+        title: "Incoming class",
+        body: `${studentName} is calling you for a class`,
+        data: { type: "incoming_call", callType: "incoming", sessionId, callerName: studentName, path: "/chat" },
+      });
+      res.json({ success: true, sent });
+    } catch (err) {
+      console.error("Error ringing teacher:", err);
+      res.status(500).json({ error: "Could not notify the teacher." });
     }
   });
 

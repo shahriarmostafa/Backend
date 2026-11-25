@@ -40,15 +40,23 @@ const io = require("socket.io")(server, {
   },
 });
 
-const shurjopay = require("shurjopay")();
-shurjopay.config(
-  process.env.SP_ENDPOINT,
-  process.env.SP_USERNAME,
-  process.env.SP_PASSWORD,
-  process.env.SP_PREFIX,
-  process.env.SP_RETURN_URL,
-  process.env.SP_CANCEL_URL
-);
+// The shurjopay library takes one return URL per instance and sends both paid
+// and cancelled checkouts to it (SP_CANCEL_URL is never used - the app asks
+// /api/payments/:orderId/status for the outcome). One instance returns to the
+// native app's poperl:// link, the other to the web app, which can't open it.
+const makeShurjopay = (returnUrl) => {
+  const instance = require("shurjopay")();
+  instance.config(
+    process.env.SP_ENDPOINT,
+    process.env.SP_USERNAME,
+    process.env.SP_PASSWORD,
+    process.env.SP_PREFIX,
+    returnUrl
+  );
+  return instance;
+};
+const shurjopay = makeShurjopay(process.env.SP_RETURN_URL);
+const shurjopayWeb = makeShurjopay(process.env.SP_WEB_RETURN_URL || "https://app.poperl.com/payment-done");
 
 const { database, admin } = require("./firebase.config");
 
@@ -60,8 +68,8 @@ app.use(auth.attachUser);
 app.use(auth.gate);
 
 // Routes that don't need DB
-app.use(require("./routes/whiteboard")());
-app.use(require("./routes/notifications")({ admin }));
+// whiteboard and call tokens check call membership, so they mount once Mongo is up (see run())
+app.use(require("./routes/notifications")());
 
 const uri = `mongodb+srv://ssmustafasahir:${process.env.PASSWORD_DB}@cluster0.c6fvj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
@@ -101,17 +109,18 @@ async function run() {
       client,
     };
 
+    app.use(require("./routes/whiteboard")({ databaseinmongo: db }));
     app.use(require("./routes/users")({ ...collections, admin }));
     app.use(require("./routes/teachers")(collections));
     app.use(require("./routes/studyRooms")({ ...collections, admin }));
     app.use(require("./routes/courses")(collections));
-    app.use(require("./routes/storage")());
+    app.use(require("./routes/storage")({ databaseinmongo: db }));
     app.use(require("./routes/quizzes")(collections));
     app.use(require("./routes/progress")(collections));
     app.use(require("./routes/notificationFeed")(collections));
-    app.use(require("./routes/calls")(collections));
-    app.use(require("./routes/chat")({ ...collections, io }));
-    app.use(require("./routes/payment")({ ...collections, shurjopay }));
+    app.use(require("./routes/calls")({ ...collections, admin }));
+    app.use(require("./routes/chat")({ ...collections, io, admin }));
+    app.use(require("./routes/payment")({ ...collections, shurjopay, shurjopayWeb }));
     app.use(require("./routes/admin")(collections));
 
     const { setupSocket } = require("./routes/chat");

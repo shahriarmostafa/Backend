@@ -67,9 +67,51 @@ test("createCustomToken is reachable so it can verify its own token", async () =
   assert.equal((await request("POST", "/createCustomToken", null)).status, 200);
 });
 
-test("signup endpoints stay reachable", async () => {
-  assert.equal((await request("POST", "/newStudent", null)).status, 200);
-  assert.equal((await request("POST", "/newTeacher", null)).status, 200);
+test("signup needs the token of the Firebase account it is creating a profile for", async () => {
+  // the account exists before the profile is written, so there is always one
+  assert.equal((await request("POST", "/newStudent", null)).status, 401);
+  assert.equal((await request("POST", "/newTeacher", null)).status, 401);
+  assert.equal((await request("POST", "/newStudent", "tok-student")).status, 200);
+  assert.equal((await request("POST", "/newTeacher", "tok-student")).status, 200);
+});
+
+test("admin writes and admin-only reads are closed to ordinary users", async () => {
+  const ownerOnly = [
+    ["POST", "/pack"],
+    ["PUT", "/pack/abc"],
+    ["DELETE", "/pack/abc"],
+    ["POST", "/subjects"],
+    ["DELETE", "/subjects/abc"],
+    ["GET", "/complain"],
+    ["DELETE", "/complain/abc"],
+    ["GET", "/active-packages"],
+    ["PATCH", "/active-packages/some-uid"],
+    ["POST", "/subscriptions"],
+    ["GET", "/salaryData"],
+    ["GET", "/historyData"],
+    ["GET", "/dashboard-stats"],
+    ["POST", "/generate-monthly-history"],
+    ["GET", "/teacherList"],
+    ["GET", "/disabledTeacherList"],
+    ["PUT", "/subjects"],
+  ];
+  for (const [method, path] of ownerOnly) {
+    const { status } = await request(method, path, "tok-student");
+    assert.equal(status, 403, `${method} ${path} should be owner-only`);
+    assert.equal((await request(method, path, "tok-owner")).status, 200, `${method} ${path} for owner`);
+  }
+});
+
+test("users can still read packages and subjects and file their own complaints", async () => {
+  for (const [method, path] of [
+    ["GET", "/pack"],
+    ["GET", "/subjects"],
+    ["GET", "/ActiveTeacherList"],
+    ["POST", "/complain"],
+    ["GET", "/complain/student-uid"],
+  ]) {
+    assert.equal((await request(method, path, "tok-student")).status, 200, `${method} ${path}`);
+  }
 });
 
 test("an anonymous request to a protected route is rejected", async () => {

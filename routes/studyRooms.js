@@ -2,6 +2,7 @@ const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeRoomHelpers } = require("../utils/roomHelpers");
 const { makeNotificationHelpers } = require("../utils/notificationHelpers");
+const { resolveActor, requireParty } = require("../utils/actor");
 const {
   STUDY_ROOM_JOIN_CREDIT,
   STUDY_ROOM_CREATE_CREDIT,
@@ -35,9 +36,16 @@ module.exports = ({
     createStudyRoomChat,
     getUniqueRoomKeyword,
     spendStudentCredit,
+    claimRoomSeat,
+    releaseRoomSeat,
     renewRoomMembership,
+    getRoomJoinCost,
+    isFreeRoom,
     ensureRoomChatSubscriptions,
   } = makeRoomHelpers({ userCollection, databaseinmongo, studyRooms, activepackages, roomQuizzes });
+
+  const isRoomTeacher = (room, userId) =>
+    (room.teacherSessions || []).some((session) => session.teacherId === userId);
 
   /**
    * The room list.
@@ -53,47 +61,49 @@ module.exports = ({
    */
   router.get("/api/study-rooms", async (req, res) => {
     try {
-      const { category, type, userId, memberOnly } = req.query;
+      const { category, type, memberOnly } = req.query;
       const legacyMemberOnly = memberOnly === "true";
-
-      const filter = userId
-        ? legacyMemberOnly
-          ? { memberIds: userId }
-          : { $or: [{ visibility: "public" }, { memberIds: userId }] }
-        : { visibility: "public" };
+      // "your rooms" is personal, so the uid comes from the token
+      const userId = req.query.userId ? await resolveActor(req, res, req.query.userId) : null;
+      if (req.query.userId && !userId) return;
 
       // A room the user has joined stays in their list whatever their current
       // study profile says, so the category/type filter only narrows the public
       // side. It used to narrow both, which quietly hid your own rooms when you
       // changed profile.
-      if (category || type) {
-        const scope = {};
-        if (category) scope.category = category;
-        if (type) scope.type = type;
-        if (userId && !legacyMemberOnly) {
-          filter.$or = [{ visibility: "public", ...scope }, { memberIds: userId }];
-        } else {
-          Object.assign(filter, scope);
-        }
-      }
+      const scope = {};
+      if (category) scope.category = category;
+      if (type) scope.type = type;
 
-      const rooms = await studyRooms
-        .find(filter, { projection: STUDY_ROOM_LIST_PROJECTION })
-        .sort({ updatedAt: -1, createdAt: -1 })
-        .limit(50)
-        .toArray();
+      // Joined rooms are their own query. Both slices used to share one
+      // `.limit(50)` sorted by activity, so once 50 busier public rooms existed
+      // a student's own rooms fell off the end and "Your rooms" emptied.
+      const listQuery = (filter, limit) =>
+        studyRooms
+          .find(filter, { projection: STUDY_ROOM_LIST_PROJECTION })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .limit(limit)
+          .toArray();
+      const [joinedRooms, publicRooms] = await Promise.all([
+        userId
+          ? listQuery(legacyMemberOnly ? { memberIds: userId, ...scope } : { memberIds: userId }, 100)
+          : [],
+        legacyMemberOnly
+          ? []
+          : listQuery(
+              userId
+                ? { visibility: "public", memberIds: { $ne: userId }, ...scope }
+                : { visibility: "public", ...scope },
+              50
+            ),
+      ]);
 
-      const hydratedRooms = rooms.map(hydrateStudyRoomLite);
-      const joined = userId
-        ? hydratedRooms.filter((room) => room.memberIds.includes(userId))
-        : [];
-      const available = userId
-        ? hydratedRooms.filter((room) => !room.memberIds.includes(userId))
-        : hydratedRooms;
+      const joined = joinedRooms.map(hydrateStudyRoomLite);
+      const available = publicRooms.map(hydrateStudyRoomLite);
 
       res.json({
         success: true,
-        rooms: hydratedRooms, // kept for older builds that read a flat list
+        rooms: [...joined, ...available], // kept for older builds that read a flat list
         joined,
         available,
         costs: { join: STUDY_ROOM_JOIN_CREDIT, create: STUDY_ROOM_CREATE_CREDIT },
@@ -137,12 +147,13 @@ module.exports = ({
   router.post("/api/study-rooms", async (req, res) => {
     try {
       const {
-        userId,
         name,
         visibility = "public",
         category = "school",
         type = "bangla_medium",
       } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const cleanName = String(name || "").trim();
       const cleanVisibility = visibility === "private" ? "private" : "public";
       const cleanCategory = ["school", "college", "university"].includes(category)
@@ -217,7 +228,9 @@ module.exports = ({
 
   router.patch("/api/study-rooms/:roomId", async (req, res) => {
     try {
-      const { userId, name, visibility, category, type } = req.body;
+      const { name, visibility, category, type } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
       if (!room) return res.status(404).json({ error: "Room not found." });
       if (!userId || !(room.memberIds || []).includes(userId))
@@ -240,7 +253,9 @@ module.exports = ({
 
   router.post("/api/study-rooms/:roomId/progress/goals", async (req, res) => {
     try {
-      const { userId, title, note = "", dueDate = null } = req.body;
+      const { title, note = "", dueDate = null } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const cleanTitle = String(title || "").trim();
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
 
@@ -257,12 +272,16 @@ module.exports = ({
       if (!cleanTitle) return res.status(400).json({ error: "Goal title is required." });
 
       const now = new Date();
+      const parsedDueDate = dueDate ? new Date(dueDate) : null;
       const goal = {
         id: new ObjectId().toString(),
         title: cleanTitle.slice(0, 120),
         note: String(note || "").trim().slice(0, 400),
-        dueDate: dueDate ? new Date(dueDate) : null,
+        dueDate: parsedDueDate && !Number.isNaN(parsedDueDate.getTime()) ? parsedDueDate : null,
         createdBy: userId,
+        // teacher-set goals in teacher-controlled rooms count for XP without
+        // peer confirmation; see ROOM_GOAL_XP_* in utils/constants.js
+        createdByRole: isControlledTeacher && !isActiveStudent ? "teacher" : "student",
         createdAt: now,
         votes: { [userId]: false },
       };
@@ -292,7 +311,9 @@ module.exports = ({
 
   router.patch("/api/study-rooms/:roomId/progress/goals/:goalId/vote", async (req, res) => {
     try {
-      const { userId, completed } = req.body;
+      const { completed } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const { goalId } = req.params;
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
 
@@ -327,7 +348,8 @@ module.exports = ({
 
   router.delete("/api/study-rooms/:roomId/progress/goals/:goalId", async (req, res) => {
     try {
-      const { userId } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const { goalId } = req.params;
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
 
@@ -358,10 +380,52 @@ module.exports = ({
     }
   });
 
+  /**
+   * Reactivates a lapsed member: free rooms just flip the status back on, paid
+   * rooms go through renewRoomMembership (conditional claim, then a conditional
+   * charge). Shared by /join (lapsed member) and /renew.
+   */
+  const reactivateMember = async (room, userId) => {
+    const membership = getRoomMembership(room, userId);
+    if (membership.isActive)
+      return { ok: false, status: 409, alreadyActive: true, message: "Your room membership is already active." };
+
+    if (isFreeRoom(room)) {
+      await studyRooms.updateOne(
+        { _id: room._id, memberIds: userId },
+        {
+          $set: {
+            [`memberStatuses.${userId}`]: {
+              joinedAt: membership.joinedAt,
+              lastPaymentAt: null,
+              nextBillingAt: null,
+              isActive: true,
+              freeAccess: true,
+            },
+            updatedAt: Date.now(),
+          },
+        }
+      );
+      return { ok: true, freeAccess: true, credit: null };
+    }
+
+    return renewRoomMembership(room, userId);
+  };
+
+  /** A refused renewal still sends the current room, so the app can refresh. */
+  const sendRenewalRefusal = async (res, room, result) => {
+    const freshRoom = await studyRooms.findOne({ _id: room._id });
+    return res.status(result.status).json({
+      error: result.message,
+      alreadyActive: Boolean(result.alreadyActive),
+      room: result.alreadyActive ? await hydrateStudyRoom(freshRoom) : undefined,
+    });
+  };
+
   router.post("/api/study-rooms/:roomId/join", async (req, res) => {
     try {
-      const { userId } = req.body;
-      if (!userId) return res.status(400).json({ error: "userId is required." });
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
 
       const userDoc = await userCollection.findOne({ uid: userId, role: "student" });
       if (!userDoc)
@@ -371,40 +435,18 @@ module.exports = ({
       if (!room) return res.status(404).json({ error: "Room not found." });
 
       if ((room.memberIds || []).includes(userId)) {
-        const membership = getRoomMembership(room, userId);
-        if (membership.isActive)
+        if (getRoomMembership(room, userId).isActive)
           return res.json({ success: true, room: await hydrateStudyRoom(room), alreadyJoined: true });
 
-        if (room.freeAccess === true || room.creditExpenseEnabled === false) {
-          const now = new Date();
-          await studyRooms.updateOne(
-            { _id: room._id },
-            {
-              $set: {
-                [`memberStatuses.${userId}`]: {
-                  joinedAt: membership.joinedAt,
-                  lastPaymentAt: null,
-                  nextBillingAt: null,
-                  isActive: true,
-                  freeAccess: true,
-                },
-                updatedAt: Date.now(),
-              },
-            }
-          );
-          const freeRenewedRoom = await studyRooms.findOne({ _id: room._id });
-          return res.json({ success: true, room: await hydrateStudyRoom(freeRenewedRoom), renewed: true, freeAccess: true });
-        }
-
-        const renewalResult = await renewRoomMembership(room, userId);
-        if (!renewalResult.ok)
-          return res.status(renewalResult.status).json({ error: renewalResult.message });
+        const renewalResult = await reactivateMember(room, userId);
+        if (!renewalResult.ok) return sendRenewalRefusal(res, room, renewalResult);
 
         const renewedRoom = await studyRooms.findOne({ _id: room._id });
         return res.json({
           success: true,
           room: await hydrateStudyRoom(renewedRoom),
           renewed: true,
+          freeAccess: renewalResult.freeAccess === true || undefined,
           remainingCredit: renewalResult.credit,
         });
       }
@@ -412,65 +454,63 @@ module.exports = ({
       if ((room.memberIds || []).length >= (room.maxStudents || STUDY_ROOM_MAX_STUDENTS))
         return res.status(409).json({ error: "This room is full." });
 
-      const shouldSpendCredit = room.freeAccess !== true && room.creditExpenseEnabled !== false;
-      let creditResult = { ok: true, credit: null };
-      if (shouldSpendCredit) {
-        creditResult = await spendStudentCredit(userId, STUDY_ROOM_JOIN_CREDIT);
-        if (!creditResult.ok)
-          return res.status(creditResult.status).json({ error: creditResult.message });
+      const joinCost = getRoomJoinCost(room);
+      const shouldSpendCredit = joinCost > 0;
+      const now = new Date();
+
+      // Seat first, atomically (see claimRoomSeat); a lost race - double tap,
+      // or the last seat going to someone else - is answered before any charge.
+      const claimed = await claimRoomSeat(room, userId, {
+        joinedAt: now,
+        lastPaymentAt: shouldSpendCredit ? now : null,
+        nextBillingAt: shouldSpendCredit ? new Date(now.getTime() + STUDY_ROOM_MONTH_MS) : null,
+        isActive: true,
+        freeAccess: !shouldSpendCredit,
+      });
+      if (!claimed) {
+        const latestRoom = await studyRooms.findOne({ _id: room._id });
+        if ((latestRoom?.memberIds || []).includes(userId))
+          return res.json({ success: true, room: await hydrateStudyRoom(latestRoom), alreadyJoined: true });
+        return res.status(409).json({ error: "This room is full." });
       }
 
-      const now = new Date();
-      const nextMemberIds = [...(room.memberIds || []), userId];
-      const updatedChats = (room.chats || []).map((chat) =>
-        chat.type === "students"
-          ? { ...chat, participantIds: nextMemberIds }
-          : { ...chat, participantIds: [...new Set([...(chat.participantIds || []), userId])] }
-      );
-
-      await studyRooms.updateOne(
-        { _id: room._id },
-        {
-          $set: {
-            memberIds: nextMemberIds,
-            chats: updatedChats,
-            [`memberStatuses.${userId}`]: {
-              joinedAt: now,
-              lastPaymentAt: shouldSpendCredit ? now : null,
-              nextBillingAt: shouldSpendCredit ? new Date(now.getTime() + STUDY_ROOM_MONTH_MS) : null,
-              isActive: true,
-              freeAccess: !shouldSpendCredit,
-            },
-            updatedAt: Date.now(),
-          },
+      let creditResult = { ok: true, credit: null };
+      if (shouldSpendCredit) {
+        creditResult = await spendStudentCredit(userId, joinCost);
+        if (!creditResult.ok) {
+          await releaseRoomSeat(room, userId);
+          return res.status(creditResult.status).json({ error: creditResult.message });
         }
-      );
+      }
 
+      // chat participant lists grow by one id each; never written back from the
+      // stale copy read above
+      const joinedRoom = await studyRooms.findOne({ _id: room._id });
+      const roomChats = joinedRoom?.chats || [];
       const chatDB = databaseinmongo.collection("chatDB");
       await Promise.all(
-        updatedChats.map((chat) =>
-          chat.chatId
+        roomChats.map((chat) =>
+          chat.chatId && ObjectId.isValid(chat.chatId)
             ? chatDB.updateOne(
                 { _id: new ObjectId(chat.chatId) },
-                { $set: { participantIds: chat.participantIds } }
+                { $addToSet: { participantIds: userId } }
               )
             : Promise.resolve()
         )
       );
       await Promise.all(
-        updatedChats.map((chat) =>
+        roomChats.map((chat) =>
           ensureRoomChatSubscriptions({
             chat: { ...chat, roomId: room._id.toString() },
-            participantIds: chat.participantIds,
+            participantIds: chat.participantIds || joinedRoom.memberIds || [],
             roomId: room._id.toString(),
           })
         )
       );
 
-      const updatedRoom = await studyRooms.findOne({ _id: room._id });
       res.json({
         success: true,
-        room: await hydrateStudyRoom(updatedRoom),
+        room: await hydrateStudyRoom(joinedRoom),
         remainingCredit: creditResult.credit,
         freeAccess: !shouldSpendCredit,
       });
@@ -482,41 +522,22 @@ module.exports = ({
 
   router.post("/api/study-rooms/:roomId/renew", async (req, res) => {
     try {
-      const { userId } = req.body;
-      if (!userId) return res.status(400).json({ error: "userId is required." });
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
 
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
       if (!room) return res.status(404).json({ error: "Room not found." });
+      if (!(room.memberIds || []).includes(userId))
+        return res.status(404).json({ error: "Join this room first." });
 
-      if (room.freeAccess === true || room.creditExpenseEnabled === false) {
-        const membership = getRoomMembership(room, userId);
-        await studyRooms.updateOne(
-          { _id: room._id },
-          {
-            $set: {
-              [`memberStatuses.${userId}`]: {
-                joinedAt: membership.joinedAt,
-                lastPaymentAt: null,
-                nextBillingAt: null,
-                isActive: true,
-                freeAccess: true,
-              },
-              updatedAt: Date.now(),
-            },
-          }
-        );
-        const freeRoom = await studyRooms.findOne({ _id: room._id });
-        return res.json({ success: true, room: await hydrateStudyRoom(freeRoom), freeAccess: true });
-      }
-
-      const renewalResult = await renewRoomMembership(room, userId);
-      if (!renewalResult.ok)
-        return res.status(renewalResult.status).json({ error: renewalResult.message });
+      const renewalResult = await reactivateMember(room, userId);
+      if (!renewalResult.ok) return sendRenewalRefusal(res, room, renewalResult);
 
       const updatedRoom = await studyRooms.findOne({ _id: room._id });
       res.json({
         success: true,
         room: await hydrateStudyRoom(updatedRoom),
+        freeAccess: renewalResult.freeAccess === true || undefined,
         remainingCredit: renewalResult.credit,
       });
     } catch (err) {
@@ -527,8 +548,10 @@ module.exports = ({
 
   router.post("/api/study-rooms/:roomId/teachers", async (req, res) => {
     try {
-      const { userId, teacherId, subject } = req.body;
-      if (!userId || !teacherId)
+      const { teacherId, subject } = req.body;
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
+      if (!teacherId)
         return res.status(400).json({ error: "userId and teacherId are required." });
 
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
@@ -576,7 +599,9 @@ module.exports = ({
         ...teacherChat,
         addedBy: userId,
         addedAt: new Date(),
-        expiresAt: new Date(Date.now() + STUDY_ROOM_TEACHER_SESSION_MS),
+        // STUDY_ROOM_TEACHER_SESSION_MS was never defined, which stored an
+        // Invalid Date. Nothing reads this yet; null until a length is chosen.
+        expiresAt: STUDY_ROOM_TEACHER_SESSION_MS ? new Date(Date.now() + STUDY_ROOM_TEACHER_SESSION_MS) : null,
       };
 
       await studyRooms.updateOne(
@@ -619,7 +644,8 @@ module.exports = ({
 
   router.get("/api/teacher-room-chats/:teacherId", async (req, res) => {
     try {
-      const { teacherId } = req.params;
+      const teacherId = await resolveActor(req, res, req.params.teacherId);
+      if (!teacherId) return;
       const teacher = await userCollection.findOne({ uid: teacherId, role: "teacher" });
       if (!teacher)
         return res.status(403).json({ error: "Only teachers can view room chats." });
@@ -634,7 +660,7 @@ module.exports = ({
       const roomMembers = allMemberIds.length
         ? await userCollection
             .find({ uid: { $in: allMemberIds } })
-            .project({ uid: 1, displayName: 1, photoURL: 1, email: 1, role: 1 })
+            .project({ uid: 1, displayName: 1, photoURL: 1, role: 1 })
             .toArray()
         : [];
       const membersById = roomMembers.reduce((acc, member) => {
@@ -694,9 +720,14 @@ module.exports = ({
 
   router.post("/api/study-rooms/:roomId/call-notification", async (req, res) => {
     try {
-      const { callerId, callerName, chatName } = req.body;
+      const { callerName, chatName } = req.body;
+      const callerId = await resolveActor(req, res, req.body?.callerId);
+      if (!callerId) return;
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
       if (!room) return res.status(404).json({ error: "Room not found." });
+      // anyone signed in could push "class started" to every member of any room
+      if (!(room.memberIds || []).includes(callerId) && !isRoomTeacher(room, callerId))
+        return res.status(403).json({ error: "Only room members can start a room class." });
 
       const memberIds = (room.memberIds || []).filter((id) => id !== callerId);
       if (!memberIds.length) return res.json({ success: true, sent: 0 });
@@ -719,7 +750,6 @@ module.exports = ({
           notification: {
             sound: "default",
             channelId: "high_importance_channel",
-            clickAction: "FLUTTER_NOTIFICATION_CLICK",
           },
         },
         apns: { payload: { aps: { sound: "default", contentAvailable: true } } },
@@ -728,6 +758,7 @@ module.exports = ({
           roomId: room._id.toString(),
           roomName: room.name || "",
           chatName: chatName || "",
+          path: `/study-rooms/${room._id.toString()}`,
         },
       };
 
@@ -808,8 +839,16 @@ module.exports = ({
       const { sessionId } = req.body;
       if (!sessionId) return res.status(400).json({ error: "sessionId is required." });
 
-      await databaseinmongo.collection("callSession").updateOne(
-        { sessionId, endTime: { $exists: false } },
+      // Heartbeats decide how long a call is billed and paid if it is never
+      // ended properly, so only the call's own student or teacher may send them.
+      const callSession = databaseinmongo.collection("callSession");
+      const session = await callSession.findOne({ sessionId: String(sessionId) }, { projection: { studentId: 1, teacherId: 1 } });
+      if (!session) return res.json({ success: false });
+      const caller = await requireParty(req, res, [session.studentId, session.teacherId], req.body.userId);
+      if (!caller) return;
+
+      await callSession.updateOne(
+        { sessionId: String(sessionId), endTime: { $exists: false } },
         { $set: { lastHeartbeatAt: Date.now() } }
       );
       res.json({ success: true });

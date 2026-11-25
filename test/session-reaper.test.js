@@ -143,3 +143,49 @@ test("several abandoned sessions are all closed", async () => {
   const { reaped } = await reaper.reapOnce();
   assert.equal(reaped, 2, "the one still alive should survive");
 });
+
+test("a student short of credit is billed what they have, not nothing", async () => {
+  // 10 minutes is 60 credit; the student has 20
+  const { reaper, db, sessions } = setup([liveSession()], [{ uid: "student-1", credit: 20 }]);
+  await reaper.reapOnce();
+  assert.equal(db.collection("activePackages")._all()[0].credit, 0);
+  const closed = await sessions.findOne({ sessionId: "s1" });
+  assert.equal(closed.creditDeducted, 20, "the record must match what was actually taken");
+});
+
+test("the teacher of an abandoned direct class is paid for the covered time", async () => {
+  const { reaper, db } = setup(
+    [liveSession()],
+    [{ uid: "student-1", credit: 500 }]
+  );
+  await db.collection("userCollection").insertOne({ uid: "teacher-1", role: "teacher", points: 0 });
+  await reaper.reapOnce();
+  const teacher = db.collection("userCollection")._all().find((u) => u.uid === "teacher-1");
+  assert.equal(teacher.points, 12, "ten billed minutes are worth 12 points");
+});
+
+test("a teacher is not paid for a class no credit covered", async () => {
+  const { reaper, db } = setup([liveSession()], [{ uid: "student-1", credit: 0 }]);
+  await db.collection("userCollection").insertOne({ uid: "teacher-1", role: "teacher", points: 0 });
+  await reaper.reapOnce();
+  const teacher = db.collection("userCollection")._all().find((u) => u.uid === "teacher-1");
+  assert.equal(teacher.points, 0);
+});
+
+test("an abandoned group room class is billed at the group rate", async () => {
+  const room = { roomId: "room-1", roomCallId: "rc-1" };
+  const { reaper, db } = setup(
+    [
+      liveSession({ ...room, sessionId: "a", studentId: "student-1" }),
+      liveSession({ ...room, sessionId: "b", studentId: "student-2" }),
+    ],
+    [
+      { uid: "student-1", credit: 500 },
+      { uid: "student-2", credit: 500 },
+    ]
+  );
+  await reaper.reapOnce();
+  const [first] = db.collection("activePackages")._all();
+  // 60 ten-second blocks at the 0.7 group rate
+  assert.equal(first.credit, 500 - 42);
+});

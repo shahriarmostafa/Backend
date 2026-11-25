@@ -7,6 +7,7 @@ const {
   priceCreditPack,
   priceExtension,
 } = require("../utils/purchasePricing");
+const { resolveActor } = require("../utils/actor");
 
 module.exports = ({
   activepackages,
@@ -16,6 +17,7 @@ module.exports = ({
   packages,
   creditPrices,
   shurjopay,
+  shurjopayWeb = null,
 }) => {
   const router = Router();
 
@@ -31,8 +33,12 @@ module.exports = ({
   const resolvePurchase = async ({ packageId, uid, requestedCredit, requestedHours }) => {
     if (packageId === "credit-pack") {
       const sub = await activepackages.findOne({ uid });
-      const category = sub?.category || null;
-      const type = sub?.type || null;
+      // A student who never subscribed has no package to read the profile
+      // from; the app prices them by their study profile, so the server must
+      // too or it refuses the sale it just quoted.
+      const profile = sub?.category ? null : await userCollection.findOne({ uid }, { projection: { category: 1, type: 1 } });
+      const category = sub?.category || profile?.category || null;
+      const type = sub?.type || profile?.type || null;
       const priceDoc = await creditPrices.findOne({ category, type });
       return priceCreditPack({
         requestedCredit,
@@ -67,7 +73,31 @@ module.exports = ({
     return String(Math.round(value));
   };
 
-  const startGatewayCheckout = ({
+  // ShurjoPay requires a phone, city and address on every order. The app used
+  // to send one hard-coded number and address for every customer; use the
+  // customer's own number when we have one and keep the defaults configurable.
+  const DEFAULT_CUSTOMER = {
+    phone: process.env.SP_DEFAULT_CUSTOMER_PHONE || "01875460458",
+    city: process.env.SP_DEFAULT_CUSTOMER_CITY || "Dhaka",
+    address: process.env.SP_DEFAULT_CUSTOMER_ADDRESS || "Uttara, Sector 10, Dhaka",
+  };
+  const normalizePhone = (value) => String(value || "").replace(/[\s-]/g, "").replace(/^\+?88/, "");
+  const resolveCustomer = async ({ uid, customer_name, customer_phone, customer_city, customer_address }) => {
+    const user = uid
+      ? await userCollection.findOne({ uid }, { projection: { displayName: 1, phone: 1, whatsapp: 1 } })
+      : null;
+    const phone = [customer_phone, user?.phone, user?.whatsapp]
+      .map(normalizePhone)
+      .find((value) => /^01[3-9]\d{8}$/.test(value));
+    return {
+      customer_name: customer_name || user?.displayName || "PoperL customer",
+      customer_phone: phone || DEFAULT_CUSTOMER.phone,
+      customer_city: customer_city || DEFAULT_CUSTOMER.city,
+      customer_address: customer_address || DEFAULT_CUSTOMER.address,
+    };
+  };
+
+  const startGatewayCheckout = async ({
     res,
     orderId,
     amount,
@@ -79,7 +109,18 @@ module.exports = ({
     customer_address,
     metadata,
     context,
+    returnTo,
   }) => {
+    // The app's checkout returns to poperl://; a browser can't open that, so
+    // web checkouts use the instance configured with the web return URL.
+    const gateway = returnTo === "web" && shurjopayWeb ? shurjopayWeb : shurjopay;
+    const customer = await resolveCustomer({
+      uid: metadata?.value?.uid,
+      customer_name,
+      customer_phone,
+      customer_city,
+      customer_address,
+    });
     const gatewayAmount = getGatewayAmount(amount);
     if (!gatewayAmount) {
       return res.status(400).json({
@@ -100,12 +141,9 @@ module.exports = ({
     const checkoutPayload = {
       amount: gatewayAmount,
       order_id: orderId,
-      customer_name,
-      customer_phone,
+      ...customer,
       client_ip: reqIpSafe(metadata.reqIp),
-      customer_city,
-      currency,
-      customer_address,
+      currency: currency || "BDT",
       value1: JSON.stringify(metadata.value),
     };
 
@@ -113,12 +151,12 @@ module.exports = ({
       context,
       orderId,
       amount: checkoutPayload.amount,
-      hasCustomerName: Boolean(customer_name),
-      hasCustomerPhone: Boolean(customer_phone),
-      currency,
+      returnTo: gateway === shurjopayWeb ? "web" : "app",
+      usedDefaultPhone: customer.customer_phone === DEFAULT_CUSTOMER.phone,
+      currency: checkoutPayload.currency,
     });
 
-    shurjopay.makePayment(
+    gateway.makePayment(
       checkoutPayload,
       async (resp) => {
         if (!resp?.checkout_url) {
@@ -176,8 +214,37 @@ module.exports = ({
     // posting `{ amount: 1, credit: 999999 }` bought an unlimited subscription
     // for nothing.
     if (amount === 0) {
+      // Once per student per free package. It used to be claimable on repeat,
+      // and each claim $set the credit - so it refilled an empty balance for
+      // free, and wiped a paying student's remaining credit down to the free
+      // amount. The claim record's _id is the lock: a second insert fails.
+      try {
+        await subscriptions.insertOne({
+          _id: `free:${uid}:${packageId}`,
+          uid,
+          name: displayName,
+          packageName,
+          credit,
+          price: 0,
+          durationDays: durationHours,
+          category,
+          type,
+          packageType: "free",
+          paymentStatus: "free",
+          orderId: null,
+          createdAt: new Date(),
+        });
+      } catch (err) {
+        if (err?.code === 11000) {
+          return res.status(409).json({ error: "You have already claimed this free package." });
+        }
+        throw err;
+      }
+
       const startDate = new Date();
-      const expiryDate = new Date(startDate);
+      const existing = await activepackages.findOne({ uid });
+      const currentExpiry = existing?.expiryDate ? new Date(existing.expiryDate) : null;
+      const expiryDate = currentExpiry && currentExpiry > startDate ? new Date(currentExpiry) : new Date(startDate);
       expiryDate.setHours(expiryDate.getHours() + durationHours);
 
       await activepackages.updateOne(
@@ -185,19 +252,19 @@ module.exports = ({
         {
           $set: {
             uid,
-            packageName,
-            startDate: startDate.toISOString(),
+            packageName: existing?.packageName || packageName,
+            startDate: existing?.startDate || startDate.toISOString(),
             expiryDate: expiryDate.toISOString(),
-            credit,
-            totalCredit: credit,
             isActive: true,
             paymentStatus: "approved",
-            purchasedAt: new Date(),
-            category,
-            type,
-            isUnlimited: Boolean(isUnlimited),
-            price: 0,
+            purchasedAt: existing?.purchasedAt || new Date(),
+            category: existing?.category || category,
+            type: existing?.type || type,
+            isUnlimited: Boolean(existing?.isUnlimited || isUnlimited),
           },
+          // added on top of whatever the student already has
+          $inc: { credit, totalCredit: credit },
+          $setOnInsert: { price: 0 },
         },
         { upsert: true }
       );
@@ -231,6 +298,7 @@ module.exports = ({
       customer_address,
       metadata: { reqIp: req.ip, value: metadata },
       context: "new-package",
+      returnTo: req.body.returnTo,
     });
   });
 
@@ -342,143 +410,225 @@ module.exports = ({
       customer_address,
       metadata: { reqIp: req.ip, value: metadata },
       context: "extension",
+      returnTo: req.body.returnTo,
     });
   });
+
+  // ShurjoPay's verification as a promise. The library never calls back when
+  // its own token request fails, so give up after a while instead of hanging.
+  const verifyOrder = (orderId) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Payment verification timed out")), 20000);
+      shurjopay.verifyPayment(
+        orderId,
+        (result) => {
+          clearTimeout(timer);
+          resolve(Array.isArray(result) && result.length ? result[0] : null);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
+
+  const isPaid = (data) => String(data?.sp_code) === "1000" && data?.sp_message === "Success";
+
+  /**
+   * Grants a verified, paid order. Safe to call more than once for the same
+   * order (the gateway callback and the app's own check after returning from
+   * checkout both do): the order is claimed before anything is granted.
+   */
+  const applyPaidOrder = async (order_id, data) => {
+    const metadata = JSON.parse(data.value1);
+    const {
+      paymentType,
+      uid,
+      displayName,
+      packageName,
+      price,
+      credit,
+      durationDays,
+      category,
+      type,
+      isUnlimited,
+    } = metadata;
+
+    const existingOrder = await subscriptions.findOne({ orderId: order_id });
+    if (existingOrder) return { outcome: "already-processed", uid };
+
+    // Claim the order before granting anything. The findOne above and
+    // the insert below were separate steps, so two callbacks for the
+    // same order (gateway retries, or someone replaying /ipn) could
+    // both pass the check and both add credit. The _id makes the
+    // second claim fail.
+    const claimId = `order:${order_id}`;
+    try {
+      await subscriptions.insertOne({
+        _id: claimId,
+        uid,
+        name: displayName,
+        packageName,
+        credit: Number(credit),
+        price: Number(price),
+        durationDays: Number(durationDays),
+        category,
+        orderId: order_id,
+        type,
+        packageType: paymentType,
+        paymentStatus: "processing",
+        createdAt: new Date(),
+      });
+    } catch (claimError) {
+      if (claimError?.code === 11000) return { outcome: "already-processed", uid };
+      throw claimError;
+    }
+
+    if (paymentType === "new-package") {
+      const startDate = new Date();
+      const expiryDate = new Date(startDate);
+      expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
+
+      await activepackages.updateOne(
+        { uid },
+        {
+          $set: {
+            uid,
+            packageName,
+            startDate: startDate.toISOString(),
+            expiryDate: expiryDate.toISOString(),
+            credit: Number(credit),
+            totalCredit: Number(credit),
+            isActive: true,
+            paymentStatus: "approved",
+            purchasedAt: new Date(),
+            category,
+            type,
+            isUnlimited: Boolean(isUnlimited),
+            price: Number(price),
+          },
+        },
+        { upsert: true }
+      );
+    } else if (paymentType === "extension") {
+      const existingPackage = await activepackages.findOne({ uid });
+      if (!existingPackage) {
+        // Paid, but there is nothing to extend. Keep the claim so it is
+        // not applied twice, and leave it where an admin will see it.
+        console.error(`[payment] paid extension ${order_id} for ${uid} has no package to extend`);
+        await subscriptions.updateOne(
+          { _id: claimId },
+          { $set: { paymentStatus: "needs-review", reviewReason: "no-active-package" } }
+        );
+        return { outcome: "needs-review", uid };
+      }
+
+      const now = new Date();
+      let expiryDate =
+        existingPackage.expiryDate && new Date(existingPackage.expiryDate) > now
+          ? new Date(existingPackage.expiryDate)
+          : new Date(now);
+      expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
+
+      // $inc, not a $set computed from the read above: a call or a
+      // message charged in between used to be overwritten.
+      await activepackages.updateOne(
+        { uid },
+        {
+          $set: {
+            expiryDate: expiryDate.toISOString(),
+            isUnlimited:
+              Boolean(isUnlimited) || Boolean(existingPackage.isUnlimited),
+            updatedAt: new Date(),
+          },
+          $inc: {
+            credit: Number(credit) || 0,
+            totalCredit: Number(credit) || 0,
+            price: Number(price) || 0,
+          },
+        }
+      );
+    }
+
+    await subscriptions.updateOne(
+      { _id: claimId },
+      { $set: { paymentStatus: "approved", approvedAt: new Date() } }
+    );
+
+    if (paymentType === "new-package" && Number(price) > 0) {
+      try {
+        const referralResult = await awardReferralCredit(uid, order_id);
+        if (referralResult.awarded) {
+          console.log(
+            `Referral reward awarded to UID: ${referralResult.referrerUid}`
+          );
+        }
+      } catch (referralError) {
+        console.error("Referral reward failed:", referralError);
+      }
+    }
+
+    console.log(`[payment] ${paymentType} completed for UID: ${uid}`);
+    return { outcome: "applied", uid };
+  };
 
   router.get("/ipn", async (req, res) => {
     const { order_id } = req.query;
     if (!order_id) return res.status(400).json({ error: "Missing order_id" });
 
     try {
-      console.log("🔍 Verifying payment:", order_id);
-
-      shurjopay.verifyPayment(
-        order_id,
-        async (result) => {
-          if (!result || result.length === 0)
-            return res.status(200).json({ message: "Payment not verified" });
-
-          const data = result[0];
-          console.log(data);
-
-          if (data.sp_code === "1000" && data.sp_message === "Success") {
-            const metadata = JSON.parse(data.value1);
-            const {
-              paymentType,
-              uid,
-              displayName,
-              packageName,
-              price,
-              credit,
-              durationDays,
-              category,
-              type,
-              isUnlimited,
-            } = metadata;
-
-            const existingOrder = await subscriptions.findOne({ orderId: order_id });
-            if (existingOrder) return res.status(200).json({ message: "Already processed" });
-
-            if (paymentType === "new-package") {
-              const startDate = new Date();
-              const expiryDate = new Date(startDate);
-              expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
-
-              await activepackages.updateOne(
-                { uid },
-                {
-                  $set: {
-                    uid,
-                    packageName,
-                    startDate: startDate.toISOString(),
-                    expiryDate: expiryDate.toISOString(),
-                    credit: Number(credit),
-                    totalCredit: Number(credit),
-                    isActive: true,
-                    paymentStatus: "approved",
-                    purchasedAt: new Date(),
-                    category,
-                    type,
-                    isUnlimited: Boolean(isUnlimited),
-                    price: Number(price),
-                  },
-                },
-                { upsert: true }
-              );
-            } else if (paymentType === "extension") {
-              const existingPackage = await activepackages.findOne({ uid });
-              if (!existingPackage) return res.status(404).json({ error: "Package not found" });
-
-              const now = new Date();
-              let expiryDate =
-                existingPackage.expiryDate && new Date(existingPackage.expiryDate) > now
-                  ? new Date(existingPackage.expiryDate)
-                  : new Date(now);
-              expiryDate.setHours(expiryDate.getHours() + Number(durationDays));
-
-              const updatedCredit = Number(existingPackage.credit || 0) + Number(credit);
-              const updatedTotalCredit =
-                Number(existingPackage.totalCredit || 0) + Number(credit);
-
-              await activepackages.updateOne(
-                { uid },
-                {
-                  $set: {
-                    expiryDate: expiryDate.toISOString(),
-                    credit: updatedCredit,
-                    totalCredit: updatedTotalCredit,
-                    price: Number(existingPackage.price || 0) + Number(price || 0),
-                    isUnlimited:
-                      Boolean(isUnlimited) || Boolean(existingPackage.isUnlimited),
-                    updatedAt: new Date(),
-                  },
-                }
-              );
-            }
-
-            await subscriptions.insertOne({
-              uid,
-              name: displayName,
-              packageName,
-              credit: Number(credit),
-              price: Number(price),
-              durationDays: Number(durationDays),
-              category,
-              orderId: order_id,
-              type,
-              packageType: paymentType,
-              paymentStatus: "approved",
-              createdAt: new Date(),
-            });
-
-            if (paymentType === "new-package" && Number(price) > 0) {
-              try {
-                const referralResult = await awardReferralCredit(uid, order_id);
-                if (referralResult.awarded) {
-                  console.log(
-                    `Referral reward awarded to UID: ${referralResult.referrerUid}`
-                  );
-                }
-              } catch (referralError) {
-                console.error("Referral reward failed:", referralError);
-              }
-            }
-
-            console.log(`✅ ${paymentType} completed for UID: ${uid}`);
-            return res.status(200).json({ message: "Success" });
-          } else {
-            console.warn(`⚠️ Payment failed for ${order_id}`);
-            return res.status(200).json({ message: "Payment failed" });
-          }
-        },
-        (error) => {
-          console.error("Verification error:", error);
-          return res.status(500).json({ error: "Verification failed" });
-        }
-      );
+      const data = await verifyOrder(order_id);
+      if (!data) return res.status(200).json({ message: "Payment not verified" });
+      if (!isPaid(data)) {
+        console.warn(`[payment] payment failed for ${order_id}`);
+        return res.status(200).json({ message: "Payment failed" });
+      }
+      const { outcome } = await applyPaidOrder(order_id, data);
+      return res.status(200).json({
+        message: outcome === "applied" ? "Success" : outcome === "needs-review" ? "Payment received; package needs review" : "Already processed",
+      });
     } catch (error) {
       console.error("❌ IPN error:", error);
       return res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  /**
+   * What happened to a checkout, asked by the app when the student comes back
+   * from the payment page.
+   *
+   * The return link can't say: the ShurjoPay library sends both a completed
+   * and a cancelled payment to the same return URL (SP_CANCEL_URL is never
+   * used), so the app used to announce success for a cancelled payment. This
+   * asks the gateway, and grants the purchase if the gateway's own callback
+   * has not landed yet.
+   */
+  router.get("/api/payments/:orderId/status", async (req, res) => {
+    try {
+      const caller = await resolveActor(req, res, null);
+      if (!caller) return;
+      const data = await verifyOrder(req.params.orderId).catch(() => null);
+      if (!data) return res.json({ status: "pending" });
+
+      let metadata = {};
+      try {
+        metadata = JSON.parse(data.value1 || "{}");
+      } catch {
+        metadata = {};
+      }
+      if (metadata.uid !== caller && !(await req.isOwner?.())) {
+        return res.status(403).json({ error: "This is not your payment." });
+      }
+
+      if (!isPaid(data)) {
+        const cancelled = /cancel/i.test(String(data.sp_message || ""));
+        return res.json({ status: cancelled ? "cancelled" : "failed", message: data.sp_message || null });
+      }
+      const { outcome } = await applyPaidOrder(req.params.orderId, data);
+      return res.json({ status: outcome === "needs-review" ? "needs-review" : "success" });
+    } catch (error) {
+      console.error("Payment status check failed:", error);
+      return res.status(500).json({ error: "Could not check the payment." });
     }
   });
 
@@ -583,7 +733,8 @@ module.exports = ({
   });
 
   router.get("/api/subscription/:userId", async (req, res) => {
-    const { userId } = req.params;
+    const userId = await resolveActor(req, res, req.params.userId);
+    if (!userId) return;
     try {
       const sub = await activepackages.findOne({ uid: userId });
       const { isSubscribed, outOfCredit } = getSubscriptionStatus(sub);
@@ -618,7 +769,8 @@ module.exports = ({
 
   router.get("/api/sub-check/:callerId", async (req, res) => {
     try {
-      const { callerId } = req.params;
+      const callerId = await resolveActor(req, res, req.params.callerId);
+      if (!callerId) return;
       const subscription = await activepackages.findOne({ uid: callerId });
       if (!subscription) return res.json({ isValid: false, credit: 0 });
 

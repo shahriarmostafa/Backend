@@ -15,9 +15,11 @@ const PUBLIC_PATHS = [
   /^\/ipn$/,                    // ShurjoPay server-to-server callback
   /^\/userProfile\/[^/]+$/,     // public teacher profile page (no login)
   /^\/createCustomToken$/,      // verifies its own ID token, see routes/users.js
-  /^\/newStudent$/,             // signup: user doc is created right after Firebase signup
-  /^\/newTeacher$/,
+  // /newStudent and /newTeacher are NOT public: the Firebase account exists
+  // before the profile is written, so signup always has a token to send.
 ];
+
+const WRITES = ["POST", "PUT", "PATCH", "DELETE"];
 
 // Admin surfaces. `methods` omitted means every method.
 const OWNER_PATHS = [
@@ -28,8 +30,23 @@ const OWNER_PATHS = [
   { pattern: /^\/deleteUser\// },
   { pattern: /^\/disableTeacher\// },
   { pattern: /^\/enableTeacher\// },
-  // students read credit prices; only writes are owner-only
-  { pattern: /^\/credit-price$/, methods: ["POST", "PUT", "PATCH", "DELETE"] },
+  // students read credit prices, packages and subjects; only writes are owner-only
+  { pattern: /^\/credit-price$/, methods: WRITES },
+  { pattern: /^\/pack(\/[^/]+)?$/, methods: WRITES },
+  { pattern: /^\/subjects(\/[^/]+)?$/, methods: WRITES },
+  // users file complaints and read their own; the full list and deletes are admin
+  { pattern: /^\/complain$/, methods: ["GET"] },
+  { pattern: /^\/complain\/[^/]+$/, methods: ["DELETE"] },
+  { pattern: /^\/active-packages(\/[^/]+)?$/ },
+  { pattern: /^\/subscriptions$/ },
+  { pattern: /^\/salaryData$/ },
+  { pattern: /^\/historyData$/ },
+  { pattern: /^\/dashboard-stats$/ },
+  // full teacher documents, for the admin teacher and applicant pages; the
+  // tutor list students see is /ActiveTeacherList
+  { pattern: /^\/teacherList$/ },
+  { pattern: /^\/disabledTeacherList$/ },
+  { pattern: /^\/(generate-)?monthly-history$/ },
 ];
 
 const isEnforcing = () =>
@@ -51,6 +68,20 @@ const makeAuthMiddleware = ({ admin }) => {
   };
 
   const attachUser = async (req, res, next) => {
+    // Memoised per request so routes can ask cheaply and repeatedly; see
+    // utils/actor.js, which lets owners act on other accounts.
+    let ownerLookup = null;
+    req.isOwner = () => {
+      if (!req.auth?.uid || !ownerCollection) return Promise.resolve(false);
+      if (!ownerLookup) {
+        ownerLookup = ownerCollection
+          .findOne({ uid: req.auth.uid })
+          .then((record) => record?.owner === "1")
+          .catch(() => false);
+      }
+      return ownerLookup;
+    };
+
     const token = readBearer(req);
     if (!token) return next();
     try {

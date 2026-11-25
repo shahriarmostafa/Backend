@@ -4,6 +4,31 @@ const {
   REFERRAL_REWARD_DURATION_HOURS,
   TEACHER_EXPERIENCE_LEVELS,
 } = require("../utils/constants");
+const { resolveActor } = require("../utils/actor");
+
+// What anyone may see of a teacher on the public profile page. Contact details,
+// tokens and money fields stay private.
+const PUBLIC_TEACHER_FIELDS = {
+  _id: 0,
+  uid: 1,
+  role: 1,
+  displayName: 1,
+  photoURL: 1,
+  subject: 1,
+  subjects: 1,
+  category: 1,
+  type: 1,
+  experience: 1,
+  rating: 1,
+  isActive: 1,
+  isOnline: 1,
+};
+
+const CATEGORIES = ["school", "college", "university"];
+const MEDIUMS = ["bangla_medium", "english_medium"];
+const cleanText = (value, max = 120) => (typeof value === "string" ? value.trim().slice(0, max) : "");
+const cleanPhotoUrl = (value) =>
+  typeof value === "string" && /^https:\/\//.test(value) ? value.slice(0, 500) : null;
 
 module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, admin }) => {
   const router = Router();
@@ -13,13 +38,10 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
       const uid = req.params.uid;
       const ownerCollection = databaseinmongo.collection("owner");
       const result = await ownerCollection.findOne({ uid });
-      if (result.owner === "1") {
-        res.status(200).json({ owner: true });
-      } else {
-        res.status(200).json({ owner: false });
-      }
+      res.status(200).json({ owner: result?.owner === "1" });
     } catch (err) {
       console.log(err);
+      res.status(500).json({ owner: false });
     }
   });
 
@@ -68,32 +90,74 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
     }
   });
 
+  /**
+   * Signup used to `$set` the request body straight into the user document,
+   * without a token, keyed by a body uid. Anyone could create or overwrite any
+   * account's role, credit or withdrawable points. The uid and email now come
+   * from the verified token and every other field is built here.
+   *
+   * Returns the uid the document belongs to, or null after responding.
+   */
+  const createUserDoc = async (req, res, doc) => {
+    const uid = await resolveActor(req, res, req.body?.uid);
+    if (!uid) return null;
+    const email = req.auth?.email || cleanText(req.body?.email, 200) || null;
+
+    // Google sign-in calls this on every login, so an existing account must be
+    // left exactly as it is.
+    const existingUser = await userCollection.findOne(
+      email ? { $or: [{ uid }, { email }] } : { uid },
+      { projection: { _id: 1 } }
+    );
+    if (existingUser) return { uid, existed: true };
+
+    await userCollection.updateOne(
+      { _id: uid },
+      { $setOnInsert: { ...doc, uid, email } },
+      { upsert: true }
+    );
+    await databaseinmongo.collection("chatCollection").updateOne(
+      { _id: uid },
+      { $setOnInsert: { chats: [] } },
+      { upsert: true }
+    );
+    return { uid, existed: false };
+  };
+
   router.post("/newTeacher", async (req, res) => {
     try {
-      const user = req.body;
-      user.experience = Math.max(1, Number(user.experience) || 1);
-      user.totalPoints = Math.max(0, Number(user.totalPoints) || 0);
-      const existingUser = await userCollection.findOne({ email: user.email });
+      const body = req.body || {};
+      const category = CATEGORIES.includes(body.category) ? body.category : "school";
+      const created = await createUserDoc(req, res, {
+        role: "teacher",
+        displayName: cleanText(body.displayName, 80),
+        photoURL: cleanPhotoUrl(body.photoURL),
+        whatsapp: cleanText(body.whatsapp, 20),
+        category,
+        type: category === "university" ? "english_medium" : MEDIUMS.includes(body.type) ? body.type : "bangla_medium",
+        subjects: [],
+        experience: 1,
+        rating: 4,
+        joined: Date.now(),
+        points: 0,
+        totalPoints: 0,
+        revenuePercent: 0.75,
+        joinedGroup: null,
+        ownerOfGroup: null,
+        groupMembers: 0,
+        approved: false,
+        FCMToken: null,
+        isOnline: false,
+        isActive: false,
+      });
+      if (!created) return;
 
-      if (existingUser) {
-        await userCollection.updateOne(
-          { _id: user.uid },
-          { $set: { FCMToken: user.FCMToken } }
-        );
-        return res.status(200).json({
-          success: true,
-          message: "User already exists, skipping teacher registration.",
-        });
-      }
-
-      await userCollection.updateOne({ _id: user.uid }, { $set: user }, { upsert: true });
-      await databaseinmongo.collection("chatCollection").updateOne(
-        { _id: user.uid },
-        { $setOnInsert: { chats: [] } },
-        { upsert: true }
-      );
-
-      res.status(200).json({ success: true, message: "Teacher added successfully." });
+      res.status(200).json({
+        success: true,
+        message: created.existed
+          ? "User already exists, skipping teacher registration."
+          : "Teacher added successfully.",
+      });
     } catch (error) {
       console.error(error);
       res.status(500).json({ success: false, error: "Failed to add a new teacher." });
@@ -102,38 +166,34 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
 
   router.post("/newStudent", async (req, res) => {
     try {
-      const user = req.body;
-      const referredByUid =
-        typeof user.referredByUid === "string" && user.referredByUid.trim()
-          ? user.referredByUid.trim()
+      const body = req.body || {};
+      const claimedReferrer = cleanText(body.referredByUid, 128) || null;
+      const callerUid = req.auth?.uid || cleanText(body.uid, 128);
+      // The referrer has to be a real account; a made-up uid would otherwise
+      // sit in `referrals` waiting to pay out.
+      const referrer =
+        claimedReferrer && claimedReferrer !== callerUid
+          ? await userCollection.findOne({ uid: claimedReferrer }, { projection: { uid: 1 } })
           : null;
+      const referredByUid = referrer?.uid || null;
 
-      if (referredByUid && referredByUid !== user.uid) {
-        user.referredByUid = referredByUid;
-        user.referredAt = new Date();
-      } else {
-        delete user.referredByUid;
-      }
-
-      const existingUser = await userCollection.findOne({ email: user.email });
-
-      if (existingUser) {
-        await userCollection.updateOne(
-          { _id: user.uid },
-          { $set: { FCMToken: user.FCMToken } }
-        );
+      const created = await createUserDoc(req, res, {
+        role: "student",
+        displayName: cleanText(body.displayName, 80),
+        photoURL: cleanPhotoUrl(body.photoURL),
+        FCMToken: null,
+        // Display only; spendable credit lives in activePackages.
+        subscription: { credit: 200, paymentStatus: "approved", packageName: "Free Explore", isActive: true },
+        ...(referredByUid ? { referredByUid, referredAt: new Date() } : {}),
+      });
+      if (!created) return;
+      if (created.existed) {
         return res.status(200).json({
           success: true,
           message: "User already exists, skipping student registration.",
         });
       }
-
-      await userCollection.updateOne({ _id: user.uid }, { $set: user }, { upsert: true });
-      await databaseinmongo.collection("chatCollection").updateOne(
-        { _id: user.uid },
-        { $setOnInsert: { chats: [] } },
-        { upsert: true }
-      );
+      const user = { uid: created.uid, referredByUid };
 
       if (user.referredByUid) {
         await referrals.updateOne(
@@ -161,8 +221,8 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
 
   router.get("/api/referrals/stats/:uid", async (req, res) => {
     try {
-      const { uid } = req.params;
-      if (!uid) return res.status(400).json({ success: false, error: "uid is required" });
+      const uid = await resolveActor(req, res, req.params.uid);
+      if (!uid) return;
 
       const referralDocs = await referrals.find({ referrerUid: uid }).toArray();
       const totalReferrals = referralDocs.length;
@@ -183,12 +243,24 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
     }
   });
 
+  // Public (no login): the shareable teacher page. Only the account itself and
+  // owners get the full document; everyone else gets a teacher's public fields.
   router.get("/userProfile/:uid", async (req, res) => {
     const uid = req.params.uid;
     try {
-      const user = await userCollection.findOne({ uid });
-      if (!user) return res.status(404).json({ error: "User not found" });
-      res.status(200).json({ data: user });
+      const isSelf = Boolean(req.auth?.uid) && req.auth.uid === uid;
+      if (isSelf || (await req.isOwner?.())) {
+        const user = await userCollection.findOne({ uid });
+        if (!user) return res.status(404).json({ error: "User not found" });
+        return res.status(200).json({ data: user });
+      }
+
+      const teacher = await userCollection.findOne(
+        { uid, role: "teacher" },
+        { projection: PUBLIC_TEACHER_FIELDS }
+      );
+      if (!teacher) return res.status(404).json({ error: "User not found" });
+      res.status(200).json({ data: teacher });
     } catch (error) {
       console.error("Error fetching profile:", error);
       res.status(400).json({ success: false, error: error.message });
@@ -197,11 +269,11 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
 
   router.post("/api/users/toggle-active", async (req, res) => {
     try {
-      const { userId, isActive } = req.body;
-      if (!userId) return res.status(400).json({ error: "Missing userId" });
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
       const updateResult = await userCollection.updateOne(
         { uid: userId },
-        { $set: { isActive } }
+        { $set: { isActive: req.body?.isActive === true } }
       );
       res.json({ success: true, updateResult });
     } catch (err) {
@@ -212,7 +284,9 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
 
   router.post("/api/users/study-profile", async (req, res) => {
     try {
-      const { uid, category, type } = req.body || {};
+      const { category, type } = req.body || {};
+      const uid = await resolveActor(req, res, req.body?.uid);
+      if (!uid) return;
       const cleanCategory = ["school", "college", "university"].includes(category)
         ? category
         : "";
@@ -256,10 +330,35 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
       const { userId, FCMToken } = req.body;
       if (!userId || !FCMToken)
         return res.status(400).json({ error: "Missing userId or FCMToken" });
-      await userCollection.updateOne({ uid: userId }, { $set: { FCMToken } });
+      const verifiedUserId = req.auth?.uid || userId;
+      if (req.auth?.uid && req.auth.uid !== userId)
+        return res.status(403).json({ error: "Cannot update another user's notification token." });
+      // A phone carries one token. If another account signed in on this device
+      // before, it must stop receiving this user's calls and messages.
+      await userCollection.updateMany(
+        { FCMToken, uid: { $ne: verifiedUserId } },
+        { $set: { FCMToken: null } }
+      );
+      await userCollection.updateOne({ uid: verifiedUserId }, { $set: { FCMToken } });
       res.json({ success: true });
     } catch (err) {
       console.error("Error updating FCM token:", err);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  // Called on logout so the phone stops receiving the signed-out account's
+  // notifications. Only clears the token if it is still this device's.
+  router.post("/api/users/clear-fcm", async (req, res) => {
+    try {
+      const userId = await resolveActor(req, res, req.body?.userId);
+      if (!userId) return;
+      const filter = { uid: userId };
+      if (req.body?.FCMToken) filter.FCMToken = req.body.FCMToken;
+      await userCollection.updateOne(filter, { $set: { FCMToken: null } });
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error clearing FCM token:", err);
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -309,8 +408,10 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
 
   router.post("/api/teachers/:teacherId/claim-level", async (req, res) => {
     try {
+      const teacherId = await resolveActor(req, res, req.params.teacherId);
+      if (!teacherId) return;
       const teacher = await userCollection.findOne({
-        uid: req.params.teacherId,
+        uid: teacherId,
         role: "teacher",
       });
       if (!teacher) return res.status(404).json({ error: "Teacher not found." });
@@ -347,9 +448,11 @@ module.exports = ({ userCollection, referrals, activepackages, databaseinmongo, 
     }
   });
 
+  // Returns the caller's own full document (owners may read anyone's).
   router.get("/api/getUserRole/:userId", async (req, res) => {
-    const userId = req.params.userId;
     try {
+      const userId = await resolveActor(req, res, req.params.userId);
+      if (!userId) return;
       const userDoc = await userCollection.findOne({ uid: userId });
       if (userDoc) {
         res.json({ userRole: userDoc.role, userDoc });

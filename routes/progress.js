@@ -1,6 +1,7 @@
 const { Router } = require("express");
 const { ObjectId } = require("mongodb");
 const { makeStudentProgressHelpers } = require("../utils/studentProgressHelpers");
+const { resolveActor } = require("../utils/actor");
 
 module.exports = ({ userCollection, databaseinmongo, studyRooms, roomQuizzes, publicQuizzes }) => {
   const router = Router();
@@ -12,12 +13,15 @@ module.exports = ({ userCollection, databaseinmongo, studyRooms, roomQuizzes, pu
     publicQuizzes,
   });
 
+  // a student's own progress (owners may look at anyone's)
   router.get("/api/students/:studentId/progress", async (req, res) => {
     try {
-      const progress = await getStudentProgress(req.params.studentId);
+      const studentId = await resolveActor(req, res, req.params.studentId);
+      if (!studentId) return;
+      const progress = await getStudentProgress(studentId);
       if (!progress) return res.status(404).json({ error: "Student not found." });
       res.json({ success: true, progress });
-      refreshStudentXpInBackground(req.params.studentId);
+      refreshStudentXpInBackground(studentId);
     } catch (err) {
       console.error("Error fetching student progress:", err);
       res.status(500).json({ error: "Failed to fetch student progress." });
@@ -26,7 +30,10 @@ module.exports = ({ userCollection, databaseinmongo, studyRooms, roomQuizzes, pu
 
   router.get("/api/leaderboard/public", async (req, res) => {
     try {
-      const { userId, category, type, limit } = req.query;
+      const { category, type, limit } = req.query;
+      // only used to refresh the caller's own snapshot
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       const leaderboard = await getLeaderboard({
         scope: "public",
         scopeId: "public",
@@ -44,11 +51,17 @@ module.exports = ({ userCollection, databaseinmongo, studyRooms, roomQuizzes, pu
 
   router.get("/api/study-rooms/:roomId/leaderboard", async (req, res) => {
     try {
-      const { userId, limit } = req.query;
+      const { limit } = req.query;
+      const userId = await resolveActor(req, res, req.query.userId);
+      if (!userId) return;
       if (!ObjectId.isValid(req.params.roomId)) return res.status(400).json({ error: "Invalid room id." });
       const room = await studyRooms.findOne({ _id: new ObjectId(req.params.roomId) });
       if (!room) return res.status(404).json({ error: "Room not found." });
-      if (userId && !(room.memberIds || []).includes(userId) && !(room.teacherSessions || []).some((session) => session.teacherId === userId)) {
+      // omitting ?userId used to skip this check entirely
+      const isParticipant =
+        (room.memberIds || []).includes(userId) ||
+        (room.teacherSessions || []).some((session) => session.teacherId === userId);
+      if (!isParticipant && !(await req.isOwner?.())) {
         return res.status(403).json({ error: "Join this room to view its leaderboard." });
       }
       const leaderboard = await getLeaderboard({

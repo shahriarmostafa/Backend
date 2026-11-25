@@ -10,8 +10,45 @@ const {
   PUBLIC_QUIZ_REWARD_BASE_WINNERS,
   PUBLIC_QUIZ_REWARD_WINNER_STEP,
   PUBLIC_QUIZ_REWARD_MAX_WINNERS,
+  QUIZ_SUBMIT_GRACE_MS,
 } = require("./constants");
 const { makeTeacherQualityHelpers } = require("./teacherQualityHelpers");
+const {
+  extractStoragePath,
+  normalizePath,
+  getQuizStorageFolder,
+  isStoragePathWithin,
+} = require("./r2Storage");
+
+const MAX_OPEN_ANSWER_LENGTH = 4000;
+
+/**
+ * Where a student's image answers for a quiz must live. Matches the paths the
+ * app uploads to (RoomQuizPanel / PublicQuizzes):
+ *   rooms/{roomId}/quizzes/{quizId}/answers/{uid}/...
+ *   public-quizzes/{quizId}/answers/{uid}/...
+ */
+const getAnswerStorageFolder = (quiz, studentId) => {
+  const folder = getQuizStorageFolder(quiz);
+  return folder && studentId ? `${folder}/answers/${studentId}` : "";
+};
+
+/**
+ * The latest moment an attempt may still be submitted, before grace: the quiz's
+ * own end, or the attempt's time limit counted from when it could first see the
+ * questions (join time, or the scheduled start for students who joined early) -
+ * whichever comes first. 0 means the quiz carries no timing at all.
+ */
+const getAttemptDeadline = (quiz = {}, attempt = null) => {
+  const endsAt = quiz.endsAt ? new Date(quiz.endsAt).getTime() : 0;
+  const scheduledAt = quiz.scheduledAt ? new Date(quiz.scheduledAt).getTime() : 0;
+  const joinedAt = attempt?.joinedAt ? new Date(attempt.joinedAt).getTime() : 0;
+  const limitMs = Number(quiz.timeLimitMinutes) > 0 ? Number(quiz.timeLimitMinutes) * 60 * 1000 : 0;
+  const startedAt = Math.max(joinedAt || 0, scheduledAt || 0);
+  const attemptEnd = limitMs && startedAt ? startedAt + limitMs : 0;
+  const candidates = [endsAt, attemptEnd].filter((value) => Number.isFinite(value) && value > 0);
+  return candidates.length ? Math.min(...candidates) : 0;
+};
 
 /**
  * Splits a reward pool across winners. Three winners share it 3:2:1, any other
@@ -77,22 +114,33 @@ const makeQuizHelpers = ({
     return { cleanQuestions, invalid };
   };
 
-  const scoreAnswers = (questions = [], answers = {}) => {
+  /**
+   * `storageFolder` is the student's own answer folder for this quiz. Image
+   * answers whose path or URL point anywhere else are dropped: both are stored
+   * and later deleted with the quiz, so an unchecked path let a student aim the
+   * quiz delete at any file in the bucket.
+   */
+  const scoreAnswers = (questions = [], answers = {}, { storageFolder = "" } = {}) => {
     let score = 0;
     const checkedAnswers = {};
+    const safeAnswers = answers && typeof answers === "object" ? answers : {};
     questions.forEach((question) => {
-      const rawAnswer = answers[question.id];
+      const rawAnswer = safeAnswers[question.id];
       let isCorrect = false;
       if (question.type === "mcq") {
         const selectedOption = Number(rawAnswer?.selectedOption ?? rawAnswer);
         isCorrect = selectedOption === Number(question.correctOption);
         checkedAnswers[question.id] = { selectedOption, isCorrect };
       } else if (question.type === "open") {
-        const text = String(rawAnswer?.text ?? rawAnswer ?? "").trim();
+        const text = String(rawAnswer?.text ?? rawAnswer ?? "").trim().slice(0, MAX_OPEN_ANSWER_LENGTH);
         checkedAnswers[question.id] = { text, isCorrect: false, needsManualMarking: true };
       } else {
-        const imageUrl = String(rawAnswer?.imageUrl ?? rawAnswer?.image ?? rawAnswer ?? "").trim();
-        const storagePath = String(rawAnswer?.storagePath || "").trim();
+        const rawImageUrl = String(rawAnswer?.imageUrl ?? rawAnswer?.image ?? rawAnswer ?? "").trim();
+        const rawStoragePath = normalizePath(String(rawAnswer?.storagePath || "").trim());
+        const imagePath = extractStoragePath(rawImageUrl);
+        const imageUrl = storageFolder && imagePath && isStoragePathWithin(imagePath, storageFolder) ? rawImageUrl : "";
+        const storagePath =
+          storageFolder && isStoragePathWithin(rawStoragePath, storageFolder) ? rawStoragePath : "";
         checkedAnswers[question.id] = { imageUrl, storagePath, isCorrect: false, needsManualMarking: true };
       }
       if (isCorrect) score += 1;
@@ -109,7 +157,7 @@ const makeQuizHelpers = ({
     });
   };
 
-  const getQuizStatus = (quiz) => {
+  const getQuizStatus = (quiz, now = Date.now()) => {
     if (!quiz) return "missing";
     if (quiz.status === "completed") return "completed";
     if (quiz.status === "draft") return "draft";
@@ -117,7 +165,6 @@ const makeQuizHelpers = ({
     if (quiz.status === "assigned") return "assigned";
     const scheduledAt = quiz.scheduledAt ? new Date(quiz.scheduledAt).getTime() : 0;
     const endsAt = quiz.endsAt ? new Date(quiz.endsAt).getTime() : 0;
-    const now = Date.now();
     if (endsAt && now > endsAt) return "ended";
     if (scheduledAt && now >= scheduledAt) return "open";
     return "scheduled";
@@ -133,18 +180,38 @@ const makeQuizHelpers = ({
       activePackage?.isActive === true && new Date(activePackage.expiryDate) > new Date();
     if (!isValid)
       return { ok: false, status: 403, message: "No active package found for this student." };
-    if (credit < attendCredit)
-      return {
-        ok: false,
-        status: 402,
-        message: `At least ${attendCredit} credit is required.`,
-      };
-    await activepackages.updateOne(
-      { uid: studentId },
+    const insufficient = {
+      ok: false,
+      status: 402,
+      message: `At least ${attendCredit} credit is required.`,
+    };
+    if (credit < attendCredit) return insufficient;
+    // conditional, so two attends racing on the same balance cannot both spend it
+    const result = await activepackages.updateOne(
+      { uid: studentId, credit: { $gte: attendCredit } },
       { $inc: { credit: -attendCredit } },
       { session }
     );
+    if (!result?.modifiedCount) return insufficient;
     return { ok: true, remainingCredit: credit - attendCredit };
+  };
+
+  /**
+   * Whether `attempt` may still be submitted. Rejects before the quiz opens,
+   * once it is completed, and after its deadline (see getAttemptDeadline) plus
+   * QUIZ_SUBMIT_GRACE_MS. The "ended" status alone is not a rejection: it flips
+   * the instant endsAt passes, which is exactly what the grace exists to cover.
+   */
+  const checkSubmissionWindow = (quiz, attempt, now = Date.now()) => {
+    const status = getQuizStatus(quiz, now);
+    if (status === "completed")
+      return { ok: false, status: 409, message: "This quiz is already completed." };
+    if (!["open", "ended"].includes(status))
+      return { ok: false, status: 409, message: "This quiz has not started yet." };
+    const deadline = getAttemptDeadline(quiz, attempt);
+    if (deadline && now > deadline + QUIZ_SUBMIT_GRACE_MS)
+      return { ok: false, status: 409, message: "Time is up. This quiz no longer accepts answers." };
+    return { ok: true, deadline };
   };
 
   const settleQuiz = async (quizId, session = null, options = {}) => {
@@ -305,23 +372,48 @@ const makeQuizHelpers = ({
     return { ok: true, pointDelta };
   };
 
-  const publicQuiz = (quiz, viewerId = null) => {
+  /**
+   * The client-facing quiz. `viewerId` must be the verified caller (see
+   * utils/actor.js): it decides whether correct answers, other students'
+   * attempts and the questions themselves are included.
+   *
+   * Students only see question prompts/options once the quiz is open and - for
+   * a paid quiz - they have attended (paid). They used to arrive with the quiz
+   * list, so anyone could read a paid quiz before it started without paying.
+   */
+  const publicQuiz = (quiz, viewerId = null, { isOwner = false } = {}) => {
     if (!quiz) return null;
     const status = getQuizStatus(quiz);
     const attempt = viewerId ? getAttempt(quiz, viewerId) : null;
-    const canShowAnswers = status === "completed" || (viewerId && viewerId === quiz.teacherId);
+    const isQuizTeacher = Boolean(viewerId && viewerId === quiz.teacherId);
+    const canShowAnswers = status === "completed" || isQuizTeacher || isOwner;
     const economyEnabled = quiz.quizExpenseEnabled !== false;
+    const canSeeQuestions =
+      canShowAnswers ||
+      (["open", "ended"].includes(status) && (!economyEnabled || Boolean(attempt)));
+    const questions = quiz.questions || [];
+    // Only the teacher (and admin) see every student's answers; others get the
+    // result table they need, with their own attempt in full via myAttempt.
+    const visibleAttempts = isQuizTeacher || isOwner
+      ? quiz.attempts || []
+      : (quiz.attempts || []).map(({ answers, ...rest }) =>
+          rest.studentId === viewerId ? { ...rest, answers } : rest
+        );
     return {
       ...quiz,
       id: quiz._id.toString(),
       status,
-      questions: (quiz.questions || []).map((question) => ({
-        ...question,
-        correctOption: canShowAnswers ? question.correctOption : undefined,
-        answerText: canShowAnswers ? question.answerText : undefined,
-      })),
+      questionCount: questions.length,
+      questionsHidden: !canSeeQuestions,
+      questions: canSeeQuestions
+        ? questions.map((question) => ({
+            ...question,
+            correctOption: canShowAnswers ? question.correctOption : undefined,
+            answerText: canShowAnswers ? question.answerText : undefined,
+          }))
+        : [],
       myAttempt: attempt || null,
-      attempts: canShowAnswers ? quiz.attempts || [] : undefined,
+      attempts: canShowAnswers ? visibleAttempts : undefined,
       constants: {
         attendCredit: economyEnabled ? attendCredit : 0,
         rewardRate: economyEnabled ? rewardPoolRate : 0,
@@ -339,6 +431,8 @@ const makeQuizHelpers = ({
     getQuizStatus,
     getAttempt,
     spendQuizCredit,
+    checkSubmissionWindow,
+    getAnswerStorageFolder,
     settleQuiz,
     applyQuizRating,
     publicQuiz,
@@ -374,4 +468,6 @@ module.exports = {
   makePublicQuizHelpers,
   getPublicQuizWinnerCount,
   distributeRewards,
+  getAttemptDeadline,
+  getAnswerStorageFolder,
 };

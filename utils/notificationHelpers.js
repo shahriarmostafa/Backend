@@ -1,4 +1,55 @@
 const { ObjectId } = require("mongodb");
+const { extractStoragePath, isStoragePathWithin, normalizePath } = require("./r2Storage");
+
+const ALLOWED_ANNOUNCEMENT_FILE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+]);
+
+/**
+ * The storage folder announcement files for a scope are uploaded to - the same
+ * paths AnnouncementComposer.jsx builds.
+ */
+const getAnnouncementFolder = (scope, scopeId) => {
+  const id = String(scopeId || "").trim();
+  if (!scope || !id || id.includes("/") || id.includes("..")) return "";
+  return scope === "room" ? `rooms/${id}/announcements` : `announcements/${scope}/${id}`;
+};
+
+/**
+ * Attachments come straight from the client and are shown to every member as
+ * links. Only files inside this scope's announcement folder, whose URL is our
+ * own storage URL for that same file, are kept - anything else (an outside
+ * link, another room's file) is dropped.
+ */
+const sanitizeAnnouncementAttachments = (attachments = [], { scope, scopeId } = {}) => {
+  if (!Array.isArray(attachments)) return [];
+  const folder = getAnnouncementFolder(scope, scopeId);
+  if (!folder) return [];
+  return attachments
+    .slice(0, 5)
+    .map((attachment) => ({
+      name: String(attachment?.name || "Attachment").trim().slice(0, 120),
+      url: String(attachment?.url || "").trim(),
+      path: normalizePath(String(attachment?.path || "").trim()),
+      type: String(attachment?.type || "").trim(),
+      size: Math.max(0, Number(attachment?.size) || 0),
+    }))
+    .filter((attachment) => {
+      if (!attachment.url || !attachment.path) return false;
+      if (!isStoragePathWithin(attachment.path, folder)) return false;
+      const urlPath = extractStoragePath(attachment.url);
+      if (!urlPath || normalizePath(urlPath) !== attachment.path) return false;
+      if (ALLOWED_ANNOUNCEMENT_FILE_TYPES.has(attachment.type)) return true;
+      const name = attachment.name.toLowerCase();
+      return /\.(jpe?g|png|webp|gif|pdf|docx|pptx)$/.test(name);
+    });
+};
 
 const asStringId = (value) => {
   if (!value) return "";
@@ -214,4 +265,10 @@ const makeNotificationHelpers = ({ databaseinmongo, userCollection, studyRooms, 
   };
 };
 
-module.exports = { makeNotificationHelpers, getRoomNotificationRecipients, getCourseNotificationRecipients };
+module.exports = {
+  makeNotificationHelpers,
+  getRoomNotificationRecipients,
+  getCourseNotificationRecipients,
+  sanitizeAnnouncementAttachments,
+  getAnnouncementFolder,
+};
