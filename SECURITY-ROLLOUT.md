@@ -42,8 +42,8 @@ Render deploys on push, so a backend push is a production deploy.
    hitting `/createCustomToken`.
 5. **Set `AUTH_ENFORCE=true`** (or remove it — true is the default) once the
    warnings stop.
-6. **Set `ALLOWED_ORIGINS=https://app.poperl.com,<admin origin>`** to close CORS.
-   Unset means every origin is accepted.
+6. **Set `ALLOWED_ORIGINS=<admin origin>,<development or preview origins>`** for additional browser clients. `utils/corsOptions.js` always permits `https://app.poperl.com` and the bundled Capacitor origins (`https://localhost`, `http://localhost`, `capacitor://localhost`) for both HTTP and Socket.IO. A development-only environment value must not lock installed apps out. CORS does not replace Firebase authentication.
+   Unset permits only the built-in app origins.
 
 ## Native app builds
 

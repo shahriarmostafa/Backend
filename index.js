@@ -7,35 +7,17 @@ const { MongoClient, ServerApiVersion } = require("mongodb");
 
 require("dotenv").config();
 
-// ALLOWED_ORIGINS is a comma-separated list. Unset keeps the old allow-all
-// behaviour so a misconfigured deploy cannot black-hole every client.
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((value) => value.trim())
-  .filter(Boolean);
-
-const corsOptions = allowedOrigins.length
-  ? {
-      origin: (origin, callback) => {
-        // no Origin header = server-to-server (ShurjoPay IPN, native fetch)
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error(`Origin ${origin} not allowed`));
-      },
-      credentials: true,
-    }
-  : {};
-
-if (!allowedOrigins.length) {
-  console.warn("[cors] ALLOWED_ORIGINS is unset — accepting every origin. Set it in production.");
-}
+// HTTP and Socket.IO must both accept the installed app's local WebView origin.
+const { makeCorsOptions } = require("./utils/corsOptions");
+const corsOptions = makeCorsOptions();
 
 app.use(cors(corsOptions));
 app.use(express.json({ limit: "35mb" }));
 
 const server = http.createServer(app);
-const io = require("socket.io")(server, {
+const io = new Server(server, {
   cors: {
-    origin: allowedOrigins.length ? allowedOrigins : "*",
+    ...corsOptions,
     methods: ["GET", "POST"],
   },
 });
